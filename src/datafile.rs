@@ -65,4 +65,100 @@ impl DatafileEntry {
             value: Box::from(value),
         })
     }
+    pub fn _from(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+        Ok(Self {
+            header: DatafileHeader::_from(key, value, timestamp)?,
+            key: Box::from(key),
+            value: Box::from(value),
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crc32fast::Hasher;
+
+    use crate::datafile::{self, DatafileError, DatafileHeader};
+
+    pub fn crc_of(timestamp: u64, key_size: u32, value_size: u32, key: &[u8], value: &[u8]) -> u32 {
+        let mut hasher = Hasher::new();
+
+        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(&key_size.to_be_bytes());
+        hasher.update(&value_size.to_be_bytes());
+        hasher.update(key);
+        hasher.update(value);
+
+        hasher.finalize()
+    }
+
+    #[test]
+    fn datafile_header() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let key: u32 = 1;
+        let key_size: u32 = key.to_be_bytes().len() as u32;
+
+        let value: u64 = 2;
+        let value_size: u32 = value.to_be_bytes().len() as u32;
+
+        let datafile_header =
+            DatafileHeader::_from(&key.to_be_bytes(), &value.to_be_bytes(), timestamp);
+
+        assert!(datafile_header.is_ok());
+        if let Ok(datafile_header) = datafile_header {
+            assert_eq!(
+                datafile_header.crc,
+                crc_of(
+                    timestamp,
+                    key_size,
+                    value_size,
+                    &key.to_be_bytes(),
+                    &value.to_be_bytes()
+                )
+            );
+            assert_eq!(datafile_header.timestamp, timestamp);
+            assert_eq!(datafile_header.key_size, key_size);
+            assert_eq!(datafile_header.value_size, value_size);
+        }
+    }
+
+    #[test]
+    fn datafile_header_string() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let key: String = String::from("hello world");
+        let key_size: u32 = key.len() as u32;
+
+        let value: u64 = 2;
+        let value_size: u32 = value.to_be_bytes().len() as u32;
+
+        let datafile_header =
+            DatafileHeader::_from(&key.clone().into_bytes(), &value.to_be_bytes(), timestamp);
+
+        assert!(datafile_header.is_ok());
+        if let Ok(datafile_header) = datafile_header {
+            assert_eq!(
+                datafile_header.crc,
+                crc_of(
+                    timestamp,
+                    key_size,
+                    value_size,
+                    &key.into_bytes(),
+                    &value.to_be_bytes()
+                )
+            );
+            assert_eq!(datafile_header.timestamp, timestamp);
+            assert_eq!(datafile_header.key_size, key_size);
+            assert_eq!(datafile_header.value_size, value_size);
+        }
+    }
 }
