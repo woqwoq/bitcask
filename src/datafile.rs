@@ -1,4 +1,7 @@
-use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+use std::{
+    array::TryFromSliceError,
+    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
+};
 
 use crc32fast::Hasher;
 
@@ -7,7 +10,26 @@ const DATAFILE_HEADER_SIZE_BYTES: usize = 20;
 #[derive(Debug)]
 pub enum DatafileError {
     NegativeTimestamp(SystemTimeError),
+    SliceConversion(TryFromSliceError),
+    UndersizedDatafileHeader(usize),
 }
+
+impl From<SystemTimeError> for DatafileError {
+    fn from(value: SystemTimeError) -> Self {
+        Self::NegativeTimestamp(value)
+    }
+}
+
+impl From<TryFromSliceError> for DatafileError {
+    fn from(value: TryFromSliceError) -> Self {
+        Self::SliceConversion(value)
+    }
+}
+
+const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
+const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
+const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
+const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
 #[derive(Debug, PartialEq)]
 pub struct DatafileHeader {
@@ -22,10 +44,7 @@ impl DatafileHeader {
         Self::_from(
             key,
             value,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(DatafileError::NegativeTimestamp)?
-                .as_millis() as u64,
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
         )
     }
 
@@ -54,16 +73,34 @@ impl DatafileHeader {
     fn encode(&self) -> [u8; DATAFILE_HEADER_SIZE_BYTES] {
         let mut arr: [u8; DATAFILE_HEADER_SIZE_BYTES] = [0; DATAFILE_HEADER_SIZE_BYTES];
 
-        arr[0..4].clone_from_slice(&self.crc.to_be_bytes());
-        arr[4..12].clone_from_slice(&self.timestamp.to_be_bytes());
-        arr[12..16].clone_from_slice(&self.key_size.to_be_bytes());
-        arr[16..20].clone_from_slice(&self.value_size.to_be_bytes());
+        arr[0..4].copy_from_slice(&self.crc.to_be_bytes());
+        arr[4..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        arr[12..16].copy_from_slice(&self.key_size.to_be_bytes());
+        arr[16..20].copy_from_slice(&self.value_size.to_be_bytes());
 
         arr
     }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
+        if DATAFILE_HEADER_SIZE_BYTES > bytes.len() {
+            return Err(DatafileError::UndersizedDatafileHeader(bytes.len()));
+        }
+
+        let crc_bytes: [u8; DATAFILE_HEADER_CRC_SIZE_BYTES] = bytes[0..4].try_into()?;
+        let timestamp_bytes: [u8; DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES] =
+            bytes[4..12].try_into()?;
+        let key_size_bytes: [u8; DATAFILE_HEADER_KSZ_SIZE_BYTES] = bytes[12..16].try_into()?;
+        let value_size_bytes: [u8; DATAFILE_HEADER_VSZ_SIZE_BYTES] = bytes[16..20].try_into()?;
+
+        Ok(Self {
+            crc: u32::from_be_bytes(crc_bytes),
+            timestamp: u64::from_be_bytes(timestamp_bytes),
+            key_size: u32::from_be_bytes(key_size_bytes),
+            value_size: u32::from_be_bytes(value_size_bytes),
+        })
+    }
 }
 
-// TODO: Decode()
 pub struct DatafileEntry {
     header: DatafileHeader,
     key: Box<[u8]>,
@@ -103,11 +140,10 @@ impl DatafileEntry {
 
 #[cfg(test)]
 mod datafile_tests {
+    use crc32fast::Hasher;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crc32fast::Hasher;
-
-    use crate::datafile::{DatafileEntry, DatafileHeader};
+    use crate::datafile::{DatafileEntry, DatafileError, DatafileHeader};
 
     pub fn crc_of(timestamp: u64, key_size: u32, value_size: u32, key: &[u8], value: &[u8]) -> u32 {
         let mut hasher = Hasher::new();
@@ -254,5 +290,35 @@ mod datafile_tests {
 
         assert_eq!(encoded[0..20], datafile_entry.header.encode());
         assert_eq!(encoded[20..], kv);
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn datafile_header_decode_ok() {
+        let datafile_header = DatafileHeader::from(
+            String::from("hello world").as_bytes(),
+            &(2 as u64).to_be_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            datafile_header,
+            DatafileHeader::decode(&datafile_header.encode()).unwrap()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn datafile_header_decode_err() {
+        let datafile_header = DatafileHeader::from(
+            String::from("hello world").as_bytes(),
+            &(2 as u64).to_be_bytes(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            DatafileHeader::decode(&datafile_header.encode()[0..9]),
+            Err(DatafileError::UndersizedDatafileHeader(9))
+        ));
     }
 }
