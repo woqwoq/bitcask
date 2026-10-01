@@ -12,6 +12,9 @@ pub enum DatafileError {
     NegativeTimestamp(SystemTimeError),
     SliceConversion(TryFromSliceError),
     UndersizedDatafileHeader(usize),
+    UndersizedDatafileKey { actual: usize, expected: usize },
+    UndersizedDatafileValue { actual: usize, expected: usize },
+    CrcMismatch,
 }
 
 impl From<SystemTimeError> for DatafileError {
@@ -49,25 +52,34 @@ impl DatafileHeader {
     }
 
     fn _from(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+        let key_size = key.len() as u32;
+        let value_size = value.len() as u32;
+
+        Ok(DatafileHeader {
+            crc: Self::get_crc_for(timestamp, key_size, value_size, key, value),
+            timestamp,
+            key_size,
+            value_size,
+        })
+    }
+
+    fn get_crc_for(
+        timestamp: u64,
+        key_size: u32,
+        value_size: u32,
+        key: &[u8],
+        value: &[u8],
+    ) -> u32 {
         let mut hasher = Hasher::new();
 
         hasher.update(&timestamp.to_be_bytes());
-
-        let key_size = key.len() as u32;
         hasher.update(&key_size.to_be_bytes());
-
-        let value_size = value.len() as u32;
         hasher.update(&value_size.to_be_bytes());
 
         hasher.update(key);
         hasher.update(value);
 
-        Ok(DatafileHeader {
-            crc: hasher.finalize(),
-            timestamp,
-            key_size,
-            value_size,
-        })
+        hasher.finalize()
     }
 
     fn encode(&self) -> [u8; DATAFILE_HEADER_SIZE_BYTES] {
@@ -101,6 +113,7 @@ impl DatafileHeader {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct DatafileEntry {
     header: DatafileHeader,
     key: Box<[u8]>,
@@ -135,6 +148,55 @@ impl DatafileEntry {
         buf.extend_from_slice(&self.value);
 
         Box::from(buf)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
+        let datafile_size = bytes.len();
+        let header = DatafileHeader::decode(bytes)?;
+
+        let key_size = header.key_size as usize;
+
+        let expected_datafile_size_with_key = DATAFILE_HEADER_SIZE_BYTES + key_size;
+        if expected_datafile_size_with_key > datafile_size {
+            return Err(DatafileError::UndersizedDatafileKey {
+                expected: expected_datafile_size_with_key,
+                actual: datafile_size,
+            });
+        }
+
+        let key_bytes: Box<[u8]> =
+            Box::from(&bytes[DATAFILE_HEADER_SIZE_BYTES..expected_datafile_size_with_key]);
+
+        let value_size = header.value_size as usize;
+
+        let expected_datafile_size_with_kv = expected_datafile_size_with_key + value_size;
+        if expected_datafile_size_with_kv > datafile_size {
+            return Err(DatafileError::UndersizedDatafileValue {
+                expected: expected_datafile_size_with_kv,
+                actual: datafile_size,
+            });
+        }
+
+        let value_bytes: Box<[u8]> =
+            Box::from(&bytes[expected_datafile_size_with_key..expected_datafile_size_with_kv]);
+
+        if header.crc
+            != DatafileHeader::get_crc_for(
+                header.timestamp,
+                header.key_size,
+                header.value_size,
+                &key_bytes,
+                &value_bytes,
+            )
+        {
+            return Err(DatafileError::CrcMismatch);
+        }
+
+        Ok(Self {
+            header,
+            key: key_bytes,
+            value: value_bytes,
+        })
     }
 }
 
@@ -320,5 +382,20 @@ mod datafile_tests {
             DatafileHeader::decode(&datafile_header.encode()[0..9]),
             Err(DatafileError::UndersizedDatafileHeader(9))
         ));
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn datafile_entry_decode_ok() {
+        let datafile_entry = DatafileEntry::from(
+            String::from("hello world").as_bytes(),
+            &(2 as u64).to_be_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            datafile_entry,
+            DatafileEntry::decode(&datafile_entry.encode()).unwrap()
+        );
     }
 }
