@@ -5,12 +5,11 @@ use std::{
 
 use crc32fast::Hasher;
 
-const DATAFILE_HEADER_SIZE_BYTES: usize = 20;
-
 #[derive(Debug)]
 pub enum DatafileError {
     NegativeTimestamp(SystemTimeError),
     SliceConversion(TryFromSliceError),
+    OversizedDatafileEntry,
     UndersizedDatafileHeader(usize),
     UndersizedDatafileKey { actual: usize, expected: usize },
     UndersizedDatafileValue { actual: usize, expected: usize },
@@ -29,31 +28,34 @@ impl From<TryFromSliceError> for DatafileError {
     }
 }
 
-const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
-const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
-const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
-const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
+pub const DATAFILE_HEADER_SIZE_BYTES: usize = 20;
+pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
+pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
+pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
+pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
 #[derive(Debug, PartialEq)]
 pub struct DatafileHeader {
-    crc: u32,        // CRC32 of all fields below
-    timestamp: u64,  // UNIX Timestamp when the entry was created
-    key_size: u32,   // Size of the key in bytes
-    value_size: u32, // Size of the value in bytes
+    pub crc: u32,        // CRC32 of all fields below
+    pub timestamp: u64,  // UNIX Timestamp when the entry was created
+    pub key_size: u32,   // Size of the key in bytes
+    pub value_size: u32, // Size of the value in bytes
 }
 
 impl DatafileHeader {
-    pub fn from(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
-        Self::_from(
+    pub fn new(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
+        Self::with_timestamp(
             key,
             value,
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
         )
     }
 
-    fn _from(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
-        let key_size = key.len() as u32;
-        let value_size = value.len() as u32;
+    fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+        let key_size =
+            u32::try_from(key.len()).map_err(|_| DatafileError::OversizedDatafileEntry)?;
+        let value_size =
+            u32::try_from(value.len()).map_err(|_| DatafileError::OversizedDatafileEntry)?;
 
         Ok(DatafileHeader {
             crc: Self::get_crc_for(timestamp, key_size, value_size, key, value),
@@ -115,70 +117,76 @@ impl DatafileHeader {
 
 #[derive(Debug, PartialEq)]
 pub struct DatafileEntry {
-    header: DatafileHeader,
-    key: Box<[u8]>,
-    value: Box<[u8]>,
+    pub header: DatafileHeader,
+    pub key: Box<[u8]>,
+    pub value: Box<[u8]>,
 }
 
 impl DatafileEntry {
-    pub fn from(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
+    pub fn new(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
         Ok(Self {
-            header: DatafileHeader::from(key, value)?,
+            header: DatafileHeader::new(key, value)?,
             key: Box::from(key),
             value: Box::from(value),
         })
     }
-    pub fn _from(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+    pub fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
         Ok(Self {
-            header: DatafileHeader::_from(key, value, timestamp)?,
+            header: DatafileHeader::with_timestamp(key, value, timestamp)?,
             key: Box::from(key),
             value: Box::from(value),
         })
     }
 
-    pub fn encode(&self) -> Box<[u8]> {
-        let size =
-            DATAFILE_HEADER_SIZE_BYTES + (self.header.key_size + self.header.value_size) as usize;
+    pub fn size(&self) -> Result<usize, DatafileError> {
+        let size = u64::from(self.header.key_size)
+            .checked_add(u64::from(self.header.value_size))
+            .and_then(|kv| kv.checked_add(DATAFILE_HEADER_SIZE_BYTES as u64))
+            .ok_or(DatafileError::OversizedDatafileEntry)?;
 
+        usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileEntry)
+    }
+
+    pub fn encode(&self) -> Result<Box<[u8]>, DatafileError> {
         // TODO: Rework into vectored writes to avoid allocation
-        let mut buf: Vec<u8> = Vec::with_capacity(size);
+        let mut buf: Vec<u8> = Vec::with_capacity(self.size()?);
 
         buf.extend_from_slice(&self.header.encode());
         buf.extend_from_slice(&self.key);
         buf.extend_from_slice(&self.value);
 
-        Box::from(buf)
+        Ok(Box::from(buf))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
-        let datafile_size = bytes.len();
+        let datafile_size = bytes.len() as u64;
         let header = DatafileHeader::decode(bytes)?;
 
-        let key_size = header.key_size as usize;
-
-        let expected_datafile_size_with_key = DATAFILE_HEADER_SIZE_BYTES + key_size;
+        let expected_datafile_size_with_key =
+            DATAFILE_HEADER_SIZE_BYTES as u64 + u64::from(header.key_size);
         if expected_datafile_size_with_key > datafile_size {
             return Err(DatafileError::UndersizedDatafileKey {
-                expected: expected_datafile_size_with_key,
-                actual: datafile_size,
+                expected: expected_datafile_size_with_key as usize,
+                actual: datafile_size as usize,
             });
         }
 
         let key_bytes: Box<[u8]> =
-            Box::from(&bytes[DATAFILE_HEADER_SIZE_BYTES..expected_datafile_size_with_key]);
+            Box::from(&bytes[DATAFILE_HEADER_SIZE_BYTES..expected_datafile_size_with_key as usize]);
 
-        let value_size = header.value_size as usize;
-
-        let expected_datafile_size_with_kv = expected_datafile_size_with_key + value_size;
+        let expected_datafile_size_with_kv =
+            expected_datafile_size_with_key + u64::from(header.value_size);
         if expected_datafile_size_with_kv > datafile_size {
             return Err(DatafileError::UndersizedDatafileValue {
-                expected: expected_datafile_size_with_kv,
-                actual: datafile_size,
+                expected: expected_datafile_size_with_kv as usize,
+                actual: datafile_size as usize,
             });
         }
 
-        let value_bytes: Box<[u8]> =
-            Box::from(&bytes[expected_datafile_size_with_key..expected_datafile_size_with_kv]);
+        let value_bytes: Box<[u8]> = Box::from(
+            &bytes
+                [expected_datafile_size_with_key as usize..expected_datafile_size_with_kv as usize],
+        );
 
         if header.crc
             != DatafileHeader::get_crc_for(
@@ -235,7 +243,7 @@ mod datafile_tests {
         let value_size: u32 = value.to_be_bytes().len() as u32;
 
         let datafile_header =
-            DatafileHeader::_from(&key.to_be_bytes(), &value.to_be_bytes(), timestamp);
+            DatafileHeader::with_timestamp(&key.to_be_bytes(), &value.to_be_bytes(), timestamp);
 
         assert!(datafile_header.is_ok());
         if let Ok(datafile_header) = datafile_header {
@@ -269,7 +277,8 @@ mod datafile_tests {
         let value_size: u32 = value.to_be_bytes().len() as u32;
 
         let datafile_header =
-            DatafileHeader::_from(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
+            DatafileHeader::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp)
+                .unwrap();
 
         assert_eq!(
             datafile_header.crc,
@@ -297,10 +306,11 @@ mod datafile_tests {
         let value: u64 = 2;
 
         let expected_datafile_header =
-            DatafileHeader::_from(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
+            DatafileHeader::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp)
+                .unwrap();
 
         let datafile_entry =
-            DatafileEntry::_from(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
+            DatafileEntry::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
 
         assert_eq!(datafile_entry.header, expected_datafile_header);
         assert_eq!(&datafile_entry.key.to_vec(), &key.into_bytes());
@@ -312,7 +322,7 @@ mod datafile_tests {
         let key: String = String::from("hello world");
         let value: u64 = 2;
 
-        let datafile_header = DatafileHeader::from(key.as_bytes(), &value.to_be_bytes()).unwrap();
+        let datafile_header = DatafileHeader::new(key.as_bytes(), &value.to_be_bytes()).unwrap();
 
         let mut expected: Vec<u8> = Vec::new();
         datafile_header
@@ -344,13 +354,13 @@ mod datafile_tests {
         let key: String = String::from("hello world");
         let value: u64 = 2;
 
-        let datafile_entry = DatafileEntry::from(key.as_bytes(), &value.to_be_bytes()).unwrap();
+        let datafile_entry = DatafileEntry::new(key.as_bytes(), &value.to_be_bytes()).unwrap();
 
         let mut kv: Vec<u8> = Vec::new();
         kv.extend_from_slice(key.as_bytes());
         kv.extend_from_slice(&value.to_be_bytes());
 
-        let encoded = datafile_entry.encode();
+        let encoded = datafile_entry.encode().unwrap();
 
         assert_eq!(encoded[0..20], datafile_entry.header.encode());
         assert_eq!(encoded[20..], kv);
@@ -359,7 +369,7 @@ mod datafile_tests {
     #[test]
     #[allow(clippy::unnecessary_cast)]
     fn datafile_header_decode_ok() {
-        let datafile_header = DatafileHeader::from(
+        let datafile_header = DatafileHeader::new(
             String::from("hello world").as_bytes(),
             &(2 as u64).to_be_bytes(),
         )
@@ -374,7 +384,7 @@ mod datafile_tests {
     #[test]
     #[allow(clippy::unnecessary_cast)]
     fn datafile_header_decode_err() {
-        let datafile_header = DatafileHeader::from(
+        let datafile_header = DatafileHeader::new(
             String::from("hello world").as_bytes(),
             &(2 as u64).to_be_bytes(),
         )
@@ -389,7 +399,7 @@ mod datafile_tests {
     #[test]
     #[allow(clippy::unnecessary_cast)]
     fn datafile_entry_decode_ok() {
-        let datafile_entry = DatafileEntry::from(
+        let datafile_entry = DatafileEntry::new(
             String::from("hello world").as_bytes(),
             &(2 as u64).to_be_bytes(),
         )
@@ -397,20 +407,20 @@ mod datafile_tests {
 
         assert_eq!(
             datafile_entry,
-            DatafileEntry::decode(&datafile_entry.encode()).unwrap()
+            DatafileEntry::decode(&datafile_entry.encode().unwrap()).unwrap()
         );
     }
 
     #[test]
     #[allow(clippy::unnecessary_cast)]
     fn datafile_entry_decode_err() {
-        let datafile_entry = DatafileEntry::from(
+        let datafile_entry = DatafileEntry::new(
             String::from("hello world").as_bytes(),
             &(2 as u64).to_be_bytes(),
         )
         .unwrap();
 
-        let encoded = datafile_entry.encode();
+        let encoded = datafile_entry.encode().unwrap();
 
         assert!(matches!(
             DatafileEntry::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
@@ -421,5 +431,35 @@ mod datafile_tests {
             DatafileEntry::decode(&encoded[..encoded.len() - 1]),
             Err(DatafileError::UndersizedDatafileValue { .. })
         ));
+    }
+
+    #[test]
+    fn datafile_entry_decode_corrupt_sizes() {
+        let mut bytes = vec![0u8; DATAFILE_HEADER_SIZE_BYTES];
+
+        bytes[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            DatafileEntry::decode(&bytes),
+            Err(DatafileError::UndersizedDatafileKey { .. })
+        ));
+
+        bytes[12..16].copy_from_slice(&0u32.to_be_bytes());
+        bytes[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            DatafileEntry::decode(&bytes),
+            Err(DatafileError::UndersizedDatafileValue { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn size_err() {
+        let datafile_entry = DatafileEntry::new(
+            String::from("hello world").as_bytes(),
+            &(2 as u64).to_be_bytes(),
+        )
+        .unwrap();
+
+        assert!(datafile_entry.size().is_ok());
     }
 }
