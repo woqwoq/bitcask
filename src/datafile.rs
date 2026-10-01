@@ -205,7 +205,9 @@ mod datafile_tests {
     use crc32fast::Hasher;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::datafile::{DatafileEntry, DatafileError, DatafileHeader};
+    use crate::datafile::{
+        DATAFILE_HEADER_SIZE_BYTES, DatafileEntry, DatafileError, DatafileHeader,
+    };
 
     pub fn crc_of(timestamp: u64, key_size: u32, value_size: u32, key: &[u8], value: &[u8]) -> u32 {
         let mut hasher = Hasher::new();
@@ -397,5 +399,27 @@ mod datafile_tests {
             datafile_entry,
             DatafileEntry::decode(&datafile_entry.encode()).unwrap()
         );
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn datafile_entry_decode_err() {
+        let datafile_entry = DatafileEntry::from(
+            String::from("hello world").as_bytes(),
+            &(2 as u64).to_be_bytes(),
+        )
+        .unwrap();
+
+        let encoded = datafile_entry.encode();
+
+        assert!(matches!(
+            DatafileEntry::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
+            Err(DatafileError::UndersizedDatafileKey { .. })
+        ));
+
+        assert!(matches!(
+            DatafileEntry::decode(&encoded[..encoded.len() - 1]),
+            Err(DatafileError::UndersizedDatafileValue { .. })
+        ));
     }
 }
