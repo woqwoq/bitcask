@@ -1,8 +1,7 @@
 use std::{
     array::TryFromSliceError,
-    fmt::format,
     fs::{File, OpenOptions},
-    io::{Error, IoSlice, Write},
+    io::{Error, Write},
     os::unix::fs::FileExt,
     path::PathBuf,
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
@@ -85,7 +84,21 @@ impl Datafile {
         })
     }
 
-    pub fn write_log(&mut self, entry: &DatafileLog) -> Result<(), DatafileError> {
+    pub fn open_from_file(
+        dir: PathBuf,
+        file: File,
+        file_id: u32,
+    ) -> Result<Datafile, DatafileError> {
+        Ok(Datafile {
+            file,
+            id: file_id,
+            offset: 0,
+            path: dir,
+            df_type: DatafileType::Writer,
+        })
+    }
+
+    pub fn write_log(&mut self, entry: &DatafileLog) -> Result<u64, DatafileError> {
         if !self.is_writer() {
             return Err(DatafileError::WriteAttemptToReaderDatafile);
         }
@@ -93,14 +106,24 @@ impl Datafile {
         if self.offset as usize + entry.size()? >= DATAFILE_MAX_SIZE_BYTES {
             return Err(DatafileError::DatafileFull);
         }
+        let start_offset = self.offset;
 
         // Move offset, so first so we fail-fast before we commit the transaction
         self.move_writer_offset(entry.size()? as u64)?;
 
         // Commit
-        self.file.write_all(&entry.header.encode())?;
-        self.file.write_all(&entry.key)?;
-        self.file.write_all(&entry.value)?;
+        Self::write_log_to(&mut self.file, entry)?;
+
+        Ok(start_offset)
+    }
+
+    pub fn write_log_to<W: Write>(
+        writer: &mut W,
+        entry: &DatafileLog,
+    ) -> Result<(), DatafileError> {
+        writer.write_all(&entry.header.encode())?;
+        writer.write_all(&entry.key)?;
+        writer.write_all(&entry.value)?;
 
         Ok(())
     }
@@ -133,15 +156,8 @@ impl Datafile {
         self.df_type == DatafileType::Writer
     }
 
-    fn generate_filename(dir: &PathBuf, file_id: u32) -> Result<String, DatafileError> {
-        Ok(format!(
-            "{}/{:08}.{}",
-            dir.as_os_str()
-                .to_str()
-                .ok_or(DatafileError::InvalidPath(dir.clone()))?,
-            file_id,
-            DATAFILE_EXTENSION
-        ))
+    fn generate_filename(dir: &PathBuf, file_id: u32) -> Result<PathBuf, DatafileError> {
+        Ok(dir.join(format!("{:08}.{}", file_id, DATAFILE_EXTENSION)))
     }
 }
 
@@ -258,14 +274,6 @@ impl DatafileLog {
         usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileEntry)
     }
 
-    pub fn write_to<W: Write>(&self, buf: &mut W) -> Result<(), DatafileError> {
-        buf.write_all(&self.header.encode())?;
-        buf.write_all(&self.key)?;
-        buf.write_all(&self.value)?;
-
-        Ok(())
-    }
-
     pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
         let datafile_size = bytes.len() as u64;
         let header = DatafileLogHeader::decode(bytes)?;
@@ -322,7 +330,7 @@ mod datafile_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::datafile::{
-        DATAFILE_HEADER_SIZE_BYTES, DatafileError, DatafileLog, DatafileLogHeader,
+        DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileError, DatafileLog, DatafileLogHeader,
     };
 
     pub fn crc_of(timestamp: u64, key_size: u32, value_size: u32, key: &[u8], value: &[u8]) -> u32 {
@@ -470,7 +478,7 @@ mod datafile_tests {
 
         let mut encoded: Vec<u8> = Vec::new();
 
-        datafile_entry.write_to(&mut encoded).unwrap();
+        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
 
         assert_eq!(encoded[0..20], datafile_entry.header.encode());
         assert_eq!(encoded[20..], kv);
@@ -517,7 +525,7 @@ mod datafile_tests {
 
         let mut encoded: Vec<u8> = Vec::new();
 
-        datafile_entry.write_to(&mut encoded).unwrap();
+        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
 
         assert_eq!(datafile_entry, DatafileLog::decode(&encoded).unwrap());
     }
@@ -533,7 +541,7 @@ mod datafile_tests {
 
         let mut encoded: Vec<u8> = Vec::new();
 
-        datafile_entry.write_to(&mut encoded).unwrap();
+        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
 
         assert!(matches!(
             DatafileLog::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
@@ -574,5 +582,39 @@ mod datafile_tests {
         .unwrap();
 
         assert!(datafile_entry.size().is_ok());
+    }
+
+    #[test]
+    fn datafile_write_log() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+
+        let datafile_entry =
+            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+        let entry_size = datafile_entry.size().unwrap();
+
+        let offset = df.write_log(&datafile_entry).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(df.offset, entry_size as u64);
+
+        let mut expected = Vec::new();
+        Datafile::write_log_to(&mut expected, &datafile_entry).unwrap();
+        let read_bytes = df.read_bytes(offset, entry_size).unwrap();
+        assert_eq!(&*read_bytes, &expected[..]);
+    }
+
+    #[test]
+    fn datafile_move_writer_offset() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+
+        let datafile_entry =
+            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+        let entry_size = datafile_entry.size().unwrap() as u64;
+
+        assert_eq!(df.offset, 0);
+        let offset = df.write_log(&datafile_entry).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(df.offset, entry_size);
     }
 }
