@@ -1,23 +1,31 @@
 use std::{
     fs::File,
-    io::BufWriter,
+    io::{BufWriter, Error},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
 
 use lru::LruCache;
 
 use crate::{
-    datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileEntry, DatafileError},
+    datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileError, DatafileLog},
     keydir::KeyDir,
 };
 
 const LRU_CACHED_READERS_COUNT: usize = 10;
-const DATAFILE_MAX_SIZE_BYTES: usize = 10_000_000;
 
+#[derive(Debug)]
 pub enum BitcaskError {
     DatafileError(DatafileError),
 
-    WriterFileOffsetOverflow,
+    DatafileMissing(usize),
+    IO(Error),
+}
+
+impl From<Error> for BitcaskError {
+    fn from(value: Error) -> Self {
+        BitcaskError::IO(value)
+    }
 }
 
 impl From<DatafileError> for BitcaskError {
@@ -27,12 +35,10 @@ impl From<DatafileError> for BitcaskError {
 }
 
 pub struct BitcaskInstance {
-    keydir: KeyDir,                    // In-memory keydir map
-    active_file: BufWriter<File>,      // Writer file handle
-    active_file_id: u32,               // Writer file id
-    active_file_offset: u64,           // Writer file offset
-    dir_path: PathBuf,                 // For opening files through LRU
-    reader_files: LruCache<u32, File>, // Use LRU cache to track recently used files
+    keydir: KeyDir,                        // In-memory keydir map
+    active_file: Datafile,                 // Writer file handle
+    dir_path: PathBuf,                     // For opening files through LRU
+    reader_files: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
 }
 
 impl BitcaskInstance {
@@ -41,47 +47,54 @@ impl BitcaskInstance {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
-        let entry = DatafileEntry::new(key, value)?;
-        let entry_size = entry.size()?;
+        let entry = DatafileLog::new(key, value)?;
 
-        if self.active_file_offset as usize + entry_size >= DATAFILE_HEADER_SIZE_BYTES {
+        if self
+            .active_file
+            .should_switch_writer_before_write_commit(&entry)?
+        {
             self.switch_writer_datafile()?;
-            return Err(BitcaskError::DatafileError(DatafileError::DatafileFull));
         }
 
         self.commit_datafile_write(&entry)?; // Write log first, so that it can be
         // replayed in case of a crash.
 
         self.commit_keydir_write(entry)?; // Append entry to the keydir
-        self.move_writer_offset(entry_size)?; // Move the writer offset to suit the new entry
 
         Ok(())
     }
 
-    fn commit_keydir_write(&mut self, datafile: DatafileEntry) -> Result<(), BitcaskError> {
-        let ksz = datafile.header.key_size;
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
+        if let Some(keydir_entry) = self.keydir.get(key) {
+            if let Some(reader) = self.reader_files.get(&keydir_entry.file_id) {
+                Ok(Some(
+                    reader
+                        .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+                        .map_err(BitcaskError::DatafileError)?,
+                ))
+            } else {
+                Err(BitcaskError::DatafileMissing(keydir_entry.file_id as usize))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn commit_keydir_write(&mut self, log: DatafileLog) -> Result<(), BitcaskError> {
+        let ksz = log.header.key_size;
 
         self.keydir.put(
-            datafile,
-            self.active_file_id,
-            DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64 + self.active_file_offset,
+            log,
+            self.active_file.id,
+            DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64 + self.active_file.offset,
         );
 
         Ok(())
     }
 
-    fn move_writer_offset(&mut self, entry_size: usize) -> Result<(), BitcaskError> {
-        self.active_file_offset = self
-            .active_file_offset
-            .checked_add(entry_size as u64)
-            .ok_or(BitcaskError::WriterFileOffsetOverflow)?;
-
-        Ok(())
-    }
-
-    fn commit_datafile_write(&mut self, datafile: &DatafileEntry) -> Result<(), BitcaskError> {
-        datafile
-            .write_to(&mut self.active_file)
+    fn commit_datafile_write(&mut self, log: &DatafileLog) -> Result<(), BitcaskError> {
+        self.active_file
+            .write_log(log)
             .map_err(BitcaskError::DatafileError)
     }
 
@@ -98,7 +111,7 @@ mod test {
     use tempfile::TempDir;
 
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileEntry},
+        datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileLog},
         engine::{BitcaskInstance, LRU_CACHED_READERS_COUNT, test},
         keydir::{KeyDir, KeyDirEntry},
     };
@@ -126,7 +139,7 @@ mod test {
         )
     }
 
-    pub fn keydir_entry_for(datafile_entry: &DatafileEntry, db: &BitcaskInstance) -> KeyDirEntry {
+    pub fn keydir_entry_for(datafile_entry: &DatafileLog, db: &BitcaskInstance) -> KeyDirEntry {
         KeyDirEntry::new(
             db.active_file_id,
             datafile_entry.header.value_size,
@@ -137,16 +150,16 @@ mod test {
         )
     }
 
-    pub fn datafile_entry_for_string_string(key: &str, value: &str) -> DatafileEntry {
-        DatafileEntry::new(key.as_bytes(), value.as_bytes()).unwrap()
+    pub fn datafile_entry_for_string_string(key: &str, value: &str) -> DatafileLog {
+        DatafileLog::new(key.as_bytes(), value.as_bytes()).unwrap()
     }
 
-    pub fn datafile_entry_for_u32_string(key: u32, value: &str) -> DatafileEntry {
-        DatafileEntry::new(&key.to_be_bytes(), value.as_bytes()).unwrap()
+    pub fn datafile_entry_for_u32_string(key: u32, value: &str) -> DatafileLog {
+        DatafileLog::new(&key.to_be_bytes(), value.as_bytes()).unwrap()
     }
 
-    pub fn datafile_entry_for_string_u32(key: &str, value: u32) -> DatafileEntry {
-        DatafileEntry::new(key.as_bytes(), &value.to_be_bytes()).unwrap()
+    pub fn datafile_entry_for_string_u32(key: &str, value: u32) -> DatafileLog {
+        DatafileLog::new(key.as_bytes(), &value.to_be_bytes()).unwrap()
     }
 
     #[test]
@@ -232,5 +245,20 @@ mod test {
 
         // Offset Move
         assert_eq!(db.active_file_offset, datafile_entry.size().unwrap() as u64);
+    }
+
+    #[test]
+    fn get_ok() {
+        let (mut db, _dir) = build_mock_bitcask_instance();
+
+        let key = "hello world";
+        let value: u32 = 2;
+
+        assert!(db.put(key.as_bytes(), &value.to_be_bytes()).is_ok());
+
+        assert_eq!(
+            db.get(key.as_bytes()).unwrap().unwrap(),
+            Box::from(value.to_be_bytes())
+        );
     }
 }

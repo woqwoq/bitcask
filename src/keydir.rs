@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::datafile::DatafileEntry;
+use crate::datafile::DatafileLog;
 
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
 #[derive(Debug, PartialEq, Clone)]
@@ -33,7 +33,7 @@ impl KeyDir {
         }
     }
 
-    pub fn put(&mut self, entry: DatafileEntry, file_id: u32, value_offset: u64) {
+    pub fn put(&mut self, entry: DatafileLog, file_id: u32, value_offset: u64) {
         self.dir.insert(
             entry.key,
             KeyDirEntry::new(
