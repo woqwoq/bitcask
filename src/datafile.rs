@@ -1,5 +1,6 @@
 use std::{
     array::TryFromSliceError,
+    io::{Error, IoSlice, Write},
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
@@ -9,11 +10,19 @@ use crc32fast::Hasher;
 pub enum DatafileError {
     NegativeTimestamp(SystemTimeError),
     SliceConversion(TryFromSliceError),
+    DatafileFull,
     OversizedDatafileEntry,
     UndersizedDatafileHeader(usize),
     UndersizedDatafileKey { actual: usize, expected: usize },
     UndersizedDatafileValue { actual: usize, expected: usize },
     CrcMismatch,
+    IOWrite(Error),
+}
+
+impl From<Error> for DatafileError {
+    fn from(value: Error) -> Self {
+        Self::IOWrite(value)
+    }
 }
 
 impl From<SystemTimeError> for DatafileError {
@@ -34,7 +43,7 @@ pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
 pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
 pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DatafileHeader {
     pub crc: u32,        // CRC32 of all fields below
     pub timestamp: u64,  // UNIX Timestamp when the entry was created
@@ -84,7 +93,7 @@ impl DatafileHeader {
         hasher.finalize()
     }
 
-    fn encode(&self) -> [u8; DATAFILE_HEADER_SIZE_BYTES] {
+    pub fn encode(&self) -> [u8; DATAFILE_HEADER_SIZE_BYTES] {
         let mut arr: [u8; DATAFILE_HEADER_SIZE_BYTES] = [0; DATAFILE_HEADER_SIZE_BYTES];
 
         arr[0..4].copy_from_slice(&self.crc.to_be_bytes());
@@ -115,7 +124,7 @@ impl DatafileHeader {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DatafileEntry {
     pub header: DatafileHeader,
     pub key: Box<[u8]>,
@@ -147,15 +156,12 @@ impl DatafileEntry {
         usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileEntry)
     }
 
-    pub fn encode(&self) -> Result<Box<[u8]>, DatafileError> {
-        // TODO: Rework into vectored writes to avoid allocation
-        let mut buf: Vec<u8> = Vec::with_capacity(self.size()?);
+    pub fn write_to<W: Write>(&self, buf: &mut W) -> Result<(), DatafileError> {
+        buf.write_all(&self.header.encode())?;
+        buf.write_all(&self.key)?;
+        buf.write_all(&self.value)?;
 
-        buf.extend_from_slice(&self.header.encode());
-        buf.extend_from_slice(&self.key);
-        buf.extend_from_slice(&self.value);
-
-        Ok(Box::from(buf))
+        Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
@@ -360,7 +366,9 @@ mod datafile_tests {
         kv.extend_from_slice(key.as_bytes());
         kv.extend_from_slice(&value.to_be_bytes());
 
-        let encoded = datafile_entry.encode().unwrap();
+        let mut encoded: Vec<u8> = Vec::new();
+
+        datafile_entry.write_to(&mut encoded).unwrap();
 
         assert_eq!(encoded[0..20], datafile_entry.header.encode());
         assert_eq!(encoded[20..], kv);
@@ -405,10 +413,11 @@ mod datafile_tests {
         )
         .unwrap();
 
-        assert_eq!(
-            datafile_entry,
-            DatafileEntry::decode(&datafile_entry.encode().unwrap()).unwrap()
-        );
+        let mut encoded: Vec<u8> = Vec::new();
+
+        datafile_entry.write_to(&mut encoded).unwrap();
+
+        assert_eq!(datafile_entry, DatafileEntry::decode(&encoded).unwrap());
     }
 
     #[test]
@@ -420,7 +429,9 @@ mod datafile_tests {
         )
         .unwrap();
 
-        let encoded = datafile_entry.encode().unwrap();
+        let mut encoded: Vec<u8> = Vec::new();
+
+        datafile_entry.write_to(&mut encoded).unwrap();
 
         assert!(matches!(
             DatafileEntry::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
