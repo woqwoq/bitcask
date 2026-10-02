@@ -103,9 +103,6 @@ impl Datafile {
             return Err(DatafileError::WriteAttemptToReaderDatafile);
         }
 
-        if self.offset as usize + entry.size()? >= DATAFILE_MAX_SIZE_BYTES {
-            return Err(DatafileError::DatafileFull);
-        }
         let start_offset = self.offset;
 
         // Move offset, so first so we fail-fast before we commit the transaction
@@ -132,14 +129,24 @@ impl Datafile {
         &self,
         entry: &DatafileLog,
     ) -> Result<bool, DatafileError> {
-        Ok(self.offset as usize + entry.size()? >= DATAFILE_MAX_SIZE_BYTES)
+        Ok(self
+            .offset
+            .checked_add(entry.size()? as u64)
+            .unwrap_or(DATAFILE_MAX_SIZE_BYTES as u64)
+            >= DATAFILE_MAX_SIZE_BYTES as u64)
     }
 
     fn move_writer_offset(&mut self, offset: u64) -> Result<(), DatafileError> {
-        self.offset = self
+        let new_offset = self
             .offset
             .checked_add(offset)
             .ok_or(DatafileError::WriterFileOffsetOverflow)?;
+
+        if new_offset >= DATAFILE_MAX_SIZE_BYTES as u64 {
+            return Err(DatafileError::DatafileFull);
+        }
+
+        self.offset = new_offset;
 
         Ok(())
     }
@@ -330,7 +337,8 @@ mod datafile_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::datafile::{
-        DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileError, DatafileLog, DatafileLogHeader,
+        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileError, DatafileLog,
+        DatafileLogHeader,
     };
 
     pub fn crc_of(timestamp: u64, key_size: u32, value_size: u32, key: &[u8], value: &[u8]) -> u32 {
@@ -616,5 +624,47 @@ mod datafile_tests {
         let offset = df.write_log(&datafile_entry).unwrap();
         assert_eq!(offset, 0);
         assert_eq!(df.offset, entry_size);
+    }
+
+    #[test]
+    fn datafile_non_writer_write_err() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        df.df_type = crate::datafile::DatafileType::Reader;
+
+        let datafile_entry =
+            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+
+        assert!(matches!(
+            df.write_log(&datafile_entry),
+            Err(DatafileError::WriteAttemptToReaderDatafile)
+        ));
+    }
+
+    #[test]
+    fn datafile_write_err_full() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        df.offset = DATAFILE_MAX_SIZE_BYTES as u64;
+
+        let datafile_entry =
+            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+
+        assert!(matches!(
+            df.write_log(&datafile_entry),
+            Err(DatafileError::DatafileFull)
+        ));
+    }
+
+    #[test]
+    fn move_writer_offset_err_ovf() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        df.offset = u64::MAX;
+
+        assert!(matches!(
+            df.move_writer_offset(1),
+            Err(DatafileError::WriterFileOffsetOverflow)
+        ));
     }
 }

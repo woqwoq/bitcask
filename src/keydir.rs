@@ -54,3 +54,40 @@ impl KeyDir {
         self.dir.len()
     }
 }
+
+#[cfg(test)]
+mod keydir_tests {
+    use crate::{
+        datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileLog},
+        keydir::{KeyDir, KeyDirEntry},
+    };
+
+    #[test]
+    fn new() {
+        let keydir = KeyDir::new();
+        assert_eq!(keydir.size(), 0);
+    }
+
+    #[test]
+    fn put_get() {
+        let mut keydir = KeyDir::new();
+        assert_eq!(keydir.size(), 0);
+
+        let key = "hello world".as_bytes();
+        let value = 67u32.to_be_bytes();
+
+        let datafile_entry = DatafileLog::new(key, &value).unwrap();
+        let offset = DATAFILE_HEADER_SIZE_BYTES as u64 + datafile_entry.header.key_size as u64;
+
+        keydir.put(datafile_entry.clone(), 0, offset);
+
+        let expected = KeyDirEntry::new(
+            0,
+            datafile_entry.header.value_size,
+            offset,
+            datafile_entry.header.timestamp,
+        );
+
+        assert_eq!(keydir.get(key).unwrap(), &expected);
+    }
+}
