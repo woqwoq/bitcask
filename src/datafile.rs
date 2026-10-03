@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -9,7 +9,7 @@ use std::{
 
 use crc32fast::Hasher;
 
-use crate::error::DatafileError;
+use crate::{error::DatafileError, keydir::KeyDir};
 
 pub const DATAFILE_HEADER_SIZE_BYTES: usize = 20;
 pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
@@ -17,8 +17,8 @@ pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
 pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
 pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
-pub const DATAFILE_MAX_SIZE_BYTES: usize = 10_000_000;
-const DATAFILE_EXTENSION: &str = "db";
+pub const DATAFILE_MAX_SIZE_BYTES: usize = 10_000;
+pub const DATAFILE_EXTENSION: &str = "db";
 
 pub struct Datafile {
     file: File,
@@ -60,6 +60,32 @@ impl Datafile {
             offset: 0,
             is_writer: false,
         })
+    }
+
+    pub fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
+        let mut buf = Vec::new();
+        self.file.read_to_end(&mut buf)?;
+
+        let mut start_offset = 0;
+
+        while start_offset < buf.len() {
+            let log = DatafileLog::decode(&buf[start_offset..])?;
+
+            let log_size = log.size()?;
+            let ksz = log.header.key_size;
+
+            keydir.put(
+                log,
+                self.id,
+                start_offset as u64 + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
+            );
+
+            start_offset += log_size;
+        }
+
+        self.offset = start_offset as u64;
+
+        Ok(())
     }
 
     pub fn append_log(&mut self, entry: &DatafileLog) -> Result<u64, DatafileError> {
@@ -127,7 +153,7 @@ impl Datafile {
         self.is_writer = false;
     }
 
-    fn generate_filename(dir: &Path, file_id: u32) -> Result<PathBuf, DatafileError> {
+    pub fn generate_filename(dir: &Path, file_id: u32) -> Result<PathBuf, DatafileError> {
         Ok(dir.join(format!("{:08}.{}", file_id, DATAFILE_EXTENSION)))
     }
 }
@@ -342,11 +368,17 @@ impl Display for DatafileLog {
 #[cfg(test)]
 mod datafile_tests {
     use crc32fast::Hasher;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        io::Seek,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use crate::datafile::{
-        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileError, DatafileLog,
-        DatafileLogHeader,
+    use crate::{
+        datafile::{
+            DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileError,
+            DatafileLog, DatafileLogHeader,
+        },
+        keydir::KeyDir,
     };
 
     pub fn crc_of(timestamp: u64, key_size: u32, value_size: u32, key: &[u8], value: &[u8]) -> u32 {
@@ -681,5 +713,29 @@ mod datafile_tests {
         let formatted = format!("{entry}");
         assert!(formatted.contains("hello"));
         assert!(formatted.contains("world"));
+    }
+
+    #[test]
+    fn replay_ok() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+
+        // Pre-fill datafile
+        for i in 0..30usize {
+            assert!(
+                df.append_log(
+                    &DatafileLog::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                )
+                .is_ok()
+            );
+        }
+        let _ = df.file.rewind();
+
+        let mut keydir = KeyDir::new();
+
+        df.replay(&mut keydir).unwrap();
+
+        assert_eq!(keydir.size(), 30);
+        (0..30usize).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
     }
 }

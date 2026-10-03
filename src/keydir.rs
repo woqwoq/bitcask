@@ -50,6 +50,10 @@ impl KeyDir {
         );
     }
 
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.dir.contains_key(key)
+    }
+
     pub fn size(&self) -> usize {
         self.dir.len()
     }

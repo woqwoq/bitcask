@@ -1,3 +1,5 @@
+use std::{path::PathBuf, process};
+
 use crate::engine::BitcaskInstance;
 
 mod datafile;
@@ -6,7 +8,24 @@ mod error;
 mod keydir;
 
 fn main() {
-    let (mut db, _) = BitcaskInstance::build_mock_bitcask_instance();
+    match BitcaskInstance::open(PathBuf::from("db")) {
+        Ok(mut db) => {
+            for i in 0..2000u32 {
+                if db.get(&i.to_be_bytes()).unwrap().unwrap()
+                    != Box::from(format!("{i}").as_bytes())
+                {
+                    println!("Miss: {}", i);
+                }
+            }
 
-    db.put("h".as_bytes(), "1".as_bytes()).unwrap();
+            println!("Writer:\n{}\n Readers:\n", db.writer);
+            for (_, df) in db.readers {
+                println!("{df}\n");
+            }
+        }
+        Err(e) => {
+            eprintln!("{e:?}");
+            process::exit(1);
+        }
+    }
 }

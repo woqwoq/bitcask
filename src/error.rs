@@ -1,10 +1,27 @@
-use std::{array::TryFromSliceError, io::Error, path::PathBuf, time::SystemTimeError};
+use std::{
+    array::TryFromSliceError, io::Error, num::ParseIntError, path::PathBuf, time::SystemTimeError,
+};
 
 #[derive(Debug)]
 pub enum BitcaskError {
     DatafileError(DatafileError),
 
     DatafileMissing(usize),
+    InvalidDBPath(Error),
+    FilenameConversion,
+    DatafileNameError(ParseIntError),
+}
+
+impl From<ParseIntError> for BitcaskError {
+    fn from(value: ParseIntError) -> Self {
+        Self::DatafileNameError(value)
+    }
+}
+
+impl From<Error> for BitcaskError {
+    fn from(value: Error) -> Self {
+        Self::InvalidDBPath(value)
+    }
 }
 
 impl From<DatafileError> for BitcaskError {

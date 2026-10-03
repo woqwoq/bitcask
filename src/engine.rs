@@ -1,10 +1,10 @@
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{fs::read_dir, num::NonZeroUsize, path::PathBuf};
 
 use lru::LruCache;
 use tempfile::TempDir;
 
 use crate::{
-    datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileLog},
+    datafile::{DATAFILE_EXTENSION, DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileLog},
     error::BitcaskError,
     keydir::KeyDir,
 };
@@ -12,15 +12,50 @@ use crate::{
 pub const LRU_CACHED_READERS_COUNT: usize = 10;
 
 pub struct BitcaskInstance {
-    pub(crate) keydir: KeyDir,        // In-memory keydir map
-    writer: Datafile,                 // Writer file handle
-    dir_path: PathBuf,                // For opening files through LRU
-    readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
+    pub(crate) keydir: KeyDir,            // In-memory keydir map
+    pub writer: Datafile,                 // Writer file handle
+    dir_path: PathBuf,                    // For opening files through LRU
+    pub readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
 }
 
 impl BitcaskInstance {
-    pub fn open(dir_path: PathBuf) -> Result<Self, BitcaskError> {
-        todo!()
+    pub fn open(dir: PathBuf) -> Result<Self, BitcaskError> {
+        let mut keydir = KeyDir::new();
+        let mut readers: LruCache<u32, Datafile> =
+            LruCache::new(NonZeroUsize::new(LRU_CACHED_READERS_COUNT).unwrap());
+
+        let mut ids: Vec<u32> = Vec::new();
+        for file in read_dir(&dir)? {
+            let filename = file?
+                .file_name()
+                .into_string()
+                .map_err(|_| BitcaskError::FilenameConversion)?;
+
+            if let Some((name, ext)) = filename.rsplit_once('.') {
+                if ext == DATAFILE_EXTENSION {
+                    ids.push(name.parse::<u32>()?);
+                }
+            } else {
+                continue;
+            }
+        }
+        ids.sort();
+
+        let mut highest_id = 0u32;
+        for id in ids {
+            let mut df = Datafile::open_reader(&dir, id)?;
+            df.replay(&mut keydir)?;
+
+            readers.put(id, df);
+            highest_id = highest_id.max(id);
+        }
+
+        Ok(BitcaskInstance {
+            keydir,
+            writer: Datafile::new_writer(&dir, highest_id + 1)?,
+            dir_path: dir,
+            readers,
+        })
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
