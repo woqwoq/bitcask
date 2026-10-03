@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 use crate::datafile::DatafileLog;
 
@@ -52,6 +52,31 @@ impl KeyDir {
 
     pub fn size(&self) -> usize {
         self.dir.len()
+    }
+}
+
+impl Display for KeyDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "| {:<20} | {:<16} | {:<8} | {:<10} | {:<12} |",
+            "key", "timestamp", "file_id", "value_size", "value_offset"
+        )?;
+        writeln!(
+            f,
+            "|{:-<22}|{:-<18}|{:-<10}|{:-<12}|{:-<14}|",
+            "", "", "", "", ""
+        )?;
+        for (key, val) in self.dir.iter() {
+            let key_str = String::from_utf8_lossy(key);
+            writeln!(
+                f,
+                "| {:<20} | {:<16} | {:<8} | {:<10} | {:<12} |",
+                key_str, val.timestamp, val.file_id, val.value_size, val.value_offset
+            )?;
+        }
+
+        Ok(())
     }
 }
 

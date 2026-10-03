@@ -1,8 +1,9 @@
 use std::{
+    fmt::Display,
     fs::{File, OpenOptions},
     io::Write,
     os::unix::fs::FileExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -23,13 +24,12 @@ pub struct Datafile {
     file: File,
     pub id: u32,
     pub offset: u64,
-    path: PathBuf,
     pub is_writer: bool,
 }
 
 impl Datafile {
-    pub fn new(dir: PathBuf, file_id: u32) -> Result<Datafile, DatafileError> {
-        let filename = Self::generate_filename(&dir, file_id)?;
+    pub fn new_writer(dir: &Path, id: u32) -> Result<Datafile, DatafileError> {
+        let filename = Self::generate_filename(dir, id)?;
 
         let file = OpenOptions::new()
             .read(true)
@@ -39,14 +39,30 @@ impl Datafile {
 
         Ok(Datafile {
             file,
-            id: file_id,
+            id,
             offset: 0,
-            path: dir.clone(),
             is_writer: true,
         })
     }
 
-    pub fn write_log(&mut self, entry: &DatafileLog) -> Result<u64, DatafileError> {
+    pub fn open_reader(dir: &Path, id: u32) -> Result<Datafile, DatafileError> {
+        let filename = Self::generate_filename(dir, id)?;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .open(filename)?;
+
+        Ok(Datafile {
+            file,
+            id,
+            offset: 0,
+            is_writer: false,
+        })
+    }
+
+    pub fn append_log(&mut self, entry: &DatafileLog) -> Result<u64, DatafileError> {
         if !self.is_writer {
             return Err(DatafileError::WriteAttemptToReaderDatafile);
         }
@@ -111,8 +127,24 @@ impl Datafile {
         self.is_writer = false;
     }
 
-    fn generate_filename(dir: &PathBuf, file_id: u32) -> Result<PathBuf, DatafileError> {
+    fn generate_filename(dir: &Path, file_id: u32) -> Result<PathBuf, DatafileError> {
         Ok(dir.join(format!("{:08}.{}", file_id, DATAFILE_EXTENSION)))
+    }
+}
+
+impl Display for Datafile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "| {:<6} | {:<10} | {:<10} |",
+            "id", "offset", "is_writer"
+        )?;
+        writeln!(f, "|{:-<8}|{:-<12}|{:-<12}|", "", "", "")?;
+        write!(
+            f,
+            "| {:<6} | {:<10} | {:<10} |",
+            self.id, self.offset, self.is_writer
+        )
     }
 }
 
@@ -276,6 +308,34 @@ impl DatafileLog {
             key: key_bytes,
             value: value_bytes,
         })
+    }
+}
+
+impl Display for DatafileLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key_str = String::from_utf8_lossy(&self.key);
+        let value_str = String::from_utf8_lossy(&self.value);
+
+        writeln!(
+            f,
+            "| {:<10} | {:<16} | {:<10} | {:<10} | {:<20} | {:<20} |",
+            "crc", "timestamp", "key_size", "value_size", "key", "value"
+        )?;
+        writeln!(
+            f,
+            "|{:-<12}|{:-<18}|{:-<12}|{:-<12}|{:-<22}|{:-<22}|",
+            "", "", "", "", "", ""
+        )?;
+        write!(
+            f,
+            "| {:<10} | {:<16} | {:<10} | {:<10} | {:<20} | {:<20} |",
+            self.header.crc,
+            self.header.timestamp,
+            self.header.key_size,
+            self.header.value_size,
+            key_str,
+            value_str
+        )
     }
 }
 
@@ -542,13 +602,13 @@ mod datafile_tests {
     #[test]
     fn datafile_write_log() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
 
         let datafile_entry =
             DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
         let entry_size = datafile_entry.size().unwrap();
 
-        let offset = df.write_log(&datafile_entry).unwrap();
+        let offset = df.append_log(&datafile_entry).unwrap();
         assert_eq!(offset, 0);
         assert_eq!(df.offset, entry_size as u64);
 
@@ -561,14 +621,14 @@ mod datafile_tests {
     #[test]
     fn datafile_move_writer_offset() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
 
         let datafile_entry =
             DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
         let entry_size = datafile_entry.size().unwrap() as u64;
 
         assert_eq!(df.offset, 0);
-        let offset = df.write_log(&datafile_entry).unwrap();
+        let offset = df.append_log(&datafile_entry).unwrap();
         assert_eq!(offset, 0);
         assert_eq!(df.offset, entry_size);
     }
@@ -576,14 +636,14 @@ mod datafile_tests {
     #[test]
     fn datafile_non_writer_write_err() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
         df.demote_to_reader();
 
         let datafile_entry =
             DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
 
         assert!(matches!(
-            df.write_log(&datafile_entry),
+            df.append_log(&datafile_entry),
             Err(DatafileError::WriteAttemptToReaderDatafile)
         ));
     }
@@ -591,14 +651,14 @@ mod datafile_tests {
     #[test]
     fn datafile_write_err_full() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
         df.offset = DATAFILE_MAX_SIZE_BYTES as u64;
 
         let datafile_entry =
             DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
 
         assert!(matches!(
-            df.write_log(&datafile_entry),
+            df.append_log(&datafile_entry),
             Err(DatafileError::DatafileFull)
         ));
     }
@@ -606,12 +666,20 @@ mod datafile_tests {
     #[test]
     fn move_writer_offset_err_ovf() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
         df.offset = u64::MAX;
 
         assert!(matches!(
             df.move_writer_offset(1),
             Err(DatafileError::WriterFileOffsetOverflow)
         ));
+    }
+
+    #[test]
+    fn datafile_log_display() {
+        let entry = DatafileLog::new("hello".as_bytes(), "world".as_bytes()).unwrap();
+        let formatted = format!("{entry}");
+        assert!(formatted.contains("hello"));
+        assert!(formatted.contains("world"));
     }
 }
