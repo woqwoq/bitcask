@@ -2,6 +2,7 @@ use crate::engine::BitcaskInstance;
 
 mod datafile;
 mod engine;
+mod error;
 mod keydir;
 
 fn main() {

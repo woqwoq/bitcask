@@ -4,24 +4,12 @@ use lru::LruCache;
 use tempfile::TempDir;
 
 use crate::{
-    datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileError, DatafileLog},
+    datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileLog},
+    error::BitcaskError,
     keydir::KeyDir,
 };
 
 pub const LRU_CACHED_READERS_COUNT: usize = 10;
-
-#[derive(Debug)]
-pub enum BitcaskError {
-    DatafileError(DatafileError),
-
-    DatafileMissing(usize),
-}
-
-impl From<DatafileError> for BitcaskError {
-    fn from(value: DatafileError) -> Self {
-        Self::DatafileError(value)
-    }
-}
 
 pub struct BitcaskInstance {
     pub(crate) keydir: KeyDir,             // In-memory keydir map
@@ -92,6 +80,14 @@ impl BitcaskInstance {
     }
 
     fn switch_writer_datafile(&mut self) -> Result<(), BitcaskError> {
+        self.active_file.demote_to_reader();
+        let old_writer = &mut self.active_file;
+        let new_writer = Datafile::new(self.dir_path.clone(), old_writer.id + 1)?;
+
+        let old_writer = std::mem::replace(old_writer, new_writer);
+
+        self.reader_files.put(old_writer.id, old_writer);
+
         Ok(())
     }
 
@@ -99,19 +95,9 @@ impl BitcaskInstance {
         let temp_dir = tempfile::tempdir().unwrap();
         let dir_path = PathBuf::from(temp_dir.path());
 
-        let writer = Datafile::open_from_file(
-            dir_path.clone(),
-            tempfile::tempfile_in(&dir_path).unwrap(),
-            2,
-        )
-        .unwrap();
-
-        let reader = Datafile::open_from_file(
-            dir_path.clone(),
-            tempfile::tempfile_in(&dir_path).unwrap(),
-            1,
-        )
-        .unwrap();
+        let writer = Datafile::new(dir_path.clone(), 2).unwrap();
+        let mut reader = Datafile::new(dir_path.clone(), 1).unwrap();
+        reader.is_writer = false;
 
         let mut readers: LruCache<u32, Datafile> =
             LruCache::new(NonZeroUsize::new(LRU_CACHED_READERS_COUNT).unwrap());
@@ -133,7 +119,7 @@ impl BitcaskInstance {
 #[cfg(test)]
 mod test {
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileLog},
+        datafile::{DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileLog},
         engine::BitcaskInstance,
         keydir::KeyDirEntry,
     };
@@ -229,6 +215,60 @@ mod test {
         assert_eq!(
             db.get(key.as_bytes()).unwrap().unwrap(),
             Box::from(value2.as_bytes())
+        );
+    }
+
+    #[test]
+    fn switch_writer_datafile() {
+        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
+
+        assert_eq!(db.active_file.id, 2);
+        assert!(db.active_file.is_writer);
+        assert_eq!(db.active_file.offset, 0);
+        assert_eq!(db.reader_files.len(), 1);
+
+        assert!(db.switch_writer_datafile().is_ok());
+
+        // Make sure old writer is demoted and added to LRU cache of readers
+        assert_eq!(db.reader_files.len(), 2);
+        let old = db.reader_files.get(&2u32).unwrap();
+        assert_eq!(old.id, 2);
+        assert!(!old.is_writer);
+
+        // Make sure new writer is created with proper id, role and offset
+        assert_eq!(db.active_file.id, 3);
+        assert!(db.active_file.is_writer);
+        assert_eq!(db.active_file.offset, 0);
+
+        // Make sure the new datafile accepts writes
+        let key = "hello world";
+        let value: u32 = 2;
+
+        let datafile_entry = datafile_entry_for_string_u32(key, value);
+        assert!(db.active_file.write_log(&datafile_entry).is_ok());
+        assert_eq!(db.active_file.offset, datafile_entry.size().unwrap() as u64);
+    }
+
+    #[test]
+    fn put_switch_writer() {
+        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
+        db.active_file.offset = DATAFILE_MAX_SIZE_BYTES as u64;
+
+        assert_eq!(db.active_file.id, 2);
+        assert!(db.active_file.is_writer);
+        assert_eq!(db.active_file.offset, DATAFILE_MAX_SIZE_BYTES as u64);
+
+        let key = "hello world";
+        let value: u32 = 2;
+
+        assert!(db.put(key.as_bytes(), &value.to_be_bytes()).is_ok());
+
+        // Make sure new writer is created with proper id, role and offset
+        assert_eq!(db.active_file.id, 3);
+        assert!(db.active_file.is_writer);
+        assert_eq!(
+            db.active_file.offset,
+            datafile_entry_for_string_u32(key, value).size().unwrap() as u64
         );
     }
 }

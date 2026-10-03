@@ -1,47 +1,14 @@
 use std::{
-    array::TryFromSliceError,
     fs::{File, OpenOptions},
-    io::{Error, Write},
+    io::Write,
     os::unix::fs::FileExt,
     path::PathBuf,
-    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crc32fast::Hasher;
 
-#[derive(Debug)]
-pub enum DatafileError {
-    NegativeTimestamp(SystemTimeError),
-    SliceConversion(TryFromSliceError),
-    DatafileFull,
-    OversizedDatafileEntry,
-    UndersizedDatafileHeader(usize),
-    UndersizedDatafileKey { actual: usize, expected: usize },
-    UndersizedDatafileValue { actual: usize, expected: usize },
-    CrcMismatch,
-    IOWrite(Error),
-    InvalidPath(PathBuf),
-    WriterFileOffsetOverflow,
-    WriteAttemptToReaderDatafile,
-}
-
-impl From<Error> for DatafileError {
-    fn from(value: Error) -> Self {
-        Self::IOWrite(value)
-    }
-}
-
-impl From<SystemTimeError> for DatafileError {
-    fn from(value: SystemTimeError) -> Self {
-        Self::NegativeTimestamp(value)
-    }
-}
-
-impl From<TryFromSliceError> for DatafileError {
-    fn from(value: TryFromSliceError) -> Self {
-        Self::SliceConversion(value)
-    }
-}
+use crate::error::DatafileError;
 
 pub const DATAFILE_HEADER_SIZE_BYTES: usize = 20;
 pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
@@ -49,20 +16,15 @@ pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
 pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
 pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
+pub const DATAFILE_MAX_SIZE_BYTES: usize = 10_000_000;
 const DATAFILE_EXTENSION: &str = "db";
-const DATAFILE_MAX_SIZE_BYTES: usize = 10_000_000;
 
-#[derive(Debug, PartialEq, Clone)]
-enum DatafileType {
-    Reader,
-    Writer,
-}
 pub struct Datafile {
     file: File,
     pub id: u32,
     pub offset: u64,
     path: PathBuf,
-    df_type: DatafileType,
+    pub is_writer: bool,
 }
 
 impl Datafile {
@@ -80,26 +42,12 @@ impl Datafile {
             id: file_id,
             offset: 0,
             path: dir.clone(),
-            df_type: DatafileType::Writer,
-        })
-    }
-
-    pub fn open_from_file(
-        dir: PathBuf,
-        file: File,
-        file_id: u32,
-    ) -> Result<Datafile, DatafileError> {
-        Ok(Datafile {
-            file,
-            id: file_id,
-            offset: 0,
-            path: dir,
-            df_type: DatafileType::Writer,
+            is_writer: true,
         })
     }
 
     pub fn write_log(&mut self, entry: &DatafileLog) -> Result<u64, DatafileError> {
-        if !self.is_writer() {
+        if !self.is_writer {
             return Err(DatafileError::WriteAttemptToReaderDatafile);
         }
 
@@ -159,8 +107,8 @@ impl Datafile {
         Ok(Box::from(buf))
     }
 
-    pub fn is_writer(&self) -> bool {
-        self.df_type == DatafileType::Writer
+    pub fn demote_to_reader(&mut self) {
+        self.is_writer = false;
     }
 
     fn generate_filename(dir: &PathBuf, file_id: u32) -> Result<PathBuf, DatafileError> {
@@ -493,13 +441,10 @@ mod datafile_tests {
     }
 
     #[test]
-    #[allow(clippy::unnecessary_cast)]
     fn datafile_header_decode_ok() {
-        let datafile_header = DatafileLogHeader::new(
-            String::from("hello world").as_bytes(),
-            &(2 as u64).to_be_bytes(),
-        )
-        .unwrap();
+        let datafile_header =
+            DatafileLogHeader::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                .unwrap();
 
         assert_eq!(
             datafile_header,
@@ -508,13 +453,10 @@ mod datafile_tests {
     }
 
     #[test]
-    #[allow(clippy::unnecessary_cast)]
     fn datafile_header_decode_err() {
-        let datafile_header = DatafileLogHeader::new(
-            String::from("hello world").as_bytes(),
-            &(2 as u64).to_be_bytes(),
-        )
-        .unwrap();
+        let datafile_header =
+            DatafileLogHeader::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                .unwrap();
 
         assert!(matches!(
             DatafileLogHeader::decode(&datafile_header.encode()[0..9]),
@@ -523,13 +465,9 @@ mod datafile_tests {
     }
 
     #[test]
-    #[allow(clippy::unnecessary_cast)]
     fn datafile_entry_decode_ok() {
-        let datafile_entry = DatafileLog::new(
-            String::from("hello world").as_bytes(),
-            &(2 as u64).to_be_bytes(),
-        )
-        .unwrap();
+        let datafile_entry =
+            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
 
         let mut encoded: Vec<u8> = Vec::new();
 
@@ -539,13 +477,9 @@ mod datafile_tests {
     }
 
     #[test]
-    #[allow(clippy::unnecessary_cast)]
     fn datafile_entry_decode_err() {
-        let datafile_entry = DatafileLog::new(
-            String::from("hello world").as_bytes(),
-            &(2 as u64).to_be_bytes(),
-        )
-        .unwrap();
+        let datafile_entry =
+            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
 
         let mut encoded: Vec<u8> = Vec::new();
 
@@ -559,6 +493,23 @@ mod datafile_tests {
         assert!(matches!(
             DatafileLog::decode(&encoded[..encoded.len() - 1]),
             Err(DatafileError::UndersizedDatafileValue { .. })
+        ));
+    }
+
+    #[test]
+    fn datafile_entry_decode_err_crc_mismatch() {
+        let datafile_entry =
+            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
+
+        let mut encoded: Vec<u8> = Vec::new();
+        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
+
+        let last = encoded.len();
+        encoded[last - 1] = 0u8;
+
+        assert!(matches!(
+            DatafileLog::decode(&encoded),
+            Err(DatafileError::CrcMismatch)
         ));
     }
 
@@ -581,13 +532,9 @@ mod datafile_tests {
     }
 
     #[test]
-    #[allow(clippy::unnecessary_cast)]
     fn size_err() {
-        let datafile_entry = DatafileLog::new(
-            String::from("hello world").as_bytes(),
-            &(2 as u64).to_be_bytes(),
-        )
-        .unwrap();
+        let datafile_entry =
+            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
 
         assert!(datafile_entry.size().is_ok());
     }
@@ -630,7 +577,7 @@ mod datafile_tests {
     fn datafile_non_writer_write_err() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut df = Datafile::new(temp_dir.path().to_path_buf(), 1).unwrap();
-        df.df_type = crate::datafile::DatafileType::Reader;
+        df.demote_to_reader();
 
         let datafile_entry =
             DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
