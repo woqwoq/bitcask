@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{Read, Seek, Write},
+    io::{Read, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -735,7 +735,7 @@ mod datafile_tests {
 
         df.replay(&mut keydir).unwrap();
 
-        assert_eq!(keydir.size(), 30);
+        assert_eq!(keydir.len(), 30);
         (0..30usize).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
     }
 }

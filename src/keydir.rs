@@ -54,7 +54,11 @@ impl KeyDir {
         self.dir.contains_key(key)
     }
 
-    pub fn size(&self) -> usize {
+    pub fn is_empty(&self) -> bool {
+        self.dir.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
         self.dir.len()
     }
 }
@@ -94,13 +98,13 @@ mod keydir_tests {
     #[test]
     fn new() {
         let keydir = KeyDir::new();
-        assert_eq!(keydir.size(), 0);
+        assert_eq!(keydir.len(), 0);
     }
 
     #[test]
     fn put_get() {
         let mut keydir = KeyDir::new();
-        assert_eq!(keydir.size(), 0);
+        assert_eq!(keydir.len(), 0);
 
         let key = "hello world".as_bytes();
         let value = 67u32.to_be_bytes();

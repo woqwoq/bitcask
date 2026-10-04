@@ -16,9 +16,9 @@ use crate::{
 
 pub const LRU_CACHED_READERS_COUNT: usize = 10;
 pub struct BitcaskInstance {
+    dir_path: PathBuf,                    // For opening files through LRU
     pub(crate) keydir: KeyDir,            // In-memory keydir map
     pub writer: Datafile,                 // Writer file handle
-    dir_path: PathBuf,                    // For opening files through LRU
     pub readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
     options: BitcaskOptions,              // User-customisable options
 }
@@ -220,6 +220,7 @@ mod test {
         datafile::{DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileLog},
         engine::BitcaskInstance,
         keydir::KeyDirEntry,
+        options::BitcaskOptions,
     };
 
     pub fn keydir_entry_for(
@@ -247,21 +248,21 @@ mod test {
         let expected = keydir_entry_for(&datafile_entry, db.writer.id, 0);
 
         assert!(db.commit_keydir_write(datafile_entry.clone(), 0).is_ok());
-        assert_eq!(db.keydir.size(), 1);
+        assert_eq!(db.keydir.len(), 1);
         assert_eq!(db.keydir.get(&datafile_entry.key).unwrap(), &expected);
 
         let datafile_entry = datafile_entry_for_string_u32("byeworld", 2);
         let expected = keydir_entry_for(&datafile_entry, db.writer.id, 35);
 
         assert!(db.commit_keydir_write(datafile_entry.clone(), 35).is_ok());
-        assert_eq!(db.keydir.size(), 2);
+        assert_eq!(db.keydir.len(), 2);
         assert_eq!(db.keydir.get(&datafile_entry.key).unwrap(), &expected);
 
         let datafile_entry = datafile_entry_for_string_u32("byeworld", 3);
         let expected = keydir_entry_for(&datafile_entry, db.writer.id, 70);
 
         assert!(db.commit_keydir_write(datafile_entry.clone(), 70).is_ok());
-        assert_ne!(db.keydir.size(), 3);
+        assert_ne!(db.keydir.len(), 3);
         assert_eq!(db.keydir.get(&datafile_entry.key).unwrap(), &expected);
     }
 
@@ -286,7 +287,7 @@ mod test {
         assert_eq!(&*read_bytes, &expected_bytes[..]);
 
         let keydir_written = db.keydir.get(key.as_bytes()).unwrap();
-        assert_eq!(db.keydir.size(), 1);
+        assert_eq!(db.keydir.len(), 1);
         assert_eq!(keydir_written.file_id, expected.file_id);
         assert_eq!(keydir_written.value_size, expected.value_size);
         assert_eq!(keydir_written.value_offset, expected.value_offset);
@@ -402,5 +403,73 @@ mod test {
         );
         // Verify the missed reader has been discovered
         assert_eq!(db.readers.len(), 2);
+    }
+
+    #[test]
+    fn open_new() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
+            .unwrap();
+
+        assert_eq!(db.writer.id, 1);
+        assert_eq!(db.writer.offset, 0);
+        assert!(db.writer.is_writer);
+
+        assert!(db.readers.is_empty());
+        assert!(db.keydir.is_empty());
+    }
+
+    #[test]
+    fn open_existing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        const ENTRY_COUNT: usize = 1000;
+        const ENTRY_SIZE: usize = 28;
+
+        let fratio: f32 = (ENTRY_COUNT * ENTRY_SIZE) as f32 / DATAFILE_MAX_SIZE_BYTES as f32;
+
+        // Temporary scope to fill the data
+        {
+            let mut db =
+                BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
+                    .unwrap();
+
+            // 28B per entry - 2 readers and 1 writer to fit 1000 entries with 10K Datafile max length
+            for i in 0..ENTRY_COUNT as u32 {
+                db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+            }
+
+            assert_eq!(db.writer.id, fratio.ceil() as u32);
+
+            assert!(if fratio.round() == fratio {
+                db.writer.offset == 0
+            } else {
+                db.writer.offset != 0
+            });
+
+            assert_eq!(db.readers.len(), fratio.floor() as usize);
+            assert_eq!(db.keydir.len(), ENTRY_COUNT);
+        } // File handles should be released at this point
+
+        {
+            let mut db =
+                BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
+                    .unwrap();
+
+            assert_eq!(db.writer.id, fratio.ceil() as u32 + 1); // New writer should be created
+            assert_eq!(db.writer.offset, 0);
+
+            assert_eq!(db.readers.len(), fratio.ceil() as usize);
+            assert_eq!(db.keydir.len(), ENTRY_COUNT);
+
+            // 28B per entry - 2 readers and 1 writer to fit 1000 entries with 10K Datafile max length
+            for i in 0..ENTRY_COUNT as u32 {
+                assert_eq!(
+                    db.get(&i.to_be_bytes()).unwrap().unwrap(),
+                    Box::from(i.to_be_bytes())
+                );
+            }
+        }
     }
 }
