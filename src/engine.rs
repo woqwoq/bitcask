@@ -1,4 +1,8 @@
-use std::{fs::read_dir, num::NonZeroUsize, path::PathBuf};
+use std::{
+    fs::read_dir,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use lru::LruCache;
 use tempfile::TempDir;
@@ -7,25 +11,35 @@ use crate::{
     datafile::{DATAFILE_EXTENSION, DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileLog},
     error::BitcaskError,
     keydir::KeyDir,
+    options::{BitcaskOption, BitcaskOptions},
 };
 
 pub const LRU_CACHED_READERS_COUNT: usize = 10;
-
 pub struct BitcaskInstance {
     pub(crate) keydir: KeyDir,            // In-memory keydir map
     pub writer: Datafile,                 // Writer file handle
     dir_path: PathBuf,                    // For opening files through LRU
     pub readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
+    options: BitcaskOptions,              // User-customisable options
 }
 
-impl BitcaskInstance {
-    pub fn open(dir: PathBuf) -> Result<Self, BitcaskError> {
-        let mut keydir = KeyDir::new();
-        let mut readers: LruCache<u32, Datafile> =
-            LruCache::new(NonZeroUsize::new(LRU_CACHED_READERS_COUNT).unwrap());
+pub struct BitcaskStartupHandler {}
+
+impl BitcaskStartupHandler {
+    pub fn parse_db_datafile_ids_at_path(
+        dir: &Path,
+        options: &BitcaskOptions,
+    ) -> Result<Vec<u32>, BitcaskError> {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+
+        if !dir.is_dir() {
+            return Err(BitcaskError::PathIsFile);
+        }
 
         let mut ids: Vec<u32> = Vec::new();
-        for file in read_dir(&dir)? {
+        for file in read_dir(dir)? {
             let filename = file?
                 .file_name()
                 .into_string()
@@ -41,20 +55,62 @@ impl BitcaskInstance {
         }
         ids.sort();
 
+        Ok(ids)
+    }
+
+    // TODO: Return last reader insted
+    pub fn replay_and_init_readers(
+        dir: &Path,
+        ids: Vec<u32>,
+    ) -> Result<(KeyDir, LruCache<u32, Datafile>, u32), BitcaskError> {
+        let mut keydir = KeyDir::new();
+        let mut readers: LruCache<u32, Datafile> =
+            LruCache::new(NonZeroUsize::new(LRU_CACHED_READERS_COUNT).unwrap());
+
         let mut highest_id = 0u32;
         for id in ids {
-            let mut df = Datafile::open_reader(&dir, id)?;
+            let mut df = Datafile::open_reader(dir, id)?;
             df.replay(&mut keydir)?;
+
+            // TODO: Reuse old writer option
 
             readers.put(id, df);
             highest_id = highest_id.max(id);
         }
 
+        Ok((keydir, readers, highest_id))
+    }
+
+    pub fn create_writer_with_options(
+        dir: &Path,
+        highest_reader_id: u32,
+        options: &BitcaskOptions,
+    ) -> Result<Datafile, BitcaskError> {
+        if options.is_enabled(BitcaskOption::ReuseExistingNonFullWriterOnStartup) {
+            todo!()
+        } else {
+            Ok(Datafile::new_writer(dir, highest_reader_id + 1)?)
+        }
+    }
+}
+
+impl BitcaskInstance {
+    pub fn open(dir: PathBuf, options: BitcaskOptions) -> Result<Self, BitcaskError> {
+        let (keydir, readers, highest_reader_id) = BitcaskStartupHandler::replay_and_init_readers(
+            &dir,
+            BitcaskStartupHandler::parse_db_datafile_ids_at_path(&dir, &options)?,
+        )?;
+
         Ok(BitcaskInstance {
             keydir,
-            writer: Datafile::new_writer(&dir, highest_id + 1)?,
+            writer: BitcaskStartupHandler::create_writer_with_options(
+                &dir,
+                highest_reader_id,
+                &options,
+            )?,
             dir_path: dir,
             readers,
+            options,
         })
     }
 
@@ -151,6 +207,7 @@ impl BitcaskInstance {
                 writer,
                 dir_path: dir_path.to_path_buf(),
                 readers,
+                options: BitcaskOptions::default(),
             },
             temp_dir,
         )

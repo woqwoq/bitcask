@@ -10,6 +10,7 @@ pub enum BitcaskError {
     InvalidDBPath(Error),
     FilenameConversion,
     DatafileNameError(ParseIntError),
+    PathIsFile,
 }
 
 impl From<ParseIntError> for BitcaskError {
