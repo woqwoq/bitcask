@@ -50,6 +50,10 @@ impl KeyDir {
         );
     }
 
+    pub fn remove(&mut self, key: &[u8]) {
+        self.dir.remove(key);
+    }
+
     pub fn contains(&self, key: &[u8]) -> bool {
         self.dir.contains_key(key)
     }

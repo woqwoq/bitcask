@@ -11,7 +11,8 @@ use crc32fast::Hasher;
 
 use crate::{error::DatafileError, keydir::KeyDir};
 
-pub const DATAFILE_HEADER_SIZE_BYTES: usize = 20;
+pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
+pub const DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES: usize = 1;
 pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
 pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
 pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
@@ -19,6 +20,9 @@ pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
 pub const DATAFILE_MAX_SIZE_BYTES: usize = 10_000;
 pub const DATAFILE_EXTENSION: &str = "db";
+
+pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
+pub const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
 
 pub struct Datafile {
     file: File,
@@ -69,21 +73,26 @@ impl Datafile {
         let mut start_offset = 0;
 
         while start_offset < buf.len() {
+            // TODO: Not read whole value in-memory just to make a keydir entry that doesn't care
             let log = DatafileLog::decode(&buf[start_offset..])?;
 
             let log_size = log.size()?;
             let ksz = log.header.key_size;
 
-            keydir.put(
-                log,
-                self.id,
-                start_offset as u64 + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
-            );
-
-            start_offset += log_size;
+            match log.header.record_type {
+                DATAFILE_RECORD_TYPE_NORMAL => {
+                    keydir.put(
+                        log,
+                        self.id,
+                        start_offset as u64 + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
+                    );
+                    start_offset += log_size;
+                    self.offset = start_offset as u64;
+                }
+                DATAFILE_RECORD_TYPE_TOMBSTONE => keydir.remove(&log.key),
+                _ => return Err(DatafileError::UnexpectedDatafileLogType),
+            }
         }
-
-        self.offset = start_offset as u64;
 
         Ok(())
     }
@@ -177,28 +186,36 @@ impl Display for Datafile {
 #[derive(Debug, PartialEq, Clone)]
 pub struct DatafileLogHeader {
     pub crc: u32,        // CRC32 of all fields below
+    pub record_type: u8, // 0 - Normal, 1 - Tombstone
     pub timestamp: u64,  // UNIX Timestamp when the entry was created
     pub key_size: u32,   // Size of the key in bytes
     pub value_size: u32, // Size of the value in bytes
 }
 
 impl DatafileLogHeader {
-    pub fn new(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
+    pub fn new(key: &[u8], value: &[u8], record_type: u8) -> Result<Self, DatafileError> {
         Self::with_timestamp(
             key,
             value,
+            record_type,
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
         )
     }
 
-    fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+    fn with_timestamp(
+        key: &[u8],
+        value: &[u8],
+        record_type: u8,
+        timestamp: u64,
+    ) -> Result<Self, DatafileError> {
         let key_size =
             u32::try_from(key.len()).map_err(|_| DatafileError::OversizedDatafileEntry)?;
         let value_size =
             u32::try_from(value.len()).map_err(|_| DatafileError::OversizedDatafileEntry)?;
 
         Ok(DatafileLogHeader {
-            crc: Self::get_crc_for(timestamp, key_size, value_size, key, value),
+            crc: Self::get_crc_for(record_type, timestamp, key_size, value_size, key, value),
+            record_type,
             timestamp,
             key_size,
             value_size,
@@ -206,6 +223,7 @@ impl DatafileLogHeader {
     }
 
     fn get_crc_for(
+        record_type: u8,
         timestamp: u64,
         key_size: u32,
         value_size: u32,
@@ -214,6 +232,7 @@ impl DatafileLogHeader {
     ) -> u32 {
         let mut hasher = Hasher::new();
 
+        hasher.update(&record_type.to_be_bytes());
         hasher.update(&timestamp.to_be_bytes());
         hasher.update(&key_size.to_be_bytes());
         hasher.update(&value_size.to_be_bytes());
@@ -227,10 +246,11 @@ impl DatafileLogHeader {
     pub fn encode(&self) -> [u8; DATAFILE_HEADER_SIZE_BYTES] {
         let mut arr: [u8; DATAFILE_HEADER_SIZE_BYTES] = [0; DATAFILE_HEADER_SIZE_BYTES];
 
-        arr[0..4].copy_from_slice(&self.crc.to_be_bytes());
-        arr[4..12].copy_from_slice(&self.timestamp.to_be_bytes());
-        arr[12..16].copy_from_slice(&self.key_size.to_be_bytes());
-        arr[16..20].copy_from_slice(&self.value_size.to_be_bytes());
+        arr[0..1].copy_from_slice(&self.record_type.to_be_bytes());
+        arr[1..5].copy_from_slice(&self.crc.to_be_bytes());
+        arr[5..13].copy_from_slice(&self.timestamp.to_be_bytes());
+        arr[13..17].copy_from_slice(&self.key_size.to_be_bytes());
+        arr[17..21].copy_from_slice(&self.value_size.to_be_bytes());
 
         arr
     }
@@ -240,14 +260,16 @@ impl DatafileLogHeader {
             return Err(DatafileError::UndersizedDatafileHeader(bytes.len()));
         }
 
-        let crc_bytes: [u8; DATAFILE_HEADER_CRC_SIZE_BYTES] = bytes[0..4].try_into()?;
+        let record_type: [u8; DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES] = bytes[0..1].try_into()?;
+        let crc_bytes: [u8; DATAFILE_HEADER_CRC_SIZE_BYTES] = bytes[1..5].try_into()?;
         let timestamp_bytes: [u8; DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES] =
-            bytes[4..12].try_into()?;
-        let key_size_bytes: [u8; DATAFILE_HEADER_KSZ_SIZE_BYTES] = bytes[12..16].try_into()?;
-        let value_size_bytes: [u8; DATAFILE_HEADER_VSZ_SIZE_BYTES] = bytes[16..20].try_into()?;
+            bytes[5..13].try_into()?;
+        let key_size_bytes: [u8; DATAFILE_HEADER_KSZ_SIZE_BYTES] = bytes[13..17].try_into()?;
+        let value_size_bytes: [u8; DATAFILE_HEADER_VSZ_SIZE_BYTES] = bytes[17..21].try_into()?;
 
         Ok(Self {
             crc: u32::from_be_bytes(crc_bytes),
+            record_type: u8::from_be_bytes(record_type),
             timestamp: u64::from_be_bytes(timestamp_bytes),
             key_size: u32::from_be_bytes(key_size_bytes),
             value_size: u32::from_be_bytes(value_size_bytes),
@@ -265,14 +287,28 @@ pub struct DatafileLog {
 impl DatafileLog {
     pub fn new(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
         Ok(Self {
-            header: DatafileLogHeader::new(key, value)?,
+            header: DatafileLogHeader::new(key, value, DATAFILE_RECORD_TYPE_NORMAL)?,
             key: Box::from(key),
             value: Box::from(value),
         })
     }
+
+    pub fn new_tombstone(key: &[u8]) -> Result<Self, DatafileError> {
+        Ok(Self {
+            header: DatafileLogHeader::new(key, &[], DATAFILE_RECORD_TYPE_TOMBSTONE)?,
+            key: Box::from(key),
+            value: Box::from([]),
+        })
+    }
+
     pub fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
         Ok(Self {
-            header: DatafileLogHeader::with_timestamp(key, value, timestamp)?,
+            header: DatafileLogHeader::with_timestamp(
+                key,
+                value,
+                DATAFILE_RECORD_TYPE_NORMAL,
+                timestamp,
+            )?,
             key: Box::from(key),
             value: Box::from(value),
         })
@@ -319,6 +355,7 @@ impl DatafileLog {
 
         if header.crc
             != DatafileLogHeader::get_crc_for(
+                header.record_type,
                 header.timestamp,
                 header.key_size,
                 header.value_size,
@@ -344,17 +381,18 @@ impl Display for DatafileLog {
 
         writeln!(
             f,
-            "| {:<10} | {:<16} | {:<10} | {:<10} | {:<20} | {:<20} |",
-            "crc", "timestamp", "key_size", "value_size", "key", "value"
+            "| {:<11} | {:<10} | {:<16} | {:<10} | {:<10} | {:<20} | {:<20} |",
+            "record_type", "crc", "timestamp", "key_size", "value_size", "key", "value"
         )?;
         writeln!(
             f,
-            "|{:-<12}|{:-<18}|{:-<12}|{:-<12}|{:-<22}|{:-<22}|",
-            "", "", "", "", "", ""
+            "|{:-<13}|{:-<12}|{:-<18}|{:-<12}|{:-<12}|{:-<22}|{:-<22}|",
+            "", "", "", "", "", "", ""
         )?;
         write!(
             f,
-            "| {:<10} | {:<16} | {:<10} | {:<10} | {:<20} | {:<20} |",
+            "| {:<11} | {:<10} | {:<16} | {:<10} | {:<10} | {:<20} | {:<20} |",
+            self.header.record_type,
             self.header.crc,
             self.header.timestamp,
             self.header.key_size,
@@ -375,15 +413,23 @@ mod datafile_tests {
 
     use crate::{
         datafile::{
-            DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileError,
-            DatafileLog, DatafileLogHeader,
+            DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL,
+            Datafile, DatafileError, DatafileLog, DatafileLogHeader,
         },
         keydir::KeyDir,
     };
 
-    pub fn crc_of(timestamp: u64, key_size: u32, value_size: u32, key: &[u8], value: &[u8]) -> u32 {
+    pub fn crc_of(
+        record_type: u8,
+        timestamp: u64,
+        key_size: u32,
+        value_size: u32,
+        key: &[u8],
+        value: &[u8],
+    ) -> u32 {
         let mut hasher = Hasher::new();
 
+        hasher.update(&record_type.to_be_bytes());
         hasher.update(&timestamp.to_be_bytes());
         hasher.update(&key_size.to_be_bytes());
         hasher.update(&value_size.to_be_bytes());
@@ -406,14 +452,19 @@ mod datafile_tests {
         let value: u64 = 2;
         let value_size: u32 = value.to_be_bytes().len() as u32;
 
-        let datafile_header =
-            DatafileLogHeader::with_timestamp(&key.to_be_bytes(), &value.to_be_bytes(), timestamp);
+        let datafile_header = DatafileLogHeader::with_timestamp(
+            &key.to_be_bytes(),
+            &value.to_be_bytes(),
+            DATAFILE_RECORD_TYPE_NORMAL,
+            timestamp,
+        );
 
         assert!(datafile_header.is_ok());
         if let Ok(datafile_header) = datafile_header {
             assert_eq!(
                 datafile_header.crc,
                 crc_of(
+                    DATAFILE_RECORD_TYPE_NORMAL,
                     timestamp,
                     key_size,
                     value_size,
@@ -440,13 +491,18 @@ mod datafile_tests {
         let value: u64 = 2;
         let value_size: u32 = value.to_be_bytes().len() as u32;
 
-        let datafile_header =
-            DatafileLogHeader::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp)
-                .unwrap();
+        let datafile_header = DatafileLogHeader::with_timestamp(
+            key.as_bytes(),
+            &value.to_be_bytes(),
+            DATAFILE_RECORD_TYPE_NORMAL,
+            timestamp,
+        )
+        .unwrap();
 
         assert_eq!(
             datafile_header.crc,
             crc_of(
+                DATAFILE_RECORD_TYPE_NORMAL,
                 timestamp,
                 key_size,
                 value_size,
@@ -469,9 +525,13 @@ mod datafile_tests {
         let key: String = String::from("hello world");
         let value: u64 = 2;
 
-        let expected_datafile_header =
-            DatafileLogHeader::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp)
-                .unwrap();
+        let expected_datafile_header = DatafileLogHeader::with_timestamp(
+            key.as_bytes(),
+            &value.to_be_bytes(),
+            DATAFILE_RECORD_TYPE_NORMAL,
+            timestamp,
+        )
+        .unwrap();
 
         let datafile_entry =
             DatafileLog::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
@@ -486,9 +546,19 @@ mod datafile_tests {
         let key: String = String::from("hello world");
         let value: u64 = 2;
 
-        let datafile_header = DatafileLogHeader::new(key.as_bytes(), &value.to_be_bytes()).unwrap();
+        let datafile_header = DatafileLogHeader::new(
+            key.as_bytes(),
+            &value.to_be_bytes(),
+            DATAFILE_RECORD_TYPE_NORMAL,
+        )
+        .unwrap();
 
         let mut expected: Vec<u8> = Vec::new();
+        datafile_header
+            .record_type
+            .to_be_bytes()
+            .iter()
+            .for_each(|b| expected.push(*b));
         datafile_header
             .crc
             .to_be_bytes()
@@ -528,15 +598,21 @@ mod datafile_tests {
 
         Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
 
-        assert_eq!(encoded[0..20], datafile_entry.header.encode());
-        assert_eq!(encoded[20..], kv);
+        assert_eq!(
+            encoded[0..DATAFILE_HEADER_SIZE_BYTES],
+            datafile_entry.header.encode()
+        );
+        assert_eq!(encoded[DATAFILE_HEADER_SIZE_BYTES..], kv);
     }
 
     #[test]
     fn datafile_header_decode_ok() {
-        let datafile_header =
-            DatafileLogHeader::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
-                .unwrap();
+        let datafile_header = DatafileLogHeader::new(
+            String::from("hello world").as_bytes(),
+            &2u64.to_be_bytes(),
+            DATAFILE_RECORD_TYPE_NORMAL,
+        )
+        .unwrap();
 
         assert_eq!(
             datafile_header,
@@ -546,9 +622,12 @@ mod datafile_tests {
 
     #[test]
     fn datafile_header_decode_err() {
-        let datafile_header =
-            DatafileLogHeader::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
-                .unwrap();
+        let datafile_header = DatafileLogHeader::new(
+            String::from("hello world").as_bytes(),
+            &2u64.to_be_bytes(),
+            DATAFILE_RECORD_TYPE_NORMAL,
+        )
+        .unwrap();
 
         assert!(matches!(
             DatafileLogHeader::decode(&datafile_header.encode()[0..9]),
@@ -609,14 +688,14 @@ mod datafile_tests {
     fn datafile_entry_decode_corrupt_sizes() {
         let mut bytes = vec![0u8; DATAFILE_HEADER_SIZE_BYTES];
 
-        bytes[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        bytes[13..17].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(
             DatafileLog::decode(&bytes),
             Err(DatafileError::UndersizedDatafileKey { .. })
         ));
 
-        bytes[12..16].copy_from_slice(&0u32.to_be_bytes());
-        bytes[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+        bytes[13..17].copy_from_slice(&0u32.to_be_bytes());
+        bytes[17..21].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(
             DatafileLog::decode(&bytes),
             Err(DatafileError::UndersizedDatafileValue { .. })

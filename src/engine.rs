@@ -392,7 +392,8 @@ mod test {
         missed_reader.is_writer = false;
 
         // Prepare KeyDir to store a mapping of the key to the file that isn't present in LRU
-        db.keydir.put(dfl, 3, 31);
+        let value_offset = DATAFILE_HEADER_SIZE_BYTES as u64 + dfl.header.key_size as u64;
+        db.keydir.put(dfl, 3, value_offset);
 
         // Make sure the datafile is not known
         assert_eq!(db.readers.len(), 1);
@@ -425,7 +426,7 @@ mod test {
         let temp_dir = tempfile::tempdir().unwrap();
 
         const ENTRY_COUNT: usize = 1000;
-        const ENTRY_SIZE: usize = 28;
+        const ENTRY_SIZE: usize = 29;
 
         let fratio: f32 = (ENTRY_COUNT * ENTRY_SIZE) as f32 / DATAFILE_MAX_SIZE_BYTES as f32;
 

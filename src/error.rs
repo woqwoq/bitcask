@@ -45,6 +45,7 @@ pub enum DatafileError {
     InvalidPath(PathBuf),
     WriterFileOffsetOverflow,
     WriteAttemptToReaderDatafile,
+    UnexpectedDatafileLogType,
 }
 
 impl From<Error> for DatafileError {
