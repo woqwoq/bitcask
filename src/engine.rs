@@ -545,6 +545,34 @@ mod test {
 
     #[test]
     fn remove_with_replay_ok() {
-        todo!();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        const RECORD_COUNT: usize = 50;
+        const DELETES_COUNT: usize = RECORD_COUNT.div_ceil(2);
+
+        // Temporary scope to fill the data
+        {
+            let mut db =
+                BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
+                    .unwrap();
+
+            for i in 0..RECORD_COUNT as u32 {
+                db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+            }
+
+            for i in 0..DELETES_COUNT as u32 {
+                db.remove(&i.to_be_bytes()).unwrap();
+            }
+
+            assert_eq!(db.keydir.len(), RECORD_COUNT - DELETES_COUNT);
+        } // File handles should be released at this point
+
+        {
+            let db =
+                BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
+                    .unwrap();
+
+            assert_eq!(db.keydir.len(), RECORD_COUNT - DELETES_COUNT);
+        }
     }
 }
