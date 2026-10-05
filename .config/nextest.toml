@@ -1,0 +1,4 @@
+[profile.ci]
+# Run all tests regardless of failures.
+fail-fast = false
+junit = { path = "junit.xml" }

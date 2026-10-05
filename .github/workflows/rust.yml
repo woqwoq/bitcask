@@ -10,13 +10,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install nextest
+      uses: taiki-e/install-action@nextest
+
     - name: Build
       run: cargo build --verbose
+
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo nextest run --profile ci
+
+    - name: Report test results
+      uses: dorny/test-reporter@v1
+      if: success() || failure()
+      with:
+        name: Nextest Results
+        path: target/nextest/ci/junit.xml
+        reporter: java-junit
