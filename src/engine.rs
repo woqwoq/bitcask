@@ -8,8 +8,11 @@ use lru::LruCache;
 use tempfile::TempDir;
 
 use crate::{
-    datafile::{DATAFILE_EXTENSION, DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileLog},
-    error::BitcaskError,
+    datafile::{
+        DATAFILE_EXTENSION, DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL,
+        DATAFILE_RECORD_TYPE_TOMBSTONE, Datafile, DatafileRecord,
+    },
+    error::{BitcaskError, DatafileError},
     keydir::KeyDir,
     options::{BitcaskOption, BitcaskOptions},
 };
@@ -115,21 +118,7 @@ impl BitcaskInstance {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
-        let entry = DatafileLog::new(key, value)?;
-
-        if self
-            .writer
-            .should_switch_writer_before_write_commit(&entry)?
-        {
-            self.switch_writer_datafile()?;
-        }
-
-        let offset = self.commit_datafile_write(&entry)?; // Write log first, so that it can be
-        // replayed in case of a crash.
-
-        self.commit_keydir_write(entry, offset)?; // Append entry to the keydir
-
-        Ok(())
+        self.write_record(DatafileRecord::new(key, value)?)
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
@@ -158,21 +147,57 @@ impl BitcaskInstance {
         }
     }
 
-    fn commit_keydir_write(&mut self, log: DatafileLog, offset: u64) -> Result<(), BitcaskError> {
-        let ksz = log.header.key_size;
+    fn write_record(&mut self, record: DatafileRecord) -> Result<(), BitcaskError> {
+        if self
+            .writer
+            .should_switch_writer_before_write_commit(record.size()? as u64)?
+        {
+            self.switch_writer_datafile()?;
+        }
 
-        self.keydir.put(
-            log,
-            self.writer.id,
-            DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64 + offset,
-        );
+        let offset = self.commit_datafile_write(&record)?; // Write record first, so that it can be
+        // replayed in case of a crash.
+
+        self.commit_keydir_write(record, offset)?; // Append entry to the keydir
 
         Ok(())
     }
 
-    fn commit_datafile_write(&mut self, log: &DatafileLog) -> Result<u64, BitcaskError> {
+    pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
+        if self.keydir.contains(key) {
+            self.write_record(DatafileRecord::new_tombstone(key)?)?;
+        }
+
+        Ok(())
+    }
+
+    fn commit_keydir_write(
+        &mut self,
+        record: DatafileRecord,
+        offset: u64,
+    ) -> Result<(), BitcaskError> {
+        let ksz = record.header.key_size;
+
+        match record.header.record_type {
+            DATAFILE_RECORD_TYPE_NORMAL => {
+                self.keydir.put(
+                    record,
+                    self.writer.id,
+                    offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
+                );
+            }
+            DATAFILE_RECORD_TYPE_TOMBSTONE => {
+                self.keydir.remove(&record.key);
+            }
+            _ => return Err(DatafileError::UnexpectedDatafileRecordType)?,
+        }
+
+        Ok(())
+    }
+
+    fn commit_datafile_write(&mut self, record: &DatafileRecord) -> Result<u64, BitcaskError> {
         self.writer
-            .append_log(log)
+            .append_record(record)
             .map_err(BitcaskError::DatafileError)
     }
 
@@ -217,53 +242,53 @@ impl BitcaskInstance {
 #[cfg(test)]
 mod test {
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileLog},
+        datafile::{DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileRecord},
         engine::BitcaskInstance,
         keydir::KeyDirEntry,
         options::BitcaskOptions,
     };
 
     pub fn keydir_entry_for(
-        datafile_entry: &DatafileLog,
+        datafile_record: &DatafileRecord,
         file_id: u32,
         offset: u64,
     ) -> KeyDirEntry {
         KeyDirEntry::new(
             file_id,
-            datafile_entry.header.value_size,
-            DATAFILE_HEADER_SIZE_BYTES as u64 + datafile_entry.header.key_size as u64 + offset,
-            datafile_entry.header.timestamp,
+            datafile_record.header.value_size,
+            DATAFILE_HEADER_SIZE_BYTES as u64 + datafile_record.header.key_size as u64 + offset,
+            datafile_record.header.timestamp,
         )
     }
 
-    pub fn datafile_entry_for_string_u32(key: &str, value: u32) -> DatafileLog {
-        DatafileLog::new(key.as_bytes(), &value.to_be_bytes()).unwrap()
+    pub fn datafile_record_for_string_u32(key: &str, value: u32) -> DatafileRecord {
+        DatafileRecord::new(key.as_bytes(), &value.to_be_bytes()).unwrap()
     }
 
     #[test]
     fn commit_keydir_write() {
         let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
 
-        let datafile_entry = datafile_entry_for_string_u32("hello world", 2);
-        let expected = keydir_entry_for(&datafile_entry, db.writer.id, 0);
+        let datafile_record = datafile_record_for_string_u32("hello world", 2);
+        let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
 
-        assert!(db.commit_keydir_write(datafile_entry.clone(), 0).is_ok());
+        assert!(db.commit_keydir_write(datafile_record.clone(), 0).is_ok());
         assert_eq!(db.keydir.len(), 1);
-        assert_eq!(db.keydir.get(&datafile_entry.key).unwrap(), &expected);
+        assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
 
-        let datafile_entry = datafile_entry_for_string_u32("byeworld", 2);
-        let expected = keydir_entry_for(&datafile_entry, db.writer.id, 35);
+        let datafile_record = datafile_record_for_string_u32("byeworld", 2);
+        let expected = keydir_entry_for(&datafile_record, db.writer.id, 35);
 
-        assert!(db.commit_keydir_write(datafile_entry.clone(), 35).is_ok());
+        assert!(db.commit_keydir_write(datafile_record.clone(), 35).is_ok());
         assert_eq!(db.keydir.len(), 2);
-        assert_eq!(db.keydir.get(&datafile_entry.key).unwrap(), &expected);
+        assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
 
-        let datafile_entry = datafile_entry_for_string_u32("byeworld", 3);
-        let expected = keydir_entry_for(&datafile_entry, db.writer.id, 70);
+        let datafile_record = datafile_record_for_string_u32("byeworld", 3);
+        let expected = keydir_entry_for(&datafile_record, db.writer.id, 70);
 
-        assert!(db.commit_keydir_write(datafile_entry.clone(), 70).is_ok());
+        assert!(db.commit_keydir_write(datafile_record.clone(), 70).is_ok());
         assert_ne!(db.keydir.len(), 3);
-        assert_eq!(db.keydir.get(&datafile_entry.key).unwrap(), &expected);
+        assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
     }
 
     #[test]
@@ -273,16 +298,16 @@ mod test {
         let key = "hello world";
         let value: u32 = 2;
 
-        let datafile_entry = datafile_entry_for_string_u32(key, value);
-        let expected = keydir_entry_for(&datafile_entry, db.writer.id, 0);
+        let datafile_record = datafile_record_for_string_u32(key, value);
+        let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
 
         assert!(db.put(key.as_bytes(), &value.to_be_bytes()).is_ok());
 
         let mut expected_bytes = Vec::new();
-        Datafile::write_log_to(&mut expected_bytes, &datafile_entry).unwrap();
+        Datafile::write_record_to(&mut expected_bytes, &datafile_record).unwrap();
         let read_bytes = db
             .writer
-            .read_bytes(0, datafile_entry.size().unwrap())
+            .read_bytes(0, datafile_record.size().unwrap())
             .unwrap();
         assert_eq!(&*read_bytes, &expected_bytes[..]);
 
@@ -292,7 +317,7 @@ mod test {
         assert_eq!(keydir_written.value_size, expected.value_size);
         assert_eq!(keydir_written.value_offset, expected.value_offset);
 
-        assert_eq!(db.writer.offset, datafile_entry.size().unwrap() as u64);
+        assert_eq!(db.writer.offset, datafile_record.size().unwrap() as u64);
     }
 
     #[test]
@@ -343,9 +368,9 @@ mod test {
         let key = "hello world";
         let value: u32 = 2;
 
-        let datafile_entry = datafile_entry_for_string_u32(key, value);
-        assert!(db.writer.append_log(&datafile_entry).is_ok());
-        assert_eq!(db.writer.offset, datafile_entry.size().unwrap() as u64);
+        let datafile_record = datafile_record_for_string_u32(key, value);
+        assert!(db.writer.append_record(&datafile_record).is_ok());
+        assert_eq!(db.writer.offset, datafile_record.size().unwrap() as u64);
     }
 
     #[test]
@@ -367,7 +392,7 @@ mod test {
         assert!(db.writer.is_writer);
         assert_eq!(
             db.writer.offset,
-            datafile_entry_for_string_u32(key, value).size().unwrap() as u64
+            datafile_record_for_string_u32(key, value).size().unwrap() as u64
         );
 
         // Verify the new writer is properly handled on get syncpath
@@ -384,16 +409,16 @@ mod test {
         let key = "hello world";
         let value = 128u32;
 
-        let dfl = datafile_entry_for_string_u32(key, value);
+        let record = datafile_record_for_string_u32(key, value);
 
         // Prepare reader datafile with the requested entry
         let mut missed_reader = Datafile::new_writer(&db.dir_path, 3).unwrap();
-        assert!(missed_reader.append_log(&dfl).is_ok());
+        assert!(missed_reader.append_record(&record).is_ok());
         missed_reader.is_writer = false;
 
         // Prepare KeyDir to store a mapping of the key to the file that isn't present in LRU
-        let value_offset = DATAFILE_HEADER_SIZE_BYTES as u64 + dfl.header.key_size as u64;
-        db.keydir.put(dfl, 3, value_offset);
+        let value_offset = DATAFILE_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
+        db.keydir.put(record, 3, value_offset);
 
         // Make sure the datafile is not known
         assert_eq!(db.readers.len(), 1);
@@ -425,10 +450,10 @@ mod test {
     fn open_existing() {
         let temp_dir = tempfile::tempdir().unwrap();
 
-        const ENTRY_COUNT: usize = 1000;
-        const ENTRY_SIZE: usize = 29;
+        const RECORD_COUNT: usize = 1000;
+        const RECORD_SIZE: usize = 29;
 
-        let fratio: f32 = (ENTRY_COUNT * ENTRY_SIZE) as f32 / DATAFILE_MAX_SIZE_BYTES as f32;
+        let fratio: f32 = (RECORD_COUNT * RECORD_SIZE) as f32 / DATAFILE_MAX_SIZE_BYTES as f32;
 
         // Temporary scope to fill the data
         {
@@ -437,7 +462,7 @@ mod test {
                     .unwrap();
 
             // 28B per entry - 2 readers and 1 writer to fit 1000 entries with 10K Datafile max length
-            for i in 0..ENTRY_COUNT as u32 {
+            for i in 0..RECORD_COUNT as u32 {
                 db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
             }
 
@@ -450,7 +475,7 @@ mod test {
             });
 
             assert_eq!(db.readers.len(), fratio.floor() as usize);
-            assert_eq!(db.keydir.len(), ENTRY_COUNT);
+            assert_eq!(db.keydir.len(), RECORD_COUNT);
         } // File handles should be released at this point
 
         {
@@ -462,15 +487,64 @@ mod test {
             assert_eq!(db.writer.offset, 0);
 
             assert_eq!(db.readers.len(), fratio.ceil() as usize);
-            assert_eq!(db.keydir.len(), ENTRY_COUNT);
+            assert_eq!(db.keydir.len(), RECORD_COUNT);
 
             // 28B per entry - 2 readers and 1 writer to fit 1000 entries with 10K Datafile max length
-            for i in 0..ENTRY_COUNT as u32 {
+            for i in 0..RECORD_COUNT as u32 {
                 assert_eq!(
                     db.get(&i.to_be_bytes()).unwrap().unwrap(),
                     Box::from(i.to_be_bytes())
                 );
             }
         }
+    }
+
+    #[test]
+    fn remove_ok() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        const ENTRY_COUNT: usize = 20;
+        const ENTRY_SIZE: usize = 29;
+        // Tombstone log is 21 + 4 = 25 bytes
+        const DATAFILE_TOMBSTONE_SIZE: usize = 25;
+
+        let mut db =
+            BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
+                .unwrap();
+
+        for i in 0..ENTRY_COUNT as u32 {
+            db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+        }
+        assert_eq!(db.writer.offset, (ENTRY_SIZE * ENTRY_COUNT) as u64);
+
+        let delete_count = ENTRY_COUNT.div_ceil(2);
+        for i in 0..delete_count as u32 {
+            db.remove(&i.to_be_bytes()).unwrap();
+        }
+        assert_eq!(db.keydir.len(), ENTRY_COUNT - delete_count);
+
+        assert!(db.get(&0u32.to_be_bytes()).unwrap().is_none());
+        assert!(
+            db.get(&(delete_count as u32 - 1).to_be_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get(&((delete_count + 1) as u32).to_be_bytes())
+                .unwrap()
+                .is_some()
+        );
+
+        // We must have a writer offset incremented by delete_count * DATAFILE_TOMBSTONE_SIZE bytes
+        // to make sure all of the tombstones are present
+        assert_eq!(
+            db.writer.offset,
+            (ENTRY_SIZE * ENTRY_COUNT + delete_count * DATAFILE_TOMBSTONE_SIZE) as u64
+        );
+    }
+
+    #[test]
+    fn remove_with_replay_ok() {
+        todo!();
     }
 }

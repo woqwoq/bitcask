@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display};
 
-use crate::datafile::DatafileLog;
+use crate::datafile::DatafileRecord;
 
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
 #[derive(Debug, PartialEq, Clone)]
@@ -38,14 +38,14 @@ impl KeyDir {
         self.dir.get(key)
     }
 
-    pub fn put(&mut self, entry: DatafileLog, file_id: u32, value_offset: u64) {
+    pub fn put(&mut self, record: DatafileRecord, file_id: u32, value_offset: u64) {
         self.dir.insert(
-            entry.key,
+            record.key,
             KeyDirEntry::new(
                 file_id,
-                entry.header.value_size,
+                record.header.value_size,
                 value_offset,
-                entry.header.timestamp,
+                record.header.timestamp,
             ),
         );
     }
@@ -95,7 +95,7 @@ impl Display for KeyDir {
 #[cfg(test)]
 mod keydir_tests {
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileLog},
+        datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
         keydir::{KeyDir, KeyDirEntry},
     };
 
@@ -113,16 +113,16 @@ mod keydir_tests {
         let key = "hello world".as_bytes();
         let value = 67u32.to_be_bytes();
 
-        let datafile_entry = DatafileLog::new(key, &value).unwrap();
-        let offset = DATAFILE_HEADER_SIZE_BYTES as u64 + datafile_entry.header.key_size as u64;
+        let datafile_record = DatafileRecord::new(key, &value).unwrap();
+        let offset = DATAFILE_HEADER_SIZE_BYTES as u64 + datafile_record.header.key_size as u64;
 
-        keydir.put(datafile_entry.clone(), 0, offset);
+        keydir.put(datafile_record.clone(), 0, offset);
 
         let expected = KeyDirEntry::new(
             0,
-            datafile_entry.header.value_size,
+            datafile_record.header.value_size,
             offset,
-            datafile_entry.header.timestamp,
+            datafile_record.header.timestamp,
         );
 
         assert_eq!(keydir.get(key).unwrap(), &expected);

@@ -74,30 +74,34 @@ impl Datafile {
 
         while start_offset < buf.len() {
             // TODO: Not read whole value in-memory just to make a keydir entry that doesn't care
-            let log = DatafileLog::decode(&buf[start_offset..])?;
+            let record = DatafileRecord::decode(&buf[start_offset..])?;
 
-            let log_size = log.size()?;
-            let ksz = log.header.key_size;
+            let record_size = record.size()?;
+            let ksz = record.header.key_size;
 
-            match log.header.record_type {
+            match record.header.record_type {
                 DATAFILE_RECORD_TYPE_NORMAL => {
                     keydir.put(
-                        log,
+                        record,
                         self.id,
                         start_offset as u64 + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
                     );
-                    start_offset += log_size;
-                    self.offset = start_offset as u64;
                 }
-                DATAFILE_RECORD_TYPE_TOMBSTONE => keydir.remove(&log.key),
-                _ => return Err(DatafileError::UnexpectedDatafileLogType),
+                DATAFILE_RECORD_TYPE_TOMBSTONE => {
+                    keydir.remove(&record.key);
+                }
+                _ => return Err(DatafileError::UnexpectedDatafileRecordType),
             }
+
+            start_offset += record_size;
         }
+
+        self.offset = start_offset as u64;
 
         Ok(())
     }
 
-    pub fn append_log(&mut self, entry: &DatafileLog) -> Result<u64, DatafileError> {
+    pub fn append_record(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {
         if !self.is_writer {
             return Err(DatafileError::WriteAttemptToReaderDatafile);
         }
@@ -105,32 +109,32 @@ impl Datafile {
         let start_offset = self.offset;
 
         // Move offset, so first so we fail-fast before we commit the transaction
-        self.move_writer_offset(entry.size()? as u64)?;
+        self.move_writer_offset(record.size()? as u64)?;
 
         // Commit
-        Self::write_log_to(&mut self.file, entry)?;
+        Self::write_record_to(&mut self.file, record)?;
 
         Ok(start_offset)
     }
 
-    pub fn write_log_to<W: Write>(
+    pub fn write_record_to<W: Write>(
         writer: &mut W,
-        entry: &DatafileLog,
+        record: &DatafileRecord,
     ) -> Result<(), DatafileError> {
-        writer.write_all(&entry.header.encode())?;
-        writer.write_all(&entry.key)?;
-        writer.write_all(&entry.value)?;
+        writer.write_all(&record.header.encode())?;
+        writer.write_all(&record.key)?;
+        writer.write_all(&record.value)?;
 
         Ok(())
     }
 
     pub fn should_switch_writer_before_write_commit(
         &self,
-        entry: &DatafileLog,
+        record_size: u64,
     ) -> Result<bool, DatafileError> {
         Ok(self
             .offset
-            .checked_add(entry.size()? as u64)
+            .checked_add(record_size)
             .unwrap_or(DATAFILE_MAX_SIZE_BYTES as u64)
             >= DATAFILE_MAX_SIZE_BYTES as u64)
     }
@@ -184,7 +188,7 @@ impl Display for Datafile {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct DatafileLogHeader {
+pub struct DatafileRecordHeader {
     pub crc: u32,        // CRC32 of all fields below
     pub record_type: u8, // 0 - Normal, 1 - Tombstone
     pub timestamp: u64,  // UNIX Timestamp when the entry was created
@@ -192,7 +196,7 @@ pub struct DatafileLogHeader {
     pub value_size: u32, // Size of the value in bytes
 }
 
-impl DatafileLogHeader {
+impl DatafileRecordHeader {
     pub fn new(key: &[u8], value: &[u8], record_type: u8) -> Result<Self, DatafileError> {
         Self::with_timestamp(
             key,
@@ -209,11 +213,11 @@ impl DatafileLogHeader {
         timestamp: u64,
     ) -> Result<Self, DatafileError> {
         let key_size =
-            u32::try_from(key.len()).map_err(|_| DatafileError::OversizedDatafileEntry)?;
+            u32::try_from(key.len()).map_err(|_| DatafileError::OversizedDatafileRecord)?;
         let value_size =
-            u32::try_from(value.len()).map_err(|_| DatafileError::OversizedDatafileEntry)?;
+            u32::try_from(value.len()).map_err(|_| DatafileError::OversizedDatafileRecord)?;
 
-        Ok(DatafileLogHeader {
+        Ok(DatafileRecordHeader {
             crc: Self::get_crc_for(record_type, timestamp, key_size, value_size, key, value),
             record_type,
             timestamp,
@@ -278,16 +282,16 @@ impl DatafileLogHeader {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct DatafileLog {
-    pub header: DatafileLogHeader,
+pub struct DatafileRecord {
+    pub header: DatafileRecordHeader,
     pub key: Box<[u8]>,
     pub value: Box<[u8]>,
 }
 
-impl DatafileLog {
+impl DatafileRecord {
     pub fn new(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
         Ok(Self {
-            header: DatafileLogHeader::new(key, value, DATAFILE_RECORD_TYPE_NORMAL)?,
+            header: DatafileRecordHeader::new(key, value, DATAFILE_RECORD_TYPE_NORMAL)?,
             key: Box::from(key),
             value: Box::from(value),
         })
@@ -295,7 +299,7 @@ impl DatafileLog {
 
     pub fn new_tombstone(key: &[u8]) -> Result<Self, DatafileError> {
         Ok(Self {
-            header: DatafileLogHeader::new(key, &[], DATAFILE_RECORD_TYPE_TOMBSTONE)?,
+            header: DatafileRecordHeader::new(key, &[], DATAFILE_RECORD_TYPE_TOMBSTONE)?,
             key: Box::from(key),
             value: Box::from([]),
         })
@@ -303,7 +307,7 @@ impl DatafileLog {
 
     pub fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
         Ok(Self {
-            header: DatafileLogHeader::with_timestamp(
+            header: DatafileRecordHeader::with_timestamp(
                 key,
                 value,
                 DATAFILE_RECORD_TYPE_NORMAL,
@@ -318,14 +322,14 @@ impl DatafileLog {
         let size = u64::from(self.header.key_size)
             .checked_add(u64::from(self.header.value_size))
             .and_then(|kv| kv.checked_add(DATAFILE_HEADER_SIZE_BYTES as u64))
-            .ok_or(DatafileError::OversizedDatafileEntry)?;
+            .ok_or(DatafileError::OversizedDatafileRecord)?;
 
-        usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileEntry)
+        usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileRecord)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
         let datafile_size = bytes.len() as u64;
-        let header = DatafileLogHeader::decode(bytes)?;
+        let header = DatafileRecordHeader::decode(bytes)?;
 
         let expected_datafile_size_with_key =
             DATAFILE_HEADER_SIZE_BYTES as u64 + u64::from(header.key_size);
@@ -354,7 +358,7 @@ impl DatafileLog {
         );
 
         if header.crc
-            != DatafileLogHeader::get_crc_for(
+            != DatafileRecordHeader::get_crc_for(
                 header.record_type,
                 header.timestamp,
                 header.key_size,
@@ -374,7 +378,7 @@ impl DatafileLog {
     }
 }
 
-impl Display for DatafileLog {
+impl Display for DatafileRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let key_str = String::from_utf8_lossy(&self.key);
         let value_str = String::from_utf8_lossy(&self.value);
@@ -414,7 +418,7 @@ mod datafile_tests {
     use crate::{
         datafile::{
             DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL,
-            Datafile, DatafileError, DatafileLog, DatafileLogHeader,
+            Datafile, DatafileError, DatafileRecord, DatafileRecordHeader,
         },
         keydir::KeyDir,
     };
@@ -452,7 +456,7 @@ mod datafile_tests {
         let value: u64 = 2;
         let value_size: u32 = value.to_be_bytes().len() as u32;
 
-        let datafile_header = DatafileLogHeader::with_timestamp(
+        let datafile_header = DatafileRecordHeader::with_timestamp(
             &key.to_be_bytes(),
             &value.to_be_bytes(),
             DATAFILE_RECORD_TYPE_NORMAL,
@@ -491,7 +495,7 @@ mod datafile_tests {
         let value: u64 = 2;
         let value_size: u32 = value.to_be_bytes().len() as u32;
 
-        let datafile_header = DatafileLogHeader::with_timestamp(
+        let datafile_header = DatafileRecordHeader::with_timestamp(
             key.as_bytes(),
             &value.to_be_bytes(),
             DATAFILE_RECORD_TYPE_NORMAL,
@@ -516,7 +520,7 @@ mod datafile_tests {
     }
 
     #[test]
-    fn datafile_entry() {
+    fn datafile_record() {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -525,7 +529,7 @@ mod datafile_tests {
         let key: String = String::from("hello world");
         let value: u64 = 2;
 
-        let expected_datafile_header = DatafileLogHeader::with_timestamp(
+        let expected_datafile_header = DatafileRecordHeader::with_timestamp(
             key.as_bytes(),
             &value.to_be_bytes(),
             DATAFILE_RECORD_TYPE_NORMAL,
@@ -533,12 +537,13 @@ mod datafile_tests {
         )
         .unwrap();
 
-        let datafile_entry =
-            DatafileLog::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
+        let datafile_record =
+            DatafileRecord::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp)
+                .unwrap();
 
-        assert_eq!(datafile_entry.header, expected_datafile_header);
-        assert_eq!(&datafile_entry.key.to_vec(), &key.into_bytes());
-        assert_eq!(&datafile_entry.value.to_vec(), &value.to_be_bytes());
+        assert_eq!(datafile_record.header, expected_datafile_header);
+        assert_eq!(&datafile_record.key.to_vec(), &key.into_bytes());
+        assert_eq!(&datafile_record.value.to_vec(), &value.to_be_bytes());
     }
 
     #[test]
@@ -546,7 +551,7 @@ mod datafile_tests {
         let key: String = String::from("hello world");
         let value: u64 = 2;
 
-        let datafile_header = DatafileLogHeader::new(
+        let datafile_header = DatafileRecordHeader::new(
             key.as_bytes(),
             &value.to_be_bytes(),
             DATAFILE_RECORD_TYPE_NORMAL,
@@ -584,11 +589,11 @@ mod datafile_tests {
     }
 
     #[test]
-    fn datafile_entry_encode() {
+    fn datafile_record_encode() {
         let key: String = String::from("hello world");
         let value: u64 = 2;
 
-        let datafile_entry = DatafileLog::new(key.as_bytes(), &value.to_be_bytes()).unwrap();
+        let datafile_record = DatafileRecord::new(key.as_bytes(), &value.to_be_bytes()).unwrap();
 
         let mut kv: Vec<u8> = Vec::new();
         kv.extend_from_slice(key.as_bytes());
@@ -596,18 +601,18 @@ mod datafile_tests {
 
         let mut encoded: Vec<u8> = Vec::new();
 
-        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
+        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
 
         assert_eq!(
             encoded[0..DATAFILE_HEADER_SIZE_BYTES],
-            datafile_entry.header.encode()
+            datafile_record.header.encode()
         );
         assert_eq!(encoded[DATAFILE_HEADER_SIZE_BYTES..], kv);
     }
 
     #[test]
     fn datafile_header_decode_ok() {
-        let datafile_header = DatafileLogHeader::new(
+        let datafile_header = DatafileRecordHeader::new(
             String::from("hello world").as_bytes(),
             &2u64.to_be_bytes(),
             DATAFILE_RECORD_TYPE_NORMAL,
@@ -616,13 +621,13 @@ mod datafile_tests {
 
         assert_eq!(
             datafile_header,
-            DatafileLogHeader::decode(&datafile_header.encode()).unwrap()
+            DatafileRecordHeader::decode(&datafile_header.encode()).unwrap()
         );
     }
 
     #[test]
     fn datafile_header_decode_err() {
-        let datafile_header = DatafileLogHeader::new(
+        let datafile_header = DatafileRecordHeader::new(
             String::from("hello world").as_bytes(),
             &2u64.to_be_bytes(),
             DATAFILE_RECORD_TYPE_NORMAL,
@@ -630,102 +635,106 @@ mod datafile_tests {
         .unwrap();
 
         assert!(matches!(
-            DatafileLogHeader::decode(&datafile_header.encode()[0..9]),
+            DatafileRecordHeader::decode(&datafile_header.encode()[0..9]),
             Err(DatafileError::UndersizedDatafileHeader(9))
         ));
     }
 
     #[test]
-    fn datafile_entry_decode_ok() {
-        let datafile_entry =
-            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
+    fn datafile_record_decode_ok() {
+        let datafile_record =
+            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                .unwrap();
 
         let mut encoded: Vec<u8> = Vec::new();
 
-        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
+        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
 
-        assert_eq!(datafile_entry, DatafileLog::decode(&encoded).unwrap());
+        assert_eq!(datafile_record, DatafileRecord::decode(&encoded).unwrap());
     }
 
     #[test]
-    fn datafile_entry_decode_err() {
-        let datafile_entry =
-            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
+    fn datafile_record_decode_err() {
+        let datafile_record =
+            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                .unwrap();
 
         let mut encoded: Vec<u8> = Vec::new();
 
-        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
+        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
 
         assert!(matches!(
-            DatafileLog::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
+            DatafileRecord::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
             Err(DatafileError::UndersizedDatafileKey { .. })
         ));
 
         assert!(matches!(
-            DatafileLog::decode(&encoded[..encoded.len() - 1]),
+            DatafileRecord::decode(&encoded[..encoded.len() - 1]),
             Err(DatafileError::UndersizedDatafileValue { .. })
         ));
     }
 
     #[test]
-    fn datafile_entry_decode_err_crc_mismatch() {
-        let datafile_entry =
-            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
+    fn datafile_record_decode_err_crc_mismatch() {
+        let datafile_record =
+            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                .unwrap();
 
         let mut encoded: Vec<u8> = Vec::new();
-        Datafile::write_log_to(&mut encoded, &datafile_entry).unwrap();
+        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
 
         let last = encoded.len();
         encoded[last - 1] = 0u8;
 
         assert!(matches!(
-            DatafileLog::decode(&encoded),
+            DatafileRecord::decode(&encoded),
             Err(DatafileError::CrcMismatch)
         ));
     }
 
     #[test]
-    fn datafile_entry_decode_corrupt_sizes() {
+    fn datafile_record_decode_corrupt_sizes() {
         let mut bytes = vec![0u8; DATAFILE_HEADER_SIZE_BYTES];
 
         bytes[13..17].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(
-            DatafileLog::decode(&bytes),
+            DatafileRecord::decode(&bytes),
             Err(DatafileError::UndersizedDatafileKey { .. })
         ));
 
         bytes[13..17].copy_from_slice(&0u32.to_be_bytes());
         bytes[17..21].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(
-            DatafileLog::decode(&bytes),
+            DatafileRecord::decode(&bytes),
             Err(DatafileError::UndersizedDatafileValue { .. })
         ));
     }
 
     #[test]
     fn size_err() {
-        let datafile_entry =
-            DatafileLog::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes()).unwrap();
+        let datafile_record =
+            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                .unwrap();
 
-        assert!(datafile_entry.size().is_ok());
+        assert!(datafile_record.size().is_ok());
     }
 
     #[test]
-    fn datafile_write_log() {
+    fn datafile_write_record() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
 
-        let datafile_entry =
-            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
-        let entry_size = datafile_entry.size().unwrap();
+        let datafile_record =
+            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+        let record_size = datafile_record.size().unwrap();
 
-        let offset = df.append_log(&datafile_entry).unwrap();
+        let offset = df.append_record(&datafile_record).unwrap();
         assert_eq!(offset, 0);
-        assert_eq!(df.offset, entry_size as u64);
+        assert_eq!(df.offset, record_size as u64);
 
         let mut expected = Vec::new();
-        Datafile::write_log_to(&mut expected, &datafile_entry).unwrap();
-        let read_bytes = df.read_bytes(offset, entry_size).unwrap();
+        Datafile::write_record_to(&mut expected, &datafile_record).unwrap();
+        let read_bytes = df.read_bytes(offset, record_size).unwrap();
         assert_eq!(&*read_bytes, &expected[..]);
     }
 
@@ -734,14 +743,14 @@ mod datafile_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
 
-        let datafile_entry =
-            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
-        let entry_size = datafile_entry.size().unwrap() as u64;
+        let datafile_record =
+            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+        let record_size = datafile_record.size().unwrap() as u64;
 
         assert_eq!(df.offset, 0);
-        let offset = df.append_log(&datafile_entry).unwrap();
+        let offset = df.append_record(&datafile_record).unwrap();
         assert_eq!(offset, 0);
-        assert_eq!(df.offset, entry_size);
+        assert_eq!(df.offset, record_size);
     }
 
     #[test]
@@ -750,11 +759,11 @@ mod datafile_tests {
         let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
         df.demote_to_reader();
 
-        let datafile_entry =
-            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+        let datafile_record =
+            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
 
         assert!(matches!(
-            df.append_log(&datafile_entry),
+            df.append_record(&datafile_record),
             Err(DatafileError::WriteAttemptToReaderDatafile)
         ));
     }
@@ -765,11 +774,11 @@ mod datafile_tests {
         let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
         df.offset = DATAFILE_MAX_SIZE_BYTES as u64;
 
-        let datafile_entry =
-            DatafileLog::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+        let datafile_record =
+            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
 
         assert!(matches!(
-            df.append_log(&datafile_entry),
+            df.append_record(&datafile_record),
             Err(DatafileError::DatafileFull)
         ));
     }
@@ -787,9 +796,9 @@ mod datafile_tests {
     }
 
     #[test]
-    fn datafile_log_display() {
-        let entry = DatafileLog::new("hello".as_bytes(), "world".as_bytes()).unwrap();
-        let formatted = format!("{entry}");
+    fn datafile_record_display() {
+        let record = DatafileRecord::new("hello".as_bytes(), "world".as_bytes()).unwrap();
+        let formatted = format!("{record}");
         assert!(formatted.contains("hello"));
         assert!(formatted.contains("world"));
     }
@@ -802,8 +811,8 @@ mod datafile_tests {
         // Pre-fill datafile
         for i in 0..30usize {
             assert!(
-                df.append_log(
-                    &DatafileLog::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                df.append_record(
+                    &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
                 )
                 .is_ok()
             );
@@ -816,5 +825,38 @@ mod datafile_tests {
 
         assert_eq!(keydir.len(), 30);
         (0..30usize).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
+    }
+
+    #[test]
+    fn replay_handles_tombstones() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+
+        // Pre-fill datafile
+        for i in 0..50usize {
+            assert!(
+                df.append_record(
+                    &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                )
+                .is_ok()
+            );
+        }
+        for i in 0..25usize {
+            assert!(
+                df.append_record(
+                    &DatafileRecord::new_tombstone(format!("{i}").as_bytes()).unwrap()
+                )
+                .is_ok()
+            );
+        }
+
+        let _ = df.file.rewind();
+
+        let mut keydir = KeyDir::new();
+
+        df.replay(&mut keydir).unwrap();
+
+        assert_eq!(keydir.len(), 25);
+        (25..50).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
     }
 }

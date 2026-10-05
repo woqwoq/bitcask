@@ -36,7 +36,7 @@ pub enum DatafileError {
     NegativeTimestamp(SystemTimeError),
     SliceConversion(TryFromSliceError),
     DatafileFull,
-    OversizedDatafileEntry,
+    OversizedDatafileRecord,
     UndersizedDatafileHeader(usize),
     UndersizedDatafileKey { actual: usize, expected: usize },
     UndersizedDatafileValue { actual: usize, expected: usize },
@@ -45,7 +45,7 @@ pub enum DatafileError {
     InvalidPath(PathBuf),
     WriterFileOffsetOverflow,
     WriteAttemptToReaderDatafile,
-    UnexpectedDatafileLogType,
+    UnexpectedDatafileRecordType,
 }
 
 impl From<Error> for DatafileError {
