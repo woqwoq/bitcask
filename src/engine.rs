@@ -212,9 +212,11 @@ impl BitcaskInstance {
         match record.header.record_type {
             DATAFILE_RECORD_TYPE_NORMAL => {
                 self.keydir.put(
-                    record,
+                    record.key,
                     self.writer.id,
+                    record.header.value_size,
                     offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
+                    record.header.timestamp,
                 );
             }
             DATAFILE_RECORD_TYPE_TOMBSTONE => {
@@ -458,7 +460,13 @@ mod test {
 
         // Prepare KeyDir to store a mapping of the key to the file that isn't present in LRU
         let value_offset = DATAFILE_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
-        db.keydir.put(record, 3, value_offset);
+        db.keydir.put(
+            record.key,
+            3,
+            record.header.value_size,
+            value_offset,
+            record.header.timestamp,
+        );
 
         // Make sure the datafile is not known
         assert_eq!(db.readers.len(), 1);

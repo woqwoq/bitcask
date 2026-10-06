@@ -38,15 +38,17 @@ impl KeyDir {
         self.dir.get(key)
     }
 
-    pub fn put(&mut self, record: DatafileRecord, file_id: u32, value_offset: u64) {
+    pub fn put(
+        &mut self,
+        key: Box<[u8]>,
+        file_id: u32,
+        value_size: u32,
+        value_offset: u64,
+        timestamp: u64,
+    ) {
         self.dir.insert(
-            record.key,
-            KeyDirEntry::new(
-                file_id,
-                record.header.value_size,
-                value_offset,
-                record.header.timestamp,
-            ),
+            key,
+            KeyDirEntry::new(file_id, value_size, value_offset, timestamp),
         );
     }
 
@@ -116,7 +118,13 @@ mod keydir_tests {
         let datafile_record = DatafileRecord::new(key, &value).unwrap();
         let offset = DATAFILE_HEADER_SIZE_BYTES as u64 + datafile_record.header.key_size as u64;
 
-        keydir.put(datafile_record.clone(), 0, offset);
+        keydir.put(
+            datafile_record.key,
+            0,
+            datafile_record.header.value_size,
+            offset,
+            datafile_record.header.timestamp,
+        );
 
         let expected = KeyDirEntry::new(
             0,

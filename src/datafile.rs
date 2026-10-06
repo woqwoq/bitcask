@@ -27,6 +27,8 @@ pub const DATAFILE_EXTENSION: &str = "db";
 pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
 pub const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
 
+pub const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 50;
+
 pub struct Datafile {
     file: File,
     pub id: u32,
@@ -70,33 +72,72 @@ impl Datafile {
     }
 
     pub fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
-        let mut buf = Vec::new();
-        self.file.read_to_end(&mut buf)?;
-
+        let file_size = self.file.metadata().unwrap().len();
         let mut start_offset = 0;
 
-        while start_offset < buf.len() {
-            // TODO: Not read whole value in-memory just to make a keydir entry that doesn't care
-            let record = DatafileRecord::decode(&buf[start_offset..])?;
+        while start_offset < file_size {
+            // TODO: Handle unexpected eof
+            let header = DatafileRecordHeader::decode(
+                &self.read_bytes(start_offset, DATAFILE_HEADER_SIZE_BYTES)?,
+            )?;
 
-            let record_size = record.size()?;
-            let ksz = record.header.key_size;
+            let mut hasher = header.crc();
 
-            match record.header.record_type {
+            let key = self.read_bytes(
+                start_offset + DATAFILE_HEADER_SIZE_BYTES as u64,
+                header.key_size as usize,
+            )?;
+            hasher.update(&key);
+
+            let mut value_buffer: [u8; DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES] =
+                [0u8; DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES];
+            let mut value_bytes_read: usize = 0;
+
+            while header.value_size > (value_bytes_read) as u32 {
+                let to_read = DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES
+                    .min(header.value_size as usize - value_bytes_read);
+
+                let bytes = self.file.read_at(
+                    &mut value_buffer[..to_read],
+                    start_offset
+                        + DATAFILE_HEADER_SIZE_BYTES as u64
+                        + header.key_size as u64
+                        + value_bytes_read as u64,
+                )?;
+
+                if bytes == 0 {
+                    break;
+                }
+
+                value_bytes_read += bytes;
+                hasher.update(&value_buffer[..bytes]);
+            }
+
+            if header.value_size > (value_bytes_read) as u32 {
+                return Err(DatafileError::TornWrite);
+            }
+
+            if hasher.finalize() != header.crc {
+                return Err(DatafileError::CrcMismatch);
+            }
+
+            match header.record_type {
                 DATAFILE_RECORD_TYPE_NORMAL => {
                     keydir.put(
-                        record,
+                        key,
                         self.id,
-                        start_offset as u64 + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
+                        header.value_size,
+                        start_offset + DATAFILE_HEADER_SIZE_BYTES as u64 + header.key_size as u64,
+                        header.timestamp,
                     );
                 }
                 DATAFILE_RECORD_TYPE_TOMBSTONE => {
-                    keydir.remove(&record.key);
+                    keydir.remove(&key);
                 }
                 _ => return Err(DatafileError::UnexpectedDatafileRecordType),
             }
 
-            start_offset += record_size;
+            start_offset += header.size()? as u64;
         }
 
         self.offset = start_offset as u64;
@@ -243,6 +284,17 @@ impl DatafileRecordHeader {
         })
     }
 
+    pub fn crc(&self) -> Hasher {
+        let mut hasher = Hasher::new();
+
+        hasher.update(&self.record_type.to_be_bytes());
+        hasher.update(&self.timestamp.to_be_bytes());
+        hasher.update(&self.key_size.to_be_bytes());
+        hasher.update(&self.value_size.to_be_bytes());
+
+        hasher
+    }
+
     fn get_crc_for(
         record_type: u8,
         timestamp: u64,
@@ -296,6 +348,15 @@ impl DatafileRecordHeader {
             value_size: u32::from_be_bytes(value_size_bytes),
         })
     }
+
+    pub fn size(&self) -> Result<usize, DatafileError> {
+        let size = u64::from(self.key_size)
+            .checked_add(u64::from(self.value_size))
+            .and_then(|kv| kv.checked_add(DATAFILE_HEADER_SIZE_BYTES as u64))
+            .ok_or(DatafileError::OversizedDatafileRecord)?;
+
+        usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileRecord)
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -336,12 +397,7 @@ impl DatafileRecord {
     }
 
     pub fn size(&self) -> Result<usize, DatafileError> {
-        let size = u64::from(self.header.key_size)
-            .checked_add(u64::from(self.header.value_size))
-            .and_then(|kv| kv.checked_add(DATAFILE_HEADER_SIZE_BYTES as u64))
-            .ok_or(DatafileError::OversizedDatafileRecord)?;
-
-        usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileRecord)
+        self.header.size()
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
@@ -875,5 +931,28 @@ mod datafile_tests {
 
         assert_eq!(keydir.len(), 25);
         (25..50).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
+    }
+
+    #[test]
+    fn replay_handles_values_larger_than_chunk_size() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+
+        // Pre-fill datafile with a value larger than chunk size
+        assert!(
+            df.append_record(
+                &DatafileRecord::new(
+                    "1".as_bytes(),
+                    "11111111111111111111111111111111111111".as_bytes()
+                )
+                .unwrap()
+            )
+            .is_ok()
+        );
+        let _ = df.file.rewind();
+
+        let mut keydir = KeyDir::new();
+
+        assert!(df.replay(&mut keydir).is_ok());
     }
 }

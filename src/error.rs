@@ -48,6 +48,7 @@ pub enum DatafileError {
     WriteAttemptToReaderDatafile,
     UnexpectedDatafileRecordType,
     SyncError(Error),
+    TornWrite,
 }
 
 impl From<Error> for DatafileError {
