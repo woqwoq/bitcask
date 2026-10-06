@@ -11,6 +11,7 @@ pub enum BitcaskError {
     FilenameConversion,
     DatafileNameError(ParseIntError),
     PathIsFile,
+    RecordLargerThanMaxDatafileSize(usize),
 }
 
 impl From<ParseIntError> for BitcaskError {

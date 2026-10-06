@@ -9,7 +9,11 @@ use std::{
 
 use crc32fast::Hasher;
 
-use crate::{error::DatafileError, keydir::KeyDir};
+use crate::{
+    error::DatafileError,
+    keydir::KeyDir,
+    options::{BitcaskOptions, DatafileMaxSize},
+};
 
 pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
 pub const DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES: usize = 1;
@@ -18,7 +22,6 @@ pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
 pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
 pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
-pub const DATAFILE_MAX_SIZE_BYTES: usize = 10_000;
 pub const DATAFILE_EXTENSION: &str = "db";
 
 pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
@@ -131,12 +134,22 @@ impl Datafile {
     pub fn should_switch_writer_before_write_commit(
         &self,
         record_size: u64,
+        options: &BitcaskOptions,
     ) -> Result<bool, DatafileError> {
-        Ok(self
+        let is_writer_oversized = self
             .offset
             .checked_add(record_size)
-            .unwrap_or(DATAFILE_MAX_SIZE_BYTES as u64)
-            >= DATAFILE_MAX_SIZE_BYTES as u64)
+            .unwrap_or(options.get_datafile_max_size() as u64)
+            >= options.get_datafile_max_size() as u64;
+
+        let is_writer_overcapped = match options.datafile_max_size {
+            DatafileMaxSize::SoftCappedBytes(_) => self.offset > 0, // Soft cap will allow one
+            // write no matter the size, so we conditionally switchover
+            DatafileMaxSize::HardCappedBytes(_) => true, // Hard cap needs to be strictly within
+                                                         // the max size, so we enforce switchover
+        };
+
+        Ok(is_writer_oversized && is_writer_overcapped)
     }
 
     fn move_writer_offset(&mut self, offset: u64) -> Result<(), DatafileError> {
@@ -144,10 +157,6 @@ impl Datafile {
             .offset
             .checked_add(offset)
             .ok_or(DatafileError::WriterFileOffsetOverflow)?;
-
-        if new_offset >= DATAFILE_MAX_SIZE_BYTES as u64 {
-            return Err(DatafileError::DatafileFull);
-        }
 
         self.offset = new_offset;
 
@@ -417,10 +426,11 @@ mod datafile_tests {
 
     use crate::{
         datafile::{
-            DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL,
-            Datafile, DatafileError, DatafileRecord, DatafileRecordHeader,
+            DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, Datafile, DatafileError,
+            DatafileRecord, DatafileRecordHeader,
         },
         keydir::KeyDir,
+        options::BitcaskOptions,
     };
 
     pub fn crc_of(
@@ -771,16 +781,15 @@ mod datafile_tests {
     #[test]
     fn datafile_write_err_full() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let options = BitcaskOptions::default();
         let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
-        df.offset = DATAFILE_MAX_SIZE_BYTES as u64;
 
-        let datafile_record =
+        let mut datafile_record =
             DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
 
-        assert!(matches!(
-            df.append_record(&datafile_record),
-            Err(DatafileError::DatafileFull)
-        ));
+        // We issue a write because one log file should accept at least one entry
+        datafile_record.header.value_size = options.get_datafile_max_size() as u32;
+        assert!(df.append_record(&datafile_record).is_ok());
     }
 
     #[test]

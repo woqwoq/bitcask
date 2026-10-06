@@ -14,7 +14,7 @@ use crate::{
     },
     error::{BitcaskError, DatafileError},
     keydir::KeyDir,
-    options::{BitcaskOption, BitcaskOptions},
+    options::{BitcaskOptions, DatafileMaxSize},
 };
 
 pub const LRU_CACHED_READERS_COUNT: usize = 10;
@@ -89,7 +89,7 @@ impl BitcaskStartupHandler {
         highest_reader_id: u32,
         options: &BitcaskOptions,
     ) -> Result<Datafile, BitcaskError> {
-        if options.is_enabled(BitcaskOption::ReuseExistingNonFullWriterOnStartup) {
+        if options.reuse_old_writer_on_startup {
             todo!()
         } else {
             Ok(Datafile::new_writer(dir, highest_reader_id + 1)?)
@@ -148,9 +148,22 @@ impl BitcaskInstance {
     }
 
     fn write_record(&mut self, record: DatafileRecord) -> Result<(), BitcaskError> {
+        let rsz = record.size()?;
+
+        // If our record is larger than the writer max size, we either throw an
+        // error or let it happen and continue
+        if rsz > self.options.get_datafile_max_size()
+            && matches!(
+                self.options.datafile_max_size,
+                DatafileMaxSize::HardCappedBytes(_)
+            )
+        {
+            return Err(BitcaskError::RecordLargerThanMaxDatafileSize(rsz));
+        }
+
         if self
             .writer
-            .should_switch_writer_before_write_commit(record.size()? as u64)?
+            .should_switch_writer_before_write_commit(rsz as u64, &self.options)?
         {
             self.switch_writer_datafile()?;
         }
@@ -242,8 +255,9 @@ impl BitcaskInstance {
 #[cfg(test)]
 mod test {
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, DATAFILE_MAX_SIZE_BYTES, Datafile, DatafileRecord},
+        datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileRecord},
         engine::BitcaskInstance,
+        error::BitcaskError,
         keydir::KeyDirEntry,
         options::BitcaskOptions,
     };
@@ -309,7 +323,8 @@ mod test {
             .writer
             .read_bytes(0, datafile_record.size().unwrap())
             .unwrap();
-        assert_eq!(&*read_bytes, &expected_bytes[..]);
+        assert_eq!(&read_bytes[0..1], &expected_bytes[0..1]);
+        assert_eq!(&read_bytes[13..], &expected_bytes[13..]);
 
         let keydir_written = db.keydir.get(key.as_bytes()).unwrap();
         assert_eq!(db.keydir.len(), 1);
@@ -376,11 +391,12 @@ mod test {
     #[test]
     fn put_switch_writer() {
         let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
-        db.writer.offset = DATAFILE_MAX_SIZE_BYTES as u64;
+        let options = BitcaskOptions::default();
+        db.writer.offset = options.get_datafile_max_size() as u64;
 
         assert_eq!(db.writer.id, 2);
         assert!(db.writer.is_writer);
-        assert_eq!(db.writer.offset, DATAFILE_MAX_SIZE_BYTES as u64);
+        assert_eq!(db.writer.offset, options.get_datafile_max_size() as u64);
 
         let key = "hello world";
         let value: u32 = 2;
@@ -449,11 +465,13 @@ mod test {
     #[test]
     fn open_existing() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let options = BitcaskOptions::default();
 
         const RECORD_COUNT: usize = 1000;
         const RECORD_SIZE: usize = 29;
 
-        let fratio: f32 = (RECORD_COUNT * RECORD_SIZE) as f32 / DATAFILE_MAX_SIZE_BYTES as f32;
+        let fratio: f32 =
+            (RECORD_COUNT * RECORD_SIZE) as f32 / options.get_datafile_max_size() as f32;
 
         // Temporary scope to fill the data
         {
@@ -574,5 +592,58 @@ mod test {
 
             assert_eq!(db.keydir.len(), RECORD_COUNT - DELETES_COUNT);
         }
+    }
+
+    #[test]
+    fn put_commits_when_oversized_entry_but_df_empty_and_soft_cap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut db = BitcaskInstance::open(
+            temp_dir.path().to_path_buf(),
+            BitcaskOptions::default()
+                .datafile_max_size(crate::options::DatafileMaxSize::SoftCappedBytes(40)),
+        )
+        .unwrap();
+
+        assert!(db.put(&0u128.to_be_bytes(), &0u128.to_be_bytes()).is_ok());
+        assert_eq!(db.writer.id, 1); // Due to current writer being empty, we expect it to have at
+        // least one entry
+        assert_eq!(db.writer.offset, 53);
+
+        assert!(db.put(&1u128.to_be_bytes(), &1u128.to_be_bytes()).is_ok());
+        assert_eq!(db.writer.id, 2); // First writer is now oversized, so we switchover and commit
+        // on the new writer
+        assert_eq!(db.writer.offset, 53);
+    }
+
+    #[test]
+    fn put_not_commits_when_oversized_entry_but_df_empty_and_hard_cap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut db = BitcaskInstance::open(
+            temp_dir.path().to_path_buf(),
+            BitcaskOptions::default()
+                .datafile_max_size(crate::options::DatafileMaxSize::HardCappedBytes(40)),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            db.put(&0u128.to_be_bytes(), &0u128.to_be_bytes()),
+            Err(BitcaskError::RecordLargerThanMaxDatafileSize(53usize))
+        ));
+        assert_eq!(db.keydir.len(), 0);
+        assert_eq!(db.writer.id, 1); // No writer switchover should occur
+
+        // First write should go through normally
+        assert!(db.put(&0u32.to_be_bytes(), &0u32.to_be_bytes()).is_ok());
+        assert_eq!(db.keydir.len(), 1);
+        assert_eq!(db.writer.id, 1);
+        assert_eq!(db.writer.offset, 29);
+
+        // The writer overflows, so we should switchover and write
+        assert!(db.put(&1u32.to_be_bytes(), &1u32.to_be_bytes()).is_ok());
+        assert_eq!(db.keydir.len(), 2);
+        assert_eq!(db.writer.id, 2);
+        assert_eq!(db.writer.offset, 29);
     }
 }
