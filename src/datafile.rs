@@ -12,7 +12,7 @@ use crc32fast::Hasher;
 use crate::{
     error::DatafileError,
     keydir::KeyDir,
-    options::{BitcaskOptions, DatafileMaxSize},
+    options::{DatafileMaxSize, SyncMode},
 };
 
 pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
@@ -134,15 +134,15 @@ impl Datafile {
     pub fn should_switch_writer_before_write_commit(
         &self,
         record_size: u64,
-        options: &BitcaskOptions,
+        datafile_max_size: &DatafileMaxSize,
     ) -> Result<bool, DatafileError> {
         let is_writer_oversized = self
             .offset
             .checked_add(record_size)
-            .unwrap_or(options.get_datafile_max_size() as u64)
-            >= options.get_datafile_max_size() as u64;
+            .unwrap_or(datafile_max_size.get_size() as u64)
+            >= datafile_max_size.get_size() as u64;
 
-        let is_writer_overcapped = match options.datafile_max_size {
+        let is_writer_overcapped = match datafile_max_size {
             DatafileMaxSize::SoftCappedBytes(_) => self.offset > 0, // Soft cap will allow one
             // write no matter the size, so we conditionally switchover
             DatafileMaxSize::HardCappedBytes(_) => true, // Hard cap needs to be strictly within
@@ -150,6 +150,14 @@ impl Datafile {
         };
 
         Ok(is_writer_oversized && is_writer_overcapped)
+    }
+
+    pub fn sync(&mut self, mode: &SyncMode) -> Result<(), DatafileError> {
+        match mode {
+            SyncMode::SyncAll => self.file.sync_all(),
+            SyncMode::SyncData => self.file.sync_data(),
+        }
+        .map_err(DatafileError::SyncError)
     }
 
     fn move_writer_offset(&mut self, offset: u64) -> Result<(), DatafileError> {
@@ -788,7 +796,7 @@ mod datafile_tests {
             DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
 
         // We issue a write because one log file should accept at least one entry
-        datafile_record.header.value_size = options.get_datafile_max_size() as u32;
+        datafile_record.header.value_size = options.datafile_max_size.get_size() as u32;
         assert!(df.append_record(&datafile_record).is_ok());
     }
 

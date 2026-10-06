@@ -14,7 +14,7 @@ use crate::{
     },
     error::{BitcaskError, DatafileError},
     keydir::KeyDir,
-    options::{BitcaskOptions, DatafileMaxSize},
+    options::{BitcaskOptions, DatafileMaxSize, SyncFrequency},
 };
 
 pub const LRU_CACHED_READERS_COUNT: usize = 10;
@@ -23,6 +23,7 @@ pub struct BitcaskInstance {
     pub(crate) keydir: KeyDir,            // In-memory keydir map
     pub writer: Datafile,                 // Writer file handle
     pub readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
+    write_count: usize,                   // Write count tracker for sync
     options: BitcaskOptions,              // User-customisable options
 }
 
@@ -113,6 +114,7 @@ impl BitcaskInstance {
             )?,
             dir_path: dir,
             readers,
+            write_count: 0,
             options,
         })
     }
@@ -152,7 +154,7 @@ impl BitcaskInstance {
 
         // If our record is larger than the writer max size, we either throw an
         // error or let it happen and continue
-        if rsz > self.options.get_datafile_max_size()
+        if rsz > self.options.datafile_max_size.get_size()
             && matches!(
                 self.options.datafile_max_size,
                 DatafileMaxSize::HardCappedBytes(_)
@@ -163,13 +165,15 @@ impl BitcaskInstance {
 
         if self
             .writer
-            .should_switch_writer_before_write_commit(rsz as u64, &self.options)?
+            .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)?
         {
             self.switch_writer_datafile()?;
         }
 
         let offset = self.commit_datafile_write(&record)?; // Write record first, so that it can be
         // replayed in case of a crash.
+
+        self.sync_writer()?; // Sync IO according to user's options
 
         self.commit_keydir_write(record, offset)?; // Append entry to the keydir
 
@@ -179,6 +183,20 @@ impl BitcaskInstance {
     pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
         if self.keydir.contains(key) {
             self.write_record(DatafileRecord::new_tombstone(key)?)?;
+        }
+
+        Ok(())
+    }
+
+    fn sync_writer(&mut self) -> Result<(), BitcaskError> {
+        match self.options.sync_frequency {
+            SyncFrequency::EveryWrite => self.writer.sync(&self.options.sync_mode)?,
+            SyncFrequency::EveryNthWrite(n) => {
+                if self.write_count.is_multiple_of(n) {
+                    self.writer.sync(&self.options.sync_mode)?
+                }
+            }
+            SyncFrequency::Never => {}
         }
 
         Ok(())
@@ -204,6 +222,8 @@ impl BitcaskInstance {
             }
             _ => return Err(DatafileError::UnexpectedDatafileRecordType)?,
         }
+
+        self.write_count += 1;
 
         Ok(())
     }
@@ -245,6 +265,7 @@ impl BitcaskInstance {
                 writer,
                 dir_path: dir_path.to_path_buf(),
                 readers,
+                write_count: 0,
                 options: BitcaskOptions::default(),
             },
             temp_dir,
@@ -392,11 +413,14 @@ mod test {
     fn put_switch_writer() {
         let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
         let options = BitcaskOptions::default();
-        db.writer.offset = options.get_datafile_max_size() as u64;
+        db.writer.offset = options.datafile_max_size.get_size() as u64;
 
         assert_eq!(db.writer.id, 2);
         assert!(db.writer.is_writer);
-        assert_eq!(db.writer.offset, options.get_datafile_max_size() as u64);
+        assert_eq!(
+            db.writer.offset,
+            options.datafile_max_size.get_size() as u64
+        );
 
         let key = "hello world";
         let value: u32 = 2;
@@ -471,7 +495,7 @@ mod test {
         const RECORD_SIZE: usize = 29;
 
         let fratio: f32 =
-            (RECORD_COUNT * RECORD_SIZE) as f32 / options.get_datafile_max_size() as f32;
+            (RECORD_COUNT * RECORD_SIZE) as f32 / options.datafile_max_size.get_size() as f32;
 
         // Temporary scope to fill the data
         {

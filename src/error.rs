@@ -47,6 +47,7 @@ pub enum DatafileError {
     WriterFileOffsetOverflow,
     WriteAttemptToReaderDatafile,
     UnexpectedDatafileRecordType,
+    SyncError(Error),
 }
 
 impl From<Error> for DatafileError {

@@ -1,11 +1,23 @@
 #[derive(Clone, PartialEq)]
 pub enum SyncMode {
+    SyncData,
+    SyncAll,
+}
+
+impl Default for SyncMode {
+    fn default() -> Self {
+        Self::SyncAll
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum SyncFrequency {
     EveryWrite,
     EveryNthWrite(usize),
     Never,
 }
 
-impl Default for SyncMode {
+impl Default for SyncFrequency {
     fn default() -> Self {
         Self::Never
     }
@@ -17,6 +29,15 @@ pub enum DatafileMaxSize {
     HardCappedBytes(usize),
 }
 
+impl DatafileMaxSize {
+    pub fn get_size(&self) -> usize {
+        match self {
+            DatafileMaxSize::SoftCappedBytes(n) => *n,
+            DatafileMaxSize::HardCappedBytes(n) => *n,
+        }
+    }
+}
+
 impl Default for DatafileMaxSize {
     fn default() -> Self {
         Self::SoftCappedBytes(10000)
@@ -26,6 +47,7 @@ impl Default for DatafileMaxSize {
 #[derive(Clone)]
 pub struct BitcaskOptions {
     pub sync_mode: SyncMode,
+    pub sync_frequency: SyncFrequency,
     pub datafile_max_size: DatafileMaxSize,
     pub reuse_old_writer_on_startup: bool,
 }
@@ -33,6 +55,16 @@ pub struct BitcaskOptions {
 impl BitcaskOptions {
     pub fn sync_mode(mut self, new: SyncMode) -> Self {
         self.sync_mode = new;
+        self
+    }
+    pub fn sync_frequency(mut self, new: SyncFrequency) -> Self {
+        if let SyncFrequency::EveryNthWrite(n) = new
+            && n == 0
+        {
+            panic!("SyncFrequency::EveryNthWrite cannot be set to 0");
+        }
+
+        self.sync_frequency = new;
         self
     }
     pub fn datafile_max_size(mut self, new: DatafileMaxSize) -> Self {
@@ -43,19 +75,13 @@ impl BitcaskOptions {
         self.reuse_old_writer_on_startup = new;
         self
     }
-
-    pub fn get_datafile_max_size(&self) -> usize {
-        match self.datafile_max_size {
-            DatafileMaxSize::SoftCappedBytes(n) => n,
-            DatafileMaxSize::HardCappedBytes(n) => n,
-        }
-    }
 }
 
 impl Default for BitcaskOptions {
     fn default() -> Self {
         Self {
             sync_mode: SyncMode::default(),
+            sync_frequency: SyncFrequency::default(),
             datafile_max_size: DatafileMaxSize::default(),
             reuse_old_writer_on_startup: false,
         }
