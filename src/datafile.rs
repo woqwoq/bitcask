@@ -71,6 +71,27 @@ impl Datafile {
         })
     }
 
+    pub fn open_reader_for_recovery(
+        dir: &Path,
+        id: u32,
+        offset: u64,
+    ) -> Result<Self, DatafileError> {
+        let filename = Self::generate_filename(dir, id)?;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open(filename)?;
+
+        Ok(Datafile {
+            file,
+            id,
+            offset,
+            is_writer: false,
+        })
+    }
+
     pub fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
         let file_size = self.file.metadata().unwrap().len();
         let mut start_offset = 0;
@@ -138,11 +159,16 @@ impl Datafile {
             }
 
             start_offset += header.size()? as u64;
+            self.offset = start_offset;
         }
 
-        self.offset = start_offset as u64;
-
         Ok(())
+    }
+
+    pub fn truncate(&mut self, new_size: u64) -> Result<(), DatafileError> {
+        self.file
+            .set_len(new_size)
+            .map_err(DatafileError::TruncateFailure)
     }
 
     pub fn append_record(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {

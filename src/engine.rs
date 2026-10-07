@@ -1,5 +1,6 @@
 use std::{
     fs::read_dir,
+    io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
 };
@@ -62,6 +63,13 @@ impl BitcaskStartupHandler {
         Ok(ids)
     }
 
+    pub fn reopen_reader_for_recovery(dir: &Path, df: Datafile) -> Result<Datafile, DatafileError> {
+        let id = df.id;
+        let offset = df.offset;
+        drop(df);
+        Datafile::open_reader_for_recovery(dir, id, offset)
+    }
+
     // TODO: Return last reader insted
     pub fn replay_and_init_readers(
         dir: &Path,
@@ -74,7 +82,22 @@ impl BitcaskStartupHandler {
         let mut highest_id = 0u32;
         for id in ids {
             let mut df = Datafile::open_reader(dir, id)?;
-            df.replay(&mut keydir)?;
+            if let Err(e) = df.replay(&mut keydir) {
+                df = Self::reopen_reader_for_recovery(dir, df)?;
+                match e {
+                    DatafileError::TornWrite => df.truncate(df.offset)?,
+                    DatafileError::UndersizedDatafileHeader(_) => df.truncate(df.offset)?,
+                    DatafileError::IO(e) => {
+                        if e.kind() == ErrorKind::UnexpectedEof {
+                            df.truncate(df.offset)?
+                        } else {
+                            return Err(BitcaskError::FatalReplayFailure(DatafileError::IO(e)));
+                        }
+                    }
+                    DatafileError::CrcMismatch => df.truncate(df.offset)?,
+                    e => return Err(BitcaskError::FatalReplayFailure(e)),
+                }
+            }
 
             // TODO: Reuse old writer option
 
@@ -172,6 +195,7 @@ impl BitcaskInstance {
 
         let offset = self.commit_datafile_write(&record)?; // Write record first, so that it can be
         // replayed in case of a crash.
+        self.write_count += 1;
 
         self.sync_writer()?; // Sync IO according to user's options
 
@@ -224,8 +248,6 @@ impl BitcaskInstance {
             }
             _ => return Err(DatafileError::UnexpectedDatafileRecordType)?,
         }
-
-        self.write_count += 1;
 
         Ok(())
     }

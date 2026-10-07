@@ -12,6 +12,7 @@ pub enum BitcaskError {
     DatafileNameError(ParseIntError),
     PathIsFile,
     RecordLargerThanMaxDatafileSize(usize),
+    FatalReplayFailure(DatafileError),
 }
 
 impl From<ParseIntError> for BitcaskError {
@@ -42,18 +43,19 @@ pub enum DatafileError {
     UndersizedDatafileKey { actual: usize, expected: usize },
     UndersizedDatafileValue { actual: usize, expected: usize },
     CrcMismatch,
-    IOWrite(Error),
+    IO(Error),
     InvalidPath(PathBuf),
     WriterFileOffsetOverflow,
     WriteAttemptToReaderDatafile,
     UnexpectedDatafileRecordType,
     SyncError(Error),
     TornWrite,
+    TruncateFailure(Error),
 }
 
 impl From<Error> for DatafileError {
     fn from(value: Error) -> Self {
-        Self::IOWrite(value)
+        Self::IO(value)
     }
 }
 
