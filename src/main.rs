@@ -23,6 +23,10 @@ fn main() {
                 }
             }
 
+            for i in 1800..2000u32 {
+                db.remove(&i.to_be_bytes()).unwrap();
+            }
+
             println!("Writer:\n{}\n Readers:\n", db.writer);
             for (_, df) in db.readers {
                 println!("{df}\n");

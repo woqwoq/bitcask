@@ -10,8 +10,8 @@ use tempfile::TempDir;
 
 use crate::{
     datafile::{
-        DATAFILE_EXTENSION, DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL,
-        DATAFILE_RECORD_TYPE_TOMBSTONE, Datafile, DatafileRecord,
+        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
+        Datafile, DatafileRecord,
     },
     error::{BitcaskError, DatafileError},
     keydir::KeyDir,
@@ -51,7 +51,7 @@ impl BitcaskStartupHandler {
                 .map_err(|_| BitcaskError::FilenameConversion)?;
 
             if let Some((name, ext)) = filename.rsplit_once('.') {
-                if ext == DATAFILE_EXTENSION {
+                if ext == options.datafile_extension {
                     ids.push(name.parse::<u32>()?);
                 }
             } else {
@@ -63,17 +63,22 @@ impl BitcaskStartupHandler {
         Ok(ids)
     }
 
-    pub fn reopen_reader_for_recovery(dir: &Path, df: Datafile) -> Result<Datafile, DatafileError> {
+    pub fn reopen_reader_for_recovery(
+        dir: &Path,
+        df: Datafile,
+        options: &BitcaskOptions,
+    ) -> Result<Datafile, DatafileError> {
         let id = df.id;
         let offset = df.offset;
         drop(df);
-        Datafile::open_reader_for_recovery(dir, id, offset)
+        Datafile::open_reader_for_recovery(dir, id, offset, &options.datafile_extension)
     }
 
     // TODO: Return last reader insted
     pub fn replay_and_init_readers(
         dir: &Path,
         ids: Vec<u32>,
+        options: &BitcaskOptions,
     ) -> Result<(KeyDir, LruCache<u32, Datafile>, u32), BitcaskError> {
         let mut keydir = KeyDir::new();
         let mut readers: LruCache<u32, Datafile> =
@@ -81,9 +86,9 @@ impl BitcaskStartupHandler {
 
         let mut highest_id = 0u32;
         for id in ids {
-            let mut df = Datafile::open_reader(dir, id)?;
+            let mut df = Datafile::open_reader(dir, id, &options.datafile_extension)?;
             if let Err(e) = df.replay(&mut keydir) {
-                df = Self::reopen_reader_for_recovery(dir, df)?;
+                df = Self::reopen_reader_for_recovery(dir, df, options)?;
                 match e {
                     DatafileError::TornWrite => df.truncate(df.offset)?,
                     DatafileError::UndersizedDatafileHeader(_) => df.truncate(df.offset)?,
@@ -116,7 +121,11 @@ impl BitcaskStartupHandler {
         if options.reuse_old_writer_on_startup {
             todo!()
         } else {
-            Ok(Datafile::new_writer(dir, highest_reader_id + 1)?)
+            Ok(Datafile::new_writer(
+                dir,
+                highest_reader_id + 1,
+                &options.datafile_extension,
+            )?)
         }
     }
 }
@@ -126,6 +135,7 @@ impl BitcaskInstance {
         let (keydir, readers, highest_reader_id) = BitcaskStartupHandler::replay_and_init_readers(
             &dir,
             BitcaskStartupHandler::parse_db_datafile_ids_at_path(&dir, &options)?,
+            &options,
         )?;
 
         Ok(BitcaskInstance {
@@ -152,7 +162,11 @@ impl BitcaskInstance {
                 &self.writer
             } else if let Some(reader) = self.readers.get(&keydir_entry.file_id) {
                 reader
-            } else if let Ok(reader) = Datafile::open_reader(&self.dir_path, keydir_entry.file_id) {
+            } else if let Ok(reader) = Datafile::open_reader(
+                &self.dir_path,
+                keydir_entry.file_id,
+                &self.options.datafile_extension,
+            ) {
                 let reader_id = reader.id;
                 self.readers.put(reader_id, reader);
                 self.readers
@@ -261,39 +275,17 @@ impl BitcaskInstance {
     fn switch_writer_datafile(&mut self) -> Result<(), BitcaskError> {
         self.writer.demote_to_reader();
         let old_writer = &mut self.writer;
-        let new_writer = Datafile::new_writer(&self.dir_path, old_writer.id + 1)?;
+        let new_writer = Datafile::new_writer(
+            &self.dir_path,
+            old_writer.id + 1,
+            &self.options.datafile_extension,
+        )?;
 
         let old_writer = std::mem::replace(old_writer, new_writer);
 
         self.readers.put(old_writer.id, old_writer);
 
         Ok(())
-    }
-
-    pub fn build_mock_bitcask_instance() -> (BitcaskInstance, TempDir) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let dir_path = temp_dir.path();
-
-        let writer = Datafile::new_writer(dir_path, 2).unwrap();
-        let mut reader = Datafile::new_writer(dir_path, 1).unwrap();
-        reader.is_writer = false;
-
-        let mut readers: LruCache<u32, Datafile> =
-            LruCache::new(NonZeroUsize::new(LRU_CACHED_READERS_COUNT).unwrap());
-
-        readers.put(1, reader);
-
-        (
-            BitcaskInstance {
-                keydir: KeyDir::new(),
-                writer,
-                dir_path: dir_path.to_path_buf(),
-                readers,
-                write_count: 0,
-                options: BitcaskOptions::default(),
-            },
-            temp_dir,
-        )
     }
 }
 
@@ -326,7 +318,9 @@ mod test {
 
     #[test]
     fn commit_keydir_write() {
-        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut db =
+            BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default());
 
         let datafile_record = datafile_record_for_string_u32("hello world", 2);
         let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
@@ -476,7 +470,8 @@ mod test {
         let record = datafile_record_for_string_u32(key, value);
 
         // Prepare reader datafile with the requested entry
-        let mut missed_reader = Datafile::new_writer(&db.dir_path, 3).unwrap();
+        let mut missed_reader =
+            Datafile::new_writer(&db.dir_path, 3, &db.options.datafile_extension).unwrap();
         assert!(missed_reader.append_record(&record).is_ok());
         missed_reader.is_writer = false;
 

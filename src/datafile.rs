@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -22,8 +22,6 @@ pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
 pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
 pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
-pub const DATAFILE_EXTENSION: &str = "db";
-
 pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
 pub const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
 
@@ -37,8 +35,12 @@ pub struct Datafile {
 }
 
 impl Datafile {
-    pub fn new_writer(dir: &Path, id: u32) -> Result<Datafile, DatafileError> {
-        let filename = Self::generate_filename(dir, id)?;
+    pub fn new_writer(
+        dir: &Path,
+        id: u32,
+        datafile_extension: &str,
+    ) -> Result<Datafile, DatafileError> {
+        let filename = Self::generate_filename(dir, id, datafile_extension)?;
 
         let file = OpenOptions::new()
             .read(true)
@@ -54,8 +56,12 @@ impl Datafile {
         })
     }
 
-    pub fn open_reader(dir: &Path, id: u32) -> Result<Datafile, DatafileError> {
-        let filename = Self::generate_filename(dir, id)?;
+    pub fn open_reader(
+        dir: &Path,
+        id: u32,
+        datafile_extension: &str,
+    ) -> Result<Datafile, DatafileError> {
+        let filename = Self::generate_filename(dir, id, datafile_extension)?;
 
         let file = OpenOptions::new()
             .read(true)
@@ -75,8 +81,9 @@ impl Datafile {
         dir: &Path,
         id: u32,
         offset: u64,
+        datafile_extension: &str,
     ) -> Result<Self, DatafileError> {
-        let filename = Self::generate_filename(dir, id)?;
+        let filename = Self::generate_filename(dir, id, datafile_extension)?;
 
         let file = OpenOptions::new()
             .read(true)
@@ -250,8 +257,12 @@ impl Datafile {
         self.is_writer = false;
     }
 
-    pub fn generate_filename(dir: &Path, file_id: u32) -> Result<PathBuf, DatafileError> {
-        Ok(dir.join(format!("{:08}.{}", file_id, DATAFILE_EXTENSION)))
+    pub fn generate_filename(
+        dir: &Path,
+        file_id: u32,
+        datafile_extension: &str,
+    ) -> Result<PathBuf, DatafileError> {
+        Ok(dir.join(format!("{:08}.{}", file_id, datafile_extension)))
     }
 }
 
@@ -409,19 +420,6 @@ impl DatafileRecord {
         })
     }
 
-    pub fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
-        Ok(Self {
-            header: DatafileRecordHeader::with_timestamp(
-                key,
-                value,
-                DATAFILE_RECORD_TYPE_NORMAL,
-                timestamp,
-            )?,
-            key: Box::from(key),
-            value: Box::from(value),
-        })
-    }
-
     pub fn size(&self) -> Result<usize, DatafileError> {
         self.header.size()
     }
@@ -522,6 +520,23 @@ mod datafile_tests {
         keydir::KeyDir,
         options::BitcaskOptions,
     };
+
+    pub fn with_timestamp(
+        key: &[u8],
+        value: &[u8],
+        timestamp: u64,
+    ) -> Result<DatafileRecord, DatafileError> {
+        Ok(DatafileRecord {
+            header: DatafileRecordHeader::with_timestamp(
+                key,
+                value,
+                DATAFILE_RECORD_TYPE_NORMAL,
+                timestamp,
+            )?,
+            key: Box::from(key),
+            value: Box::from(value),
+        })
+    }
 
     pub fn crc_of(
         record_type: u8,
@@ -638,8 +653,7 @@ mod datafile_tests {
         .unwrap();
 
         let datafile_record =
-            DatafileRecord::with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp)
-                .unwrap();
+            with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
 
         assert_eq!(datafile_record.header, expected_datafile_header);
         assert_eq!(&datafile_record.key.to_vec(), &key.into_bytes());
@@ -822,7 +836,12 @@ mod datafile_tests {
     #[test]
     fn datafile_write_record() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
 
         let datafile_record =
             DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
@@ -841,7 +860,12 @@ mod datafile_tests {
     #[test]
     fn datafile_move_writer_offset() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
 
         let datafile_record =
             DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
@@ -856,7 +880,12 @@ mod datafile_tests {
     #[test]
     fn datafile_non_writer_write_err() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
         df.demote_to_reader();
 
         let datafile_record =
@@ -872,7 +901,12 @@ mod datafile_tests {
     fn datafile_write_err_full() {
         let temp_dir = tempfile::tempdir().unwrap();
         let options = BitcaskOptions::default();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
 
         let mut datafile_record =
             DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
@@ -885,7 +919,12 @@ mod datafile_tests {
     #[test]
     fn move_writer_offset_err_ovf() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
         df.offset = u64::MAX;
 
         assert!(matches!(
@@ -905,7 +944,12 @@ mod datafile_tests {
     #[test]
     fn replay_ok() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
 
         // Pre-fill datafile
         for i in 0..30usize {
@@ -929,7 +973,12 @@ mod datafile_tests {
     #[test]
     fn replay_handles_tombstones() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
 
         // Pre-fill datafile
         for i in 0..50usize {
@@ -962,7 +1011,12 @@ mod datafile_tests {
     #[test]
     fn replay_handles_values_larger_than_chunk_size() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(temp_dir.path(), 1).unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
 
         // Pre-fill datafile with a value larger than chunk size
         assert!(
@@ -980,5 +1034,46 @@ mod datafile_tests {
         let mut keydir = KeyDir::new();
 
         assert!(df.replay(&mut keydir).is_ok());
+    }
+
+    #[test]
+    fn datafile_open_for_recover_is_writable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut df = Datafile::new_writer(
+            temp_dir.path(),
+            1,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
+
+        // Pre-fill datafile
+        for i in 0..50usize {
+            assert!(
+                df.append_record(
+                    &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                )
+                .is_ok()
+            );
+        }
+        df.demote_to_reader();
+        let id = df.id;
+        let offset = df.offset;
+        drop(df); // Free the file handle
+
+        let mut reader = Datafile::open_reader_for_recovery(
+            temp_dir.path(),
+            id,
+            offset,
+            &BitcaskOptions::default().datafile_extension,
+        )
+        .unwrap();
+
+        assert!(
+            reader
+                .append_record(&DatafileRecord::new("1".as_bytes(), "1".as_bytes()).unwrap())
+                .is_err()
+        ); // The reader should still be immutable record-wise
+
+        assert!(reader.truncate(offset).is_ok());
     }
 }

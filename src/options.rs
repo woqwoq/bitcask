@@ -1,3 +1,5 @@
+pub const DEFAULT_DATAFILE_EXTENSION: &str = "db";
+
 #[derive(Clone, PartialEq)]
 pub enum SyncMode {
     SyncData,
@@ -50,6 +52,7 @@ pub struct BitcaskOptions {
     pub sync_frequency: SyncFrequency,
     pub datafile_max_size: DatafileMaxSize,
     pub reuse_old_writer_on_startup: bool,
+    pub datafile_extension: String,
 }
 
 impl BitcaskOptions {
@@ -75,6 +78,10 @@ impl BitcaskOptions {
         self.reuse_old_writer_on_startup = new;
         self
     }
+    pub fn datafile_extension(mut self, new: &str) -> Self {
+        self.datafile_extension = new.to_string();
+        self
+    }
 }
 
 impl Default for BitcaskOptions {
@@ -84,6 +91,7 @@ impl Default for BitcaskOptions {
             sync_frequency: SyncFrequency::default(),
             datafile_max_size: DatafileMaxSize::default(),
             reuse_old_writer_on_startup: false,
+            datafile_extension: DEFAULT_DATAFILE_EXTENSION.to_string(),
         }
     }
 }
