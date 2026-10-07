@@ -6,7 +6,6 @@ use std::{
 };
 
 use lru::LruCache;
-use tempfile::TempDir;
 
 use crate::{
     datafile::{
@@ -291,6 +290,8 @@ impl BitcaskInstance {
 
 #[cfg(test)]
 mod test {
+    use tempfile::TempDir;
+
     use crate::{
         datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileRecord},
         engine::BitcaskInstance,
@@ -298,6 +299,18 @@ mod test {
         keydir::KeyDirEntry,
         options::BitcaskOptions,
     };
+
+    pub fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let options = BitcaskOptions::default();
+        let db = BitcaskInstance::open(
+            temp_dir.path().to_path_buf(),
+            BitcaskOptions::default().clone(),
+        )
+        .unwrap();
+
+        (temp_dir, options, db)
+    }
 
     pub fn keydir_entry_for(
         datafile_record: &DatafileRecord,
@@ -318,9 +331,7 @@ mod test {
 
     #[test]
     fn commit_keydir_write() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut db =
-            BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default());
+        let (_, _, mut db) = init_test();
 
         let datafile_record = datafile_record_for_string_u32("hello world", 2);
         let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
@@ -346,7 +357,7 @@ mod test {
 
     #[test]
     fn put_ok() {
-        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
+        let (_, _, mut db) = init_test();
 
         let key = "hello world";
         let value: u32 = 2;
@@ -376,7 +387,7 @@ mod test {
 
     #[test]
     fn get_ok() {
-        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
+        let (_, _, mut db) = init_test();
 
         let key = "hello world";
         let value: u32 = 2;
@@ -398,23 +409,24 @@ mod test {
 
     #[test]
     fn switch_writer_datafile() {
-        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
+        #[allow(unused_variables)]
+        let (temp_dir, _, mut db) = init_test();
 
-        assert_eq!(db.writer.id, 2);
+        assert_eq!(db.writer.id, 1);
         assert!(db.writer.is_writer);
         assert_eq!(db.writer.offset, 0);
-        assert_eq!(db.readers.len(), 1);
+        assert_eq!(db.readers.len(), 0);
 
         assert!(db.switch_writer_datafile().is_ok());
 
         // Make sure old writer is demoted and added to LRU cache of readers
-        assert_eq!(db.readers.len(), 2);
-        let old = db.readers.get(&2u32).unwrap();
-        assert_eq!(old.id, 2);
+        assert_eq!(db.readers.len(), 1);
+        let old = db.readers.get(&1u32).unwrap();
+        assert_eq!(old.id, 1);
         assert!(!old.is_writer);
 
         // Make sure new writer is created with proper id, role and offset
-        assert_eq!(db.writer.id, 3);
+        assert_eq!(db.writer.id, 2);
         assert!(db.writer.is_writer);
         assert_eq!(db.writer.offset, 0);
 
@@ -429,11 +441,12 @@ mod test {
 
     #[test]
     fn put_switch_writer() {
-        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
-        let options = BitcaskOptions::default();
+        #[allow(unused_variables)]
+        let (temp_dir, options, mut db) = init_test();
+
         db.writer.offset = options.datafile_max_size.get_size() as u64;
 
-        assert_eq!(db.writer.id, 2);
+        assert_eq!(db.writer.id, 1);
         assert!(db.writer.is_writer);
         assert_eq!(
             db.writer.offset,
@@ -446,7 +459,7 @@ mod test {
         assert!(db.put(key.as_bytes(), &value.to_be_bytes()).is_ok());
 
         // Make sure new writer is created with proper id, role and offset
-        assert_eq!(db.writer.id, 3);
+        assert_eq!(db.writer.id, 2);
         assert!(db.writer.is_writer);
         assert_eq!(
             db.writer.offset,
@@ -462,7 +475,8 @@ mod test {
 
     #[test]
     fn get_ok_lru_cache_miss() {
-        let (mut db, _dir) = BitcaskInstance::build_mock_bitcask_instance();
+        #[allow(unused_variables)]
+        let (temp_dir, _, mut db) = init_test();
 
         let key = "hello world";
         let value = 128u32;
@@ -486,22 +500,19 @@ mod test {
         );
 
         // Make sure the datafile is not known
-        assert_eq!(db.readers.len(), 1);
+        assert_eq!(db.readers.len(), 0);
 
         assert_eq!(
             db.get(key.as_bytes()).unwrap().unwrap(),
             Box::from(value.to_be_bytes())
         );
         // Verify the missed reader has been discovered
-        assert_eq!(db.readers.len(), 2);
+        assert_eq!(db.readers.len(), 1);
     }
 
     #[test]
     fn open_new() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
-            .unwrap();
+        let (_, _, db) = init_test();
 
         assert_eq!(db.writer.id, 1);
         assert_eq!(db.writer.offset, 0);
@@ -568,16 +579,12 @@ mod test {
 
     #[test]
     fn remove_ok() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let (_, _, mut db) = init_test();
 
         const ENTRY_COUNT: usize = 20;
         const ENTRY_SIZE: usize = 29;
         // Tombstone log is 21 + 4 = 25 bytes
         const DATAFILE_TOMBSTONE_SIZE: usize = 25;
-
-        let mut db =
-            BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
-                .unwrap();
 
         for i in 0..ENTRY_COUNT as u32 {
             db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
