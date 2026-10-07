@@ -1,4 +1,5 @@
 pub const DEFAULT_DATAFILE_EXTENSION: &str = "db";
+pub const DEFAULT_LRU_CACHED_READERS_COUNT: usize = 10;
 
 #[derive(Clone, PartialEq)]
 pub enum SyncMode {
@@ -53,6 +54,7 @@ pub struct BitcaskOptions {
     pub datafile_max_size: DatafileMaxSize,
     pub reuse_old_writer_on_startup: bool,
     pub datafile_extension: String,
+    pub reader_lru_cache_size: usize,
 }
 
 impl BitcaskOptions {
@@ -82,6 +84,10 @@ impl BitcaskOptions {
         self.datafile_extension = new.to_string();
         self
     }
+    pub fn reader_lru_cache_size(mut self, new: usize) -> Self {
+        self.reader_lru_cache_size = new;
+        self
+    }
 }
 
 impl Default for BitcaskOptions {
@@ -92,6 +98,7 @@ impl Default for BitcaskOptions {
             datafile_max_size: DatafileMaxSize::default(),
             reuse_old_writer_on_startup: false,
             datafile_extension: DEFAULT_DATAFILE_EXTENSION.to_string(),
+            reader_lru_cache_size: DEFAULT_LRU_CACHED_READERS_COUNT,
         }
     }
 }

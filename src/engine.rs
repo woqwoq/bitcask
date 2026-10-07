@@ -17,7 +17,6 @@ use crate::{
     options::{BitcaskOptions, DatafileMaxSize, SyncFrequency},
 };
 
-pub const LRU_CACHED_READERS_COUNT: usize = 10;
 pub struct BitcaskInstance {
     dir_path: PathBuf,                    // For opening files through LRU
     pub(crate) keydir: KeyDir,            // In-memory keydir map
@@ -81,7 +80,7 @@ impl BitcaskStartupHandler {
     ) -> Result<(KeyDir, LruCache<u32, Datafile>, u32), BitcaskError> {
         let mut keydir = KeyDir::new();
         let mut readers: LruCache<u32, Datafile> =
-            LruCache::new(NonZeroUsize::new(LRU_CACHED_READERS_COUNT).unwrap());
+            LruCache::new(NonZeroUsize::new(options.reader_lru_cache_size).unwrap());
 
         let mut highest_id = 0u32;
         for id in ids {
