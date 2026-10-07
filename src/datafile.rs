@@ -56,25 +56,37 @@ impl Datafile {
         })
     }
 
-    pub fn open_reader(
+    // Proxy call
+    fn open_datafile(
         dir: &Path,
         id: u32,
         datafile_extension: &str,
+        offset: u64,
+        writeable: bool,
+        is_writer: bool,
     ) -> Result<Datafile, DatafileError> {
         let filename = Self::generate_filename(dir, id, datafile_extension)?;
 
         let file = OpenOptions::new()
             .read(true)
-            .write(false)
+            .write(writeable)
             .create(false)
             .open(filename)?;
 
         Ok(Datafile {
             file,
             id,
-            offset: 0,
-            is_writer: false,
+            offset,
+            is_writer,
         })
+    }
+
+    pub fn open_reader(
+        dir: &Path,
+        id: u32,
+        datafile_extension: &str,
+    ) -> Result<Datafile, DatafileError> {
+        Self::open_datafile(dir, id, datafile_extension, 0, false, false)
     }
 
     pub fn open_reader_for_recovery(
@@ -83,20 +95,7 @@ impl Datafile {
         offset: u64,
         datafile_extension: &str,
     ) -> Result<Self, DatafileError> {
-        let filename = Self::generate_filename(dir, id, datafile_extension)?;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(false)
-            .open(filename)?;
-
-        Ok(Datafile {
-            file,
-            id,
-            offset,
-            is_writer: false,
-        })
+        Self::open_datafile(dir, id, datafile_extension, offset, true, false)
     }
 
     pub fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
@@ -505,7 +504,7 @@ impl Display for DatafileRecord {
 }
 
 #[cfg(test)]
-mod datafile_tests {
+mod tests {
     use crc32fast::Hasher;
     use std::{
         io::Seek,
@@ -558,28 +557,69 @@ mod datafile_tests {
         hasher.finalize()
     }
 
-    #[test]
-    fn datafile_header_int() {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+    mod header {
+        use super::*;
 
-        let key: u32 = 1;
-        let key_size: u32 = key.to_be_bytes().len() as u32;
+        #[test]
+        fn int_key() {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
 
-        let value: u64 = 2;
-        let value_size: u32 = value.to_be_bytes().len() as u32;
+            let key: u32 = 1;
+            let key_size: u32 = key.to_be_bytes().len() as u32;
 
-        let datafile_header = DatafileRecordHeader::with_timestamp(
-            &key.to_be_bytes(),
-            &value.to_be_bytes(),
-            DATAFILE_RECORD_TYPE_NORMAL,
-            timestamp,
-        );
+            let value: u64 = 2;
+            let value_size: u32 = value.to_be_bytes().len() as u32;
 
-        assert!(datafile_header.is_ok());
-        if let Ok(datafile_header) = datafile_header {
+            let datafile_header = DatafileRecordHeader::with_timestamp(
+                &key.to_be_bytes(),
+                &value.to_be_bytes(),
+                DATAFILE_RECORD_TYPE_NORMAL,
+                timestamp,
+            );
+
+            assert!(datafile_header.is_ok());
+            if let Ok(datafile_header) = datafile_header {
+                assert_eq!(
+                    datafile_header.crc,
+                    crc_of(
+                        DATAFILE_RECORD_TYPE_NORMAL,
+                        timestamp,
+                        key_size,
+                        value_size,
+                        &key.to_be_bytes(),
+                        &value.to_be_bytes()
+                    )
+                );
+                assert_eq!(datafile_header.timestamp, timestamp);
+                assert_eq!(datafile_header.key_size, key_size);
+                assert_eq!(datafile_header.value_size, value_size);
+            }
+        }
+
+        #[test]
+        fn string_key() {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            let key: String = String::from("hello world");
+            let key_size: u32 = key.len() as u32;
+
+            let value: u64 = 2;
+            let value_size: u32 = value.to_be_bytes().len() as u32;
+
+            let datafile_header = DatafileRecordHeader::with_timestamp(
+                key.as_bytes(),
+                &value.to_be_bytes(),
+                DATAFILE_RECORD_TYPE_NORMAL,
+                timestamp,
+            )
+            .unwrap();
+
             assert_eq!(
                 datafile_header.crc,
                 crc_of(
@@ -587,7 +627,7 @@ mod datafile_tests {
                     timestamp,
                     key_size,
                     value_size,
-                    &key.to_be_bytes(),
+                    &key.into_bytes(),
                     &value.to_be_bytes()
                 )
             );
@@ -595,485 +635,465 @@ mod datafile_tests {
             assert_eq!(datafile_header.key_size, key_size);
             assert_eq!(datafile_header.value_size, value_size);
         }
+
+        #[test]
+        fn encode() {
+            let key: String = String::from("hello world");
+            let value: u64 = 2;
+
+            let datafile_header = DatafileRecordHeader::new(
+                key.as_bytes(),
+                &value.to_be_bytes(),
+                DATAFILE_RECORD_TYPE_NORMAL,
+            )
+            .unwrap();
+
+            let mut expected: Vec<u8> = Vec::new();
+            datafile_header
+                .record_type
+                .to_be_bytes()
+                .iter()
+                .for_each(|b| expected.push(*b));
+            datafile_header
+                .crc
+                .to_be_bytes()
+                .iter()
+                .for_each(|b| expected.push(*b));
+            datafile_header
+                .timestamp
+                .to_be_bytes()
+                .iter()
+                .for_each(|b| expected.push(*b));
+            datafile_header
+                .key_size
+                .to_be_bytes()
+                .iter()
+                .for_each(|b| expected.push(*b));
+            datafile_header
+                .value_size
+                .to_be_bytes()
+                .iter()
+                .for_each(|b| expected.push(*b));
+
+            assert_eq!(datafile_header.encode().to_vec(), expected);
+        }
+
+        #[test]
+        fn decode_ok() {
+            let datafile_header = DatafileRecordHeader::new(
+                String::from("hello world").as_bytes(),
+                &2u64.to_be_bytes(),
+                DATAFILE_RECORD_TYPE_NORMAL,
+            )
+            .unwrap();
+
+            assert_eq!(
+                datafile_header,
+                DatafileRecordHeader::decode(&datafile_header.encode()).unwrap()
+            );
+        }
+
+        #[test]
+        fn decode_err() {
+            let datafile_header = DatafileRecordHeader::new(
+                String::from("hello world").as_bytes(),
+                &2u64.to_be_bytes(),
+                DATAFILE_RECORD_TYPE_NORMAL,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                DatafileRecordHeader::decode(&datafile_header.encode()[0..9]),
+                Err(DatafileError::UndersizedDatafileHeader(9))
+            ));
+        }
     }
 
-    #[test]
-    fn datafile_header_string() {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+    mod record {
+        use super::*;
 
-        let key: String = String::from("hello world");
-        let key_size: u32 = key.len() as u32;
+        #[test]
+        fn new() {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
 
-        let value: u64 = 2;
-        let value_size: u32 = value.to_be_bytes().len() as u32;
+            let key: String = String::from("hello world");
+            let value: u64 = 2;
 
-        let datafile_header = DatafileRecordHeader::with_timestamp(
-            key.as_bytes(),
-            &value.to_be_bytes(),
-            DATAFILE_RECORD_TYPE_NORMAL,
-            timestamp,
-        )
-        .unwrap();
-
-        assert_eq!(
-            datafile_header.crc,
-            crc_of(
+            let expected_datafile_header = DatafileRecordHeader::with_timestamp(
+                key.as_bytes(),
+                &value.to_be_bytes(),
                 DATAFILE_RECORD_TYPE_NORMAL,
                 timestamp,
-                key_size,
-                value_size,
-                &key.into_bytes(),
-                &value.to_be_bytes()
             )
-        );
-        assert_eq!(datafile_header.timestamp, timestamp);
-        assert_eq!(datafile_header.key_size, key_size);
-        assert_eq!(datafile_header.value_size, value_size);
-    }
+            .unwrap();
 
-    #[test]
-    fn datafile_record() {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            let datafile_record =
+                with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
 
-        let key: String = String::from("hello world");
-        let value: u64 = 2;
-
-        let expected_datafile_header = DatafileRecordHeader::with_timestamp(
-            key.as_bytes(),
-            &value.to_be_bytes(),
-            DATAFILE_RECORD_TYPE_NORMAL,
-            timestamp,
-        )
-        .unwrap();
-
-        let datafile_record =
-            with_timestamp(key.as_bytes(), &value.to_be_bytes(), timestamp).unwrap();
-
-        assert_eq!(datafile_record.header, expected_datafile_header);
-        assert_eq!(&datafile_record.key.to_vec(), &key.into_bytes());
-        assert_eq!(&datafile_record.value.to_vec(), &value.to_be_bytes());
-    }
-
-    #[test]
-    fn datafile_header_encode() {
-        let key: String = String::from("hello world");
-        let value: u64 = 2;
-
-        let datafile_header = DatafileRecordHeader::new(
-            key.as_bytes(),
-            &value.to_be_bytes(),
-            DATAFILE_RECORD_TYPE_NORMAL,
-        )
-        .unwrap();
-
-        let mut expected: Vec<u8> = Vec::new();
-        datafile_header
-            .record_type
-            .to_be_bytes()
-            .iter()
-            .for_each(|b| expected.push(*b));
-        datafile_header
-            .crc
-            .to_be_bytes()
-            .iter()
-            .for_each(|b| expected.push(*b));
-        datafile_header
-            .timestamp
-            .to_be_bytes()
-            .iter()
-            .for_each(|b| expected.push(*b));
-        datafile_header
-            .key_size
-            .to_be_bytes()
-            .iter()
-            .for_each(|b| expected.push(*b));
-        datafile_header
-            .value_size
-            .to_be_bytes()
-            .iter()
-            .for_each(|b| expected.push(*b));
-
-        assert_eq!(datafile_header.encode().to_vec(), expected);
-    }
-
-    #[test]
-    fn datafile_record_encode() {
-        let key: String = String::from("hello world");
-        let value: u64 = 2;
-
-        let datafile_record = DatafileRecord::new(key.as_bytes(), &value.to_be_bytes()).unwrap();
-
-        let mut kv: Vec<u8> = Vec::new();
-        kv.extend_from_slice(key.as_bytes());
-        kv.extend_from_slice(&value.to_be_bytes());
-
-        let mut encoded: Vec<u8> = Vec::new();
-
-        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
-
-        assert_eq!(
-            encoded[0..DATAFILE_HEADER_SIZE_BYTES],
-            datafile_record.header.encode()
-        );
-        assert_eq!(encoded[DATAFILE_HEADER_SIZE_BYTES..], kv);
-    }
-
-    #[test]
-    fn datafile_header_decode_ok() {
-        let datafile_header = DatafileRecordHeader::new(
-            String::from("hello world").as_bytes(),
-            &2u64.to_be_bytes(),
-            DATAFILE_RECORD_TYPE_NORMAL,
-        )
-        .unwrap();
-
-        assert_eq!(
-            datafile_header,
-            DatafileRecordHeader::decode(&datafile_header.encode()).unwrap()
-        );
-    }
-
-    #[test]
-    fn datafile_header_decode_err() {
-        let datafile_header = DatafileRecordHeader::new(
-            String::from("hello world").as_bytes(),
-            &2u64.to_be_bytes(),
-            DATAFILE_RECORD_TYPE_NORMAL,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            DatafileRecordHeader::decode(&datafile_header.encode()[0..9]),
-            Err(DatafileError::UndersizedDatafileHeader(9))
-        ));
-    }
-
-    #[test]
-    fn datafile_record_decode_ok() {
-        let datafile_record =
-            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
-                .unwrap();
-
-        let mut encoded: Vec<u8> = Vec::new();
-
-        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
-
-        assert_eq!(datafile_record, DatafileRecord::decode(&encoded).unwrap());
-    }
-
-    #[test]
-    fn datafile_record_decode_err() {
-        let datafile_record =
-            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
-                .unwrap();
-
-        let mut encoded: Vec<u8> = Vec::new();
-
-        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
-
-        assert!(matches!(
-            DatafileRecord::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
-            Err(DatafileError::UndersizedDatafileKey { .. })
-        ));
-
-        assert!(matches!(
-            DatafileRecord::decode(&encoded[..encoded.len() - 1]),
-            Err(DatafileError::UndersizedDatafileValue { .. })
-        ));
-    }
-
-    #[test]
-    fn datafile_record_decode_err_crc_mismatch() {
-        let datafile_record =
-            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
-                .unwrap();
-
-        let mut encoded: Vec<u8> = Vec::new();
-        Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
-
-        let last = encoded.len();
-        encoded[last - 1] = 0u8;
-
-        assert!(matches!(
-            DatafileRecord::decode(&encoded),
-            Err(DatafileError::CrcMismatch)
-        ));
-    }
-
-    #[test]
-    fn datafile_record_decode_corrupt_sizes() {
-        let mut bytes = vec![0u8; DATAFILE_HEADER_SIZE_BYTES];
-
-        bytes[13..17].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert!(matches!(
-            DatafileRecord::decode(&bytes),
-            Err(DatafileError::UndersizedDatafileKey { .. })
-        ));
-
-        bytes[13..17].copy_from_slice(&0u32.to_be_bytes());
-        bytes[17..21].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert!(matches!(
-            DatafileRecord::decode(&bytes),
-            Err(DatafileError::UndersizedDatafileValue { .. })
-        ));
-    }
-
-    #[test]
-    fn size_err() {
-        let datafile_record =
-            DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
-                .unwrap();
-
-        assert!(datafile_record.size().is_ok());
-    }
-
-    #[test]
-    fn datafile_write_record() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
-
-        let datafile_record =
-            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
-        let record_size = datafile_record.size().unwrap();
-
-        let offset = df.append_record(&datafile_record).unwrap();
-        assert_eq!(offset, 0);
-        assert_eq!(df.offset, record_size as u64);
-
-        let mut expected = Vec::new();
-        Datafile::write_record_to(&mut expected, &datafile_record).unwrap();
-        let read_bytes = df.read_bytes(offset, record_size).unwrap();
-        assert_eq!(&*read_bytes, &expected[..]);
-    }
-
-    #[test]
-    fn datafile_move_writer_offset() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
-
-        let datafile_record =
-            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
-        let record_size = datafile_record.size().unwrap() as u64;
-
-        assert_eq!(df.offset, 0);
-        let offset = df.append_record(&datafile_record).unwrap();
-        assert_eq!(offset, 0);
-        assert_eq!(df.offset, record_size);
-    }
-
-    #[test]
-    fn datafile_non_writer_write_err() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
-        df.demote_to_reader();
-
-        let datafile_record =
-            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
-
-        assert!(matches!(
-            df.append_record(&datafile_record),
-            Err(DatafileError::WriteAttemptToReaderDatafile)
-        ));
-    }
-
-    #[test]
-    fn datafile_write_err_full() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let options = BitcaskOptions::default();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
-
-        let mut datafile_record =
-            DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
-
-        // We issue a write because one log file should accept at least one entry
-        datafile_record.header.value_size = options.datafile_max_size.get_size() as u32;
-        assert!(df.append_record(&datafile_record).is_ok());
-    }
-
-    #[test]
-    fn move_writer_offset_err_ovf() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
-        df.offset = u64::MAX;
-
-        assert!(matches!(
-            df.move_writer_offset(1),
-            Err(DatafileError::WriterFileOffsetOverflow)
-        ));
-    }
-
-    #[test]
-    fn datafile_record_display() {
-        let record = DatafileRecord::new("hello".as_bytes(), "world".as_bytes()).unwrap();
-        let formatted = format!("{record}");
-        assert!(formatted.contains("hello"));
-        assert!(formatted.contains("world"));
-    }
-
-    #[test]
-    fn replay_ok() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
-
-        // Pre-fill datafile
-        for i in 0..30usize {
-            assert!(
-                df.append_record(
-                    &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
-                )
-                .is_ok()
-            );
-        }
-        let _ = df.file.rewind();
-
-        let mut keydir = KeyDir::new();
-
-        df.replay(&mut keydir).unwrap();
-
-        assert_eq!(keydir.len(), 30);
-        (0..30usize).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
-    }
-
-    #[test]
-    fn replay_handles_tombstones() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
-
-        // Pre-fill datafile
-        for i in 0..50usize {
-            assert!(
-                df.append_record(
-                    &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
-                )
-                .is_ok()
-            );
-        }
-        for i in 0..25usize {
-            assert!(
-                df.append_record(
-                    &DatafileRecord::new_tombstone(format!("{i}").as_bytes()).unwrap()
-                )
-                .is_ok()
-            );
+            assert_eq!(datafile_record.header, expected_datafile_header);
+            assert_eq!(&datafile_record.key.to_vec(), &key.into_bytes());
+            assert_eq!(&datafile_record.value.to_vec(), &value.to_be_bytes());
         }
 
-        let _ = df.file.rewind();
+        #[test]
+        fn encode() {
+            let key: String = String::from("hello world");
+            let value: u64 = 2;
 
-        let mut keydir = KeyDir::new();
+            let datafile_record =
+                DatafileRecord::new(key.as_bytes(), &value.to_be_bytes()).unwrap();
 
-        df.replay(&mut keydir).unwrap();
+            let mut kv: Vec<u8> = Vec::new();
+            kv.extend_from_slice(key.as_bytes());
+            kv.extend_from_slice(&value.to_be_bytes());
 
-        assert_eq!(keydir.len(), 25);
-        (25..50).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
+            let mut encoded: Vec<u8> = Vec::new();
+
+            Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
+
+            assert_eq!(
+                encoded[0..DATAFILE_HEADER_SIZE_BYTES],
+                datafile_record.header.encode()
+            );
+            assert_eq!(encoded[DATAFILE_HEADER_SIZE_BYTES..], kv);
+        }
+
+        #[test]
+        fn decode_ok() {
+            let datafile_record =
+                DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                    .unwrap();
+
+            let mut encoded: Vec<u8> = Vec::new();
+
+            Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
+
+            assert_eq!(datafile_record, DatafileRecord::decode(&encoded).unwrap());
+        }
+
+        #[test]
+        fn decode_err() {
+            let datafile_record =
+                DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                    .unwrap();
+
+            let mut encoded: Vec<u8> = Vec::new();
+
+            Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
+
+            assert!(matches!(
+                DatafileRecord::decode(&encoded[0..DATAFILE_HEADER_SIZE_BYTES + 5]),
+                Err(DatafileError::UndersizedDatafileKey { .. })
+            ));
+
+            assert!(matches!(
+                DatafileRecord::decode(&encoded[..encoded.len() - 1]),
+                Err(DatafileError::UndersizedDatafileValue { .. })
+            ));
+        }
+
+        #[test]
+        fn decode_err_crc_mismatch() {
+            let datafile_record =
+                DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                    .unwrap();
+
+            let mut encoded: Vec<u8> = Vec::new();
+            Datafile::write_record_to(&mut encoded, &datafile_record).unwrap();
+
+            let last = encoded.len();
+            encoded[last - 1] = 0u8;
+
+            assert!(matches!(
+                DatafileRecord::decode(&encoded),
+                Err(DatafileError::CrcMismatch)
+            ));
+        }
+
+        #[test]
+        fn decode_err_corrupt_sizes() {
+            let mut bytes = vec![0u8; DATAFILE_HEADER_SIZE_BYTES];
+
+            bytes[13..17].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(matches!(
+                DatafileRecord::decode(&bytes),
+                Err(DatafileError::UndersizedDatafileKey { .. })
+            ));
+
+            bytes[13..17].copy_from_slice(&0u32.to_be_bytes());
+            bytes[17..21].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(matches!(
+                DatafileRecord::decode(&bytes),
+                Err(DatafileError::UndersizedDatafileValue { .. })
+            ));
+        }
+
+        #[test]
+        fn size_ok() {
+            let datafile_record =
+                DatafileRecord::new(String::from("hello world").as_bytes(), &2u64.to_be_bytes())
+                    .unwrap();
+
+            assert!(datafile_record.size().is_ok());
+        }
+
+        #[test]
+        fn display() {
+            let record = DatafileRecord::new("hello".as_bytes(), "world".as_bytes()).unwrap();
+            let formatted = format!("{record}");
+            assert!(formatted.contains("hello"));
+            assert!(formatted.contains("world"));
+        }
     }
 
-    #[test]
-    fn replay_handles_values_larger_than_chunk_size() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
+    mod writer {
+        use super::*;
 
-        // Pre-fill datafile with a value larger than chunk size
-        assert!(
-            df.append_record(
-                &DatafileRecord::new(
-                    "1".as_bytes(),
-                    "11111111111111111111111111111111111111".as_bytes()
-                )
-                .unwrap()
+        #[test]
+        fn append_and_read_record() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
             )
-            .is_ok()
-        );
-        let _ = df.file.rewind();
+            .unwrap();
 
-        let mut keydir = KeyDir::new();
+            let datafile_record =
+                DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+            let record_size = datafile_record.size().unwrap();
 
-        assert!(df.replay(&mut keydir).is_ok());
+            let offset = df.append_record(&datafile_record).unwrap();
+            assert_eq!(offset, 0);
+            assert_eq!(df.offset, record_size as u64);
+
+            let mut expected = Vec::new();
+            Datafile::write_record_to(&mut expected, &datafile_record).unwrap();
+            let read_bytes = df.read_bytes(offset, record_size).unwrap();
+            assert_eq!(&*read_bytes, &expected[..]);
+        }
+
+        #[test]
+        fn append_advances_offset() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            let datafile_record =
+                DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+            let record_size = datafile_record.size().unwrap() as u64;
+
+            assert_eq!(df.offset, 0);
+            let offset = df.append_record(&datafile_record).unwrap();
+            assert_eq!(offset, 0);
+            assert_eq!(df.offset, record_size);
+        }
+
+        #[test]
+        fn append_rejected_after_demote() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+            df.demote_to_reader();
+
+            let datafile_record =
+                DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+
+            assert!(matches!(
+                df.append_record(&datafile_record),
+                Err(DatafileError::WriteAttemptToReaderDatafile)
+            ));
+        }
+
+        #[test]
+        fn append_allows_oversized_record_on_empty_writer() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let options = BitcaskOptions::default();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            let mut datafile_record =
+                DatafileRecord::new("hello world".as_bytes(), &2u32.to_be_bytes()).unwrap();
+
+            // We issue a write because one log file should accept at least one entry
+            datafile_record.header.value_size = options.datafile_max_size.get_size() as u32;
+            assert!(df.append_record(&datafile_record).is_ok());
+        }
+
+        #[test]
+        fn offset_overflow_err() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+            df.offset = u64::MAX;
+
+            assert!(matches!(
+                df.move_writer_offset(1),
+                Err(DatafileError::WriterFileOffsetOverflow)
+            ));
+        }
     }
 
-    #[test]
-    fn datafile_open_for_recover_is_writable() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut df = Datafile::new_writer(
-            temp_dir.path(),
-            1,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
+    mod replay {
+        use super::*;
 
-        // Pre-fill datafile
-        for i in 0..50usize {
+        #[test]
+        fn rebuilds_keydir() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            // Pre-fill datafile
+            for i in 0..30usize {
+                assert!(
+                    df.append_record(
+                        &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                    )
+                    .is_ok()
+                );
+            }
+            let _ = df.file.rewind();
+
+            let mut keydir = KeyDir::new();
+
+            df.replay(&mut keydir).unwrap();
+
+            assert_eq!(keydir.len(), 30);
+            (0..30usize).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
+        }
+
+        #[test]
+        fn handles_tombstones() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            // Pre-fill datafile
+            for i in 0..50usize {
+                assert!(
+                    df.append_record(
+                        &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                    )
+                    .is_ok()
+                );
+            }
+            for i in 0..25usize {
+                assert!(
+                    df.append_record(
+                        &DatafileRecord::new_tombstone(format!("{i}").as_bytes()).unwrap()
+                    )
+                    .is_ok()
+                );
+            }
+
+            let _ = df.file.rewind();
+
+            let mut keydir = KeyDir::new();
+
+            df.replay(&mut keydir).unwrap();
+
+            assert_eq!(keydir.len(), 25);
+            (25..50).for_each(|i| assert!(keydir.contains(format!("{i}").as_bytes())));
+        }
+
+        #[test]
+        fn handles_values_larger_than_chunk_size() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            // Pre-fill datafile with a value larger than chunk size
             assert!(
                 df.append_record(
-                    &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                    &DatafileRecord::new(
+                        "1".as_bytes(),
+                        "11111111111111111111111111111111111111".as_bytes()
+                    )
+                    .unwrap()
                 )
                 .is_ok()
             );
+            let _ = df.file.rewind();
+
+            let mut keydir = KeyDir::new();
+
+            assert!(df.replay(&mut keydir).is_ok());
         }
-        df.demote_to_reader();
-        let id = df.id;
-        let offset = df.offset;
-        drop(df); // Free the file handle
+    }
 
-        let mut reader = Datafile::open_reader_for_recovery(
-            temp_dir.path(),
-            id,
-            offset,
-            &BitcaskOptions::default().datafile_extension,
-        )
-        .unwrap();
+    mod recovery {
+        use super::*;
 
-        assert!(
-            reader
-                .append_record(&DatafileRecord::new("1".as_bytes(), "1".as_bytes()).unwrap())
-                .is_err()
-        ); // The reader should still be immutable record-wise
+        #[test]
+        fn rejects_append_but_allows_truncate() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
 
-        assert!(reader.truncate(offset).is_ok());
+            // Pre-fill datafile
+            for i in 0..50usize {
+                assert!(
+                    df.append_record(
+                        &DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap()
+                    )
+                    .is_ok()
+                );
+            }
+            df.demote_to_reader();
+            let id = df.id;
+            let offset = df.offset;
+            drop(df); // Free the file handle
+
+            let mut reader = Datafile::open_reader_for_recovery(
+                temp_dir.path(),
+                id,
+                offset,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            assert!(
+                reader
+                    .append_record(&DatafileRecord::new("1".as_bytes(), "1".as_bytes()).unwrap())
+                    .is_err()
+            ); // The reader should still be immutable record-wise
+
+            assert!(reader.truncate(offset).is_ok());
+        }
     }
 }

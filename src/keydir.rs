@@ -95,20 +95,20 @@ impl Display for KeyDir {
 }
 
 #[cfg(test)]
-mod keydir_tests {
+mod tests {
     use crate::{
         datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
         keydir::{KeyDir, KeyDirEntry},
     };
 
     #[test]
-    fn new() {
+    fn new_is_empty() {
         let keydir = KeyDir::new();
         assert_eq!(keydir.len(), 0);
     }
 
     #[test]
-    fn put_get() {
+    fn put_then_get() {
         let mut keydir = KeyDir::new();
         assert_eq!(keydir.len(), 0);
 
