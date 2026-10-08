@@ -358,6 +358,7 @@ mod tests {
         fs::OpenOptions,
         io::{Seek, SeekFrom, Write},
         num::NonZeroUsize,
+        ops::Div,
         os::unix::fs::symlink,
         path::{Path, PathBuf},
     };
@@ -370,7 +371,7 @@ mod tests {
         engine::{BitcaskInstance, BitcaskRecoveryHandler, BitcaskStartupHandler},
         error::{BitcaskError, DatafileError},
         keydir::{KeyDir, KeyDirEntry},
-        options::BitcaskOptions,
+        options::{BitcaskOptions, DatafileMaxSize},
     };
 
     pub fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {
@@ -1067,5 +1068,58 @@ mod tests {
         let datafile_record = datafile_record_for_string_u32(key, value);
         assert!(db.writer.append_record(&datafile_record).is_ok());
         assert_eq!(db.writer.offset, datafile_record.size().unwrap() as u64);
+    }
+
+    #[test]
+    fn reuse_old_writer_on_startup() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let options = BitcaskOptions::default()
+            .datafile_max_size(DatafileMaxSize::HardCappedBytes(2000))
+            .reuse_old_writer_on_startup(true);
+
+        const ENTRY_COUNT: usize = 100;
+        const ENTRY_SIZE: usize = DATAFILE_HEADER_SIZE_BYTES + 4 + 4;
+
+        let entry_total_size = ENTRY_COUNT * ENTRY_SIZE;
+        {
+            let mut db =
+                BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+
+            // 29B Entries
+            for i in 0..ENTRY_COUNT as u32 {
+                db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+            }
+
+            assert_eq!(db.keydir.len(), ENTRY_COUNT);
+
+            assert_eq!(
+                db.writer.id,
+                entry_total_size.div_ceil(options.datafile_max_size.get_size()) as u32
+            );
+
+            assert_eq!(
+                db.readers.len(),
+                entry_total_size.div(options.datafile_max_size.get_size())
+            );
+        }
+
+        {
+            let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+
+            assert_eq!(db.keydir.len(), ENTRY_COUNT);
+
+            // Same writer ID should be used
+            assert_eq!(
+                db.writer.id,
+                entry_total_size.div_ceil(options.datafile_max_size.get_size()) as u32
+            );
+
+            assert_eq!(db.writer.offset, 928);
+
+            assert_eq!(
+                db.readers.len(),
+                entry_total_size.div(options.datafile_max_size.get_size())
+            );
+        }
     }
 }
