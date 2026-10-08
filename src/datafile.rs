@@ -81,6 +81,15 @@ impl Datafile {
         })
     }
 
+    pub fn open_datafile_as_writer(
+        dir: &Path,
+        id: u32,
+        offset: u64,
+        datafile_extension: &str,
+    ) -> Result<Datafile, DatafileError> {
+        Self::open_datafile(dir, id, datafile_extension, offset, true, true)
+    }
+
     pub fn open_reader(
         dir: &Path,
         id: u32,
@@ -914,6 +923,27 @@ mod tests {
                 df.append_record(&datafile_record),
                 Err(DatafileError::WriteAttemptToReaderDatafile)
             ));
+        }
+
+        #[test]
+        fn open_datafile_as_writer_missing_file_err() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let options = BitcaskOptions::default();
+            let path = Datafile::generate_filename(temp_dir.path(), 1, &options.datafile_extension)
+                .unwrap();
+
+            let result = Datafile::open_datafile_as_writer(
+                temp_dir.path(),
+                1,
+                0,
+                &options.datafile_extension,
+            );
+
+            assert!(matches!(
+                result,
+                Err(DatafileError::IO(e)) if e.kind() == std::io::ErrorKind::NotFound
+            ));
+            assert!(!path.exists());
         }
 
         #[test]
