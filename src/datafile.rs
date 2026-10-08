@@ -25,7 +25,7 @@ pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
 pub const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
 
-pub const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 50;
+pub const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 4096;
 
 pub struct Datafile {
     file: File,

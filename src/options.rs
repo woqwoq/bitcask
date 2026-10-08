@@ -2,6 +2,20 @@ pub const DEFAULT_DATAFILE_EXTENSION: &str = "db";
 pub const DEFAULT_LRU_CACHED_READERS_COUNT: usize = 10;
 
 #[derive(Clone, PartialEq)]
+pub enum RecoveryMode {
+    TolerateCorruptedTailRecords, // Last reader failure -> truncate until failure, or fatal
+    AbsoluteConsistency,          // Any failure -> fatal
+    PointInTimeRecovery,          // Any failure -> stoop replay
+    SkipAnyCorruptedRecords,      // Any failure -> skip bad record
+}
+
+impl Default for RecoveryMode {
+    fn default() -> Self {
+        Self::TolerateCorruptedTailRecords
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub enum SyncMode {
     SyncData,
     SyncAll,
@@ -50,6 +64,7 @@ impl Default for DatafileMaxSize {
 #[derive(Clone)]
 pub struct BitcaskOptions {
     pub sync_mode: SyncMode,
+    pub recovery_mode: RecoveryMode,
     pub sync_frequency: SyncFrequency,
     pub datafile_max_size: DatafileMaxSize,
     pub reuse_old_writer_on_startup: bool,
@@ -88,12 +103,17 @@ impl BitcaskOptions {
         self.reader_lru_cache_size = new;
         self
     }
+    pub fn recovery_mode(mut self, new: RecoveryMode) -> Self {
+        self.recovery_mode = new;
+        self
+    }
 }
 
 impl Default for BitcaskOptions {
     fn default() -> Self {
         Self {
             sync_mode: SyncMode::default(),
+            recovery_mode: RecoveryMode::default(),
             sync_frequency: SyncFrequency::default(),
             datafile_max_size: DatafileMaxSize::default(),
             reuse_old_writer_on_startup: false,
