@@ -5,8 +5,6 @@ pub const DEFAULT_LRU_CACHED_READERS_COUNT: usize = 10;
 pub enum RecoveryMode {
     TolerateCorruptedTailRecords, // Last reader failure -> truncate until failure, or fatal
     AbsoluteConsistency,          // Any failure -> fatal
-    PointInTimeRecovery,          // Any failure -> stoop replay
-    SkipAnyCorruptedRecords,      // Any failure -> skip bad record
 }
 
 impl Default for RecoveryMode {

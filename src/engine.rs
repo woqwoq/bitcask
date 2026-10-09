@@ -10,11 +10,12 @@ use lru::LruCache;
 use crate::{
     datafile::{
         DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
-        Datafile, DatafileRecord,
+        Datafile,
     },
     error::{BitcaskError, DatafileError},
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
+    record::DatafileRecord,
 };
 
 pub struct BitcaskInstance {
@@ -54,37 +55,32 @@ impl BitcaskRecoveryHandler {
         error: DatafileError,
         is_last: bool,
     ) -> Result<Datafile, BitcaskError> {
-        // Recover only the last datafile
         match self.recovery_mode {
+            // Recover only the last datafile
             RecoveryMode::TolerateCorruptedTailRecords => {
-                if is_last {
-                    df = self.reopen_reader_for_recovery(df)?;
-                    match error {
-                        DatafileError::TornWrite => df.truncate(df.offset)?,
-                        DatafileError::UndersizedDatafileHeader(_) => df.truncate(df.offset)?,
-                        DatafileError::IO(e) => {
-                            if e.kind() == ErrorKind::UnexpectedEof {
-                                df.truncate(df.offset)?
-                            } else {
-                                return Err(BitcaskError::FatalReplayFailure(DatafileError::IO(e)));
-                            }
-                        }
-                        DatafileError::CrcMismatch => df.truncate(df.offset)?,
-                        e => return Err(BitcaskError::FatalReplayFailure(e)),
-                    }
-                } else {
+                if !is_last {
                     // Failure in non-last datafiles is fatal
                     return Err(BitcaskError::FatalReplayFailure(error));
                 }
-                return Ok(df);
-            }
-            RecoveryMode::AbsoluteConsistency => {
-                return Err(BitcaskError::FatalReplayFailure(error));
-            }
-            _ => {}
-        }
 
-        todo!()
+                df = self.reopen_reader_for_recovery(df)?;
+                match error {
+                    DatafileError::TornWrite => df.truncate(df.offset)?,
+                    DatafileError::UndersizedDatafileHeader(_) => df.truncate(df.offset)?,
+                    DatafileError::IO(e) => {
+                        if e.kind() == ErrorKind::UnexpectedEof {
+                            df.truncate(df.offset)?
+                        } else {
+                            return Err(BitcaskError::FatalReplayFailure(DatafileError::IO(e)));
+                        }
+                    }
+                    DatafileError::CrcMismatch => df.truncate(df.offset)?,
+                    e => return Err(BitcaskError::FatalReplayFailure(e)),
+                }
+                Ok(df)
+            }
+            RecoveryMode::AbsoluteConsistency => Err(BitcaskError::FatalReplayFailure(error)),
+        }
     }
 }
 
@@ -374,11 +370,12 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile, DatafileRecord, DatafileRecordHeader},
+        datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile},
         engine::{BitcaskInstance, BitcaskRecoveryHandler, BitcaskStartupHandler},
         error::{BitcaskError, DatafileError},
         keydir::{KeyDir, KeyDirEntry},
         options::{BitcaskOptions, DatafileMaxSize},
+        record::DatafileRecord,
     };
 
     pub fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {
@@ -792,6 +789,8 @@ mod tests {
     }
 
     mod replay_and_init_readers {
+        use crate::record::DatafileRecordHeader;
+
         use super::*;
 
         #[test]

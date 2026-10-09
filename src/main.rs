@@ -7,6 +7,7 @@ mod engine;
 mod error;
 mod keydir;
 mod options;
+mod record;
 
 fn main() {
     match BitcaskInstance::open(PathBuf::from("db"), BitcaskOptions::default()) {

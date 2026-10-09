@@ -1,7 +1,5 @@
 use std::{collections::HashMap, fmt::Display};
 
-use crate::datafile::DatafileRecord;
-
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
 #[derive(Debug, PartialEq, Clone)]
 pub struct KeyDirEntry {
@@ -97,8 +95,9 @@ impl Display for KeyDir {
 #[cfg(test)]
 mod tests {
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
+        datafile::DATAFILE_HEADER_SIZE_BYTES,
         keydir::{KeyDir, KeyDirEntry},
+        record::DatafileRecord,
     };
 
     #[test]
