@@ -18,7 +18,7 @@ use crate::{
 };
 
 pub struct BitcaskInstance {
-    dir_path: PathBuf,                    // For opening files through LRU
+    dir: PathBuf,                         // For opening files through LRU
     pub(crate) keydir: KeyDir,            // In-memory keydir map
     pub writer: Datafile,                 // Writer file handle
     pub readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
@@ -139,7 +139,6 @@ impl BitcaskStartupHandler {
         Ok(ids)
     }
 
-    // TODO: Return last reader insted
     pub fn replay_and_init_readers(
         &self,
         recovery_handler: &BitcaskRecoveryHandler,
@@ -156,7 +155,6 @@ impl BitcaskStartupHandler {
                 df = recovery_handler.recover_post_failure(df, e, is_last)?;
             }
 
-            // TODO: Reuse old writer option
             if is_last {
                 return Ok(Some(df));
             }
@@ -170,18 +168,26 @@ impl BitcaskStartupHandler {
     pub fn create_writer_with_options(
         &self,
         latest_datafile: Option<Datafile>,
+        readers: &mut LruCache<u32, Datafile>,
     ) -> Result<Datafile, BitcaskError> {
-        if self.reuse_old_writer_on_startup
-            && let Some(df) = latest_datafile
-        {
-            return Ok(self.reopen_datafile_as_writer(df)?);
-        }
+        if let Some(df) = latest_datafile {
+            if self.reuse_old_writer_on_startup {
+                return Ok(self.reopen_datafile_as_writer(df)?);
+            }
 
-        let highest_datafile_id = latest_datafile.map_or(0, |df| df.id);
+            let id = df.id;
+            readers.put(id, df);
+
+            return Ok(Datafile::new_writer(
+                &self.dir,
+                id + 1,
+                &self.datafile_extension,
+            )?);
+        }
 
         Ok(Datafile::new_writer(
             &self.dir,
-            highest_datafile_id + 1,
+            1,
             &self.datafile_extension,
         )?)
     }
@@ -202,10 +208,11 @@ impl BitcaskInstance {
             &mut readers,
         )?;
 
+        let writer = startup_handler.create_writer_with_options(latest_datafile, &mut readers)?;
         Ok(BitcaskInstance {
             keydir,
-            writer: startup_handler.create_writer_with_options(latest_datafile)?,
-            dir_path: dir,
+            writer,
+            dir,
             readers,
             write_count: 0,
             options,
@@ -223,7 +230,7 @@ impl BitcaskInstance {
             } else if let Some(reader) = self.readers.get(&keydir_entry.file_id) {
                 reader
             } else if let Ok(reader) = Datafile::open_reader(
-                &self.dir_path,
+                &self.dir,
                 keydir_entry.file_id,
                 &self.options.datafile_extension,
             ) {
@@ -339,7 +346,7 @@ impl BitcaskInstance {
         old_writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
 
         let new_writer = Datafile::new_writer(
-            &self.dir_path,
+            &self.dir,
             old_writer.id + 1,
             &self.options.datafile_extension,
         )?;
@@ -509,7 +516,7 @@ mod tests {
                 assert_eq!(db.writer.id, fratio.ceil() as u32 + 1); // New writer should be created
                 assert_eq!(db.writer.offset, 0);
 
-                assert_eq!(db.readers.len(), fratio.ceil() as usize - 1);
+                assert_eq!(db.readers.len(), fratio.ceil() as usize);
                 assert_eq!(db.keydir.len(), RECORD_COUNT);
 
                 // 28B per entry - 2 readers and 1 writer to fit 1000 entries with 10K Datafile max length
@@ -681,7 +688,7 @@ mod tests {
 
             // Prepare reader datafile with the requested entry
             let mut missed_reader =
-                Datafile::new_writer(&db.dir_path, 3, &db.options.datafile_extension).unwrap();
+                Datafile::new_writer(&db.dir, 3, &db.options.datafile_extension).unwrap();
             assert!(missed_reader.append_record(&record).is_ok());
             missed_reader.is_writer = false;
 
@@ -1077,10 +1084,11 @@ mod tests {
             .datafile_max_size(DatafileMaxSize::HardCappedBytes(2000))
             .reuse_old_writer_on_startup(true);
 
-        const ENTRY_COUNT: usize = 100;
+        const ENTRY_COUNT: usize = 500;
         const ENTRY_SIZE: usize = DATAFILE_HEADER_SIZE_BYTES + 4 + 4;
 
         let entry_total_size = ENTRY_COUNT * ENTRY_SIZE;
+
         {
             let mut db =
                 BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
@@ -1104,7 +1112,8 @@ mod tests {
         }
 
         {
-            let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+            let mut db =
+                BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
 
             assert_eq!(db.keydir.len(), ENTRY_COUNT);
 
@@ -1114,11 +1123,35 @@ mod tests {
                 entry_total_size.div_ceil(options.datafile_max_size.get_size()) as u32
             );
 
-            assert_eq!(db.writer.offset, 928);
+            assert_eq!(
+                db.writer.offset
+                    + db.readers
+                        .iter()
+                        .map(|(_, reader)| reader.offset)
+                        .sum::<u64>(),
+                entry_total_size as u64
+            );
 
             assert_eq!(
                 db.readers.len(),
                 entry_total_size.div(options.datafile_max_size.get_size())
+            );
+
+            assert!(
+                db.put(
+                    &(ENTRY_COUNT as u32 + 1u32).to_be_bytes(),
+                    &(ENTRY_COUNT as u32 + 1u32).to_be_bytes(),
+                )
+                .is_ok()
+            );
+
+            assert_eq!(
+                db.writer.offset
+                    + db.readers
+                        .iter()
+                        .map(|(_, reader)| reader.offset)
+                        .sum::<u64>(),
+                (entry_total_size + ENTRY_SIZE) as u64
             );
         }
     }

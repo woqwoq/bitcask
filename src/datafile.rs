@@ -70,6 +70,7 @@ impl Datafile {
         let file = OpenOptions::new()
             .read(true)
             .write(writeable)
+            .append(is_writer)
             .create(false)
             .open(filename)?;
 
