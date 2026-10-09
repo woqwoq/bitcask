@@ -1,6 +1,6 @@
 use std::{array::TryFromSliceError, fmt, io::Error, num::ParseIntError, time::SystemTimeError};
 
-use crate::datafile::DATAFILE_HEADER_SIZE_BYTES;
+use crate::record::DATAFILE_HEADER_SIZE_BYTES;
 
 #[derive(Debug)]
 pub enum BitcaskError {

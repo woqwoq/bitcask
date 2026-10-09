@@ -10,18 +10,11 @@ use crate::{
     error::DatafileError,
     keydir::KeyDir,
     options::{DatafileMaxSize, SyncMode},
-    record::{DatafileRecord, DatafileRecordHeader},
+    record::{
+        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
+        DatafileRecord, DatafileRecordHeader,
+    },
 };
-
-pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
-pub const DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES: usize = 1;
-pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
-pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
-pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
-pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
-
-pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
-pub const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
 
 pub const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 4096;
 

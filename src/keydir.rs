@@ -95,9 +95,8 @@ impl Display for KeyDir {
 #[cfg(test)]
 mod tests {
     use crate::{
-        datafile::DATAFILE_HEADER_SIZE_BYTES,
         keydir::{KeyDir, KeyDirEntry},
-        record::DatafileRecord,
+        record::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
     };
 
     #[test]

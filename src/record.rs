@@ -5,15 +5,17 @@ use std::{
 
 use crc32fast::Hasher;
 
-use crate::{
-    datafile::{
-        DATAFILE_HEADER_CRC_SIZE_BYTES, DATAFILE_HEADER_KSZ_SIZE_BYTES,
-        DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES, DATAFILE_HEADER_SIZE_BYTES,
-        DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES, DATAFILE_HEADER_VSZ_SIZE_BYTES,
-        DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
-    },
-    error::DatafileError,
-};
+use crate::error::DatafileError;
+
+pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
+pub const DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES: usize = 1;
+pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
+pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
+pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
+pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
+
+pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
+pub const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct DatafileRecordHeader {
@@ -242,9 +244,8 @@ mod tests {
     use crc32fast::Hasher;
 
     use crate::{
-        datafile::DATAFILE_RECORD_TYPE_NORMAL,
         error::DatafileError,
-        record::{DatafileRecord, DatafileRecordHeader},
+        record::{DATAFILE_RECORD_TYPE_NORMAL, DatafileRecord, DatafileRecordHeader},
     };
 
     pub fn with_timestamp(
@@ -441,7 +442,7 @@ mod tests {
     mod record {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        use crate::datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile};
+        use crate::{datafile::Datafile, record::DATAFILE_HEADER_SIZE_BYTES};
 
         use super::*;
 

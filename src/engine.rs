@@ -8,14 +8,14 @@ use std::{
 use lru::LruCache;
 
 use crate::{
-    datafile::{
-        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
-        Datafile,
-    },
+    datafile::Datafile,
     error::{BitcaskError, DatafileError},
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
-    record::DatafileRecord,
+    record::{
+        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
+        DatafileRecord,
+    },
 };
 
 pub struct BitcaskInstance {
@@ -370,12 +370,12 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        datafile::{DATAFILE_HEADER_SIZE_BYTES, Datafile},
+        datafile::Datafile,
         engine::{BitcaskInstance, BitcaskRecoveryHandler, BitcaskStartupHandler},
         error::{BitcaskError, DatafileError},
         keydir::{KeyDir, KeyDirEntry},
         options::{BitcaskOptions, DatafileMaxSize},
-        record::DatafileRecord,
+        record::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
     };
 
     pub fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {

@@ -1,5 +1,6 @@
 pub const DEFAULT_DATAFILE_EXTENSION: &str = "db";
 pub const DEFAULT_LRU_CACHED_READERS_COUNT: usize = 10;
+pub const DEFAULT_DATAFILE_SIZE_BYTES: usize = 10000;
 
 #[derive(Clone, PartialEq)]
 pub enum RecoveryMode {
@@ -55,7 +56,7 @@ impl DatafileMaxSize {
 
 impl Default for DatafileMaxSize {
     fn default() -> Self {
-        Self::SoftCappedBytes(10000)
+        Self::SoftCappedBytes(DEFAULT_DATAFILE_SIZE_BYTES)
     }
 }
 
