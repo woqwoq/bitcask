@@ -396,7 +396,11 @@ impl BitcaskInstance {
                         return Err(BitcaskError::DatafileError(DatafileError::CrcMismatch));
                     }
 
-                    self.write_record(DatafileRecord::new(&df_entry.key, &value)?)?; // We want to
+                    self.write_record(DatafileRecord::with_timestamp(
+                        &df_entry.key,
+                        &value,
+                        df_entry.header.timestamp,
+                    )?)?; // We want to
                     // keep original time stamp
                 }
                 // Otherwise we ignore the value as it is either dead or the tombstone itself

@@ -147,6 +147,19 @@ impl DatafileRecord {
         })
     }
 
+    pub fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+        Ok(Self {
+            header: DatafileRecordHeader::with_timestamp(
+                key,
+                value,
+                DATAFILE_RECORD_TYPE_NORMAL,
+                timestamp,
+            )?,
+            key: Box::from(key),
+            value: Box::from(value),
+        })
+    }
+
     pub fn new_tombstone(key: &[u8]) -> Result<Self, DatafileError> {
         Ok(Self {
             header: DatafileRecordHeader::new(key, &[], DATAFILE_RECORD_TYPE_TOMBSTONE)?,
