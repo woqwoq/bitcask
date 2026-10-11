@@ -264,6 +264,10 @@ impl Datafile {
     ) -> Result<PathBuf, DatafileError> {
         Ok(dir.join(format!("{:08}.{}", file_id, datafile_extension)))
     }
+
+    fn file_size(&self) -> Result<u64, DatafileError> {
+        Ok(self.file.metadata()?.len())
+    }
 }
 
 impl Display for Datafile {
@@ -279,6 +283,66 @@ impl Display for Datafile {
             "| {:<6} | {:<10} | {:<10} |",
             self.id, self.offset, self.is_writer
         )
+    }
+}
+
+pub struct DatafileRecordIterator<'a> {
+    datafile: &'a Datafile,
+    fsz: u64,
+    offset: u64,
+}
+
+pub struct DatafileRecordIteratorEntry {
+    pub header: DatafileRecordHeader,
+    pub key: Box<[u8]>,
+    pub value_offset: u64,
+}
+
+impl DatafileRecordIteratorEntry {
+    pub fn new(header: DatafileRecordHeader, key: Box<[u8]>, value_offset: u64) -> Self {
+        Self {
+            header,
+            key,
+            value_offset,
+        }
+    }
+}
+
+impl<'a> DatafileRecordIterator<'a> {
+    pub fn new(datafile: &'a Datafile) -> Result<Self, DatafileError> {
+        let fsz = datafile.file_size()?;
+        Ok(Self {
+            datafile,
+            fsz,
+            offset: 0,
+        })
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<DatafileRecordIteratorEntry>, DatafileError> {
+        if self.offset >= self.fsz {
+            return Ok(None);
+        }
+
+        let header = DatafileRecordHeader::decode(
+            &self
+                .datafile
+                .read_bytes(self.offset, DATAFILE_HEADER_SIZE_BYTES)?,
+        )?;
+
+        let key = self.datafile.read_bytes(
+            self.offset + DATAFILE_HEADER_SIZE_BYTES as u64,
+            header.key_size as usize,
+        )?;
+
+        let value_offset = self.offset + DATAFILE_HEADER_SIZE_BYTES as u64 + header.key_size as u64;
+
+        self.offset += header.size()? as u64;
+
+        Ok(Some(DatafileRecordIteratorEntry::new(
+            header,
+            key,
+            value_offset,
+        )))
     }
 }
 

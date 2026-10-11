@@ -8,7 +8,7 @@ use std::{
 use lru::LruCache;
 
 use crate::{
-    datafile::Datafile,
+    datafile::{Datafile, DatafileRecordIterator, DatafileRecordIteratorEntry},
     error::{BitcaskError, DatafileError},
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
@@ -106,24 +106,27 @@ impl BitcaskStartupHandler {
         Datafile::open_datafile_as_writer(&self.dir, id, offset, &self.datafile_extension)
     }
 
-    pub fn parse_db_datafile_ids_at_path(&self) -> Result<Vec<u32>, BitcaskError> {
-        if !self.dir.exists() {
-            std::fs::create_dir_all(&self.dir)?;
+    pub fn parse_db_datafile_ids_at_path(
+        dir: &Path,
+        datafile_extension: &str,
+    ) -> Result<Vec<u32>, BitcaskError> {
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
         }
 
-        if !self.dir.is_dir() {
+        if !dir.is_dir() {
             return Err(BitcaskError::PathIsFile);
         }
 
         let mut ids: Vec<u32> = Vec::new();
-        for file in read_dir(&self.dir)? {
+        for file in read_dir(&dir)? {
             let filename = file?
                 .file_name()
                 .into_string()
                 .map_err(|_| BitcaskError::FilenameConversion)?;
 
             if let Some((name, ext)) = filename.rsplit_once('.') {
-                if ext == self.datafile_extension {
+                if ext == datafile_extension {
                     ids.push(name.parse::<u32>()?);
                 }
             } else {
@@ -141,7 +144,7 @@ impl BitcaskStartupHandler {
         keydir: &mut KeyDir,
         readers: &mut LruCache<u32, Datafile>,
     ) -> Result<Option<Datafile>, BitcaskError> {
-        let ids = self.parse_db_datafile_ids_at_path()?;
+        let ids = Self::parse_db_datafile_ids_at_path(&self.dir, &self.datafile_extension)?;
 
         let last = ids.last().cloned();
         for id in ids {
@@ -350,6 +353,53 @@ impl BitcaskInstance {
         let old_writer = std::mem::replace(old_writer, new_writer);
 
         self.readers.put(old_writer.id, old_writer);
+
+        Ok(())
+    }
+
+    pub fn merge(&mut self) -> Result<(), BitcaskError> {
+        self.switch_writer_datafile()?; // Lock the latest writer
+
+        let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
+            &self.dir,
+            &self.options.datafile_extension,
+        )?
+        .into_iter()
+        .filter(|&id| id < self.writer.id)
+        .collect();
+
+        for id in candidate_ids {
+            let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
+            let mut iter = DatafileRecordIterator::new(&df)?;
+
+            while let Some(df_entry) = iter.next_record()? {
+                if df_entry.header.record_type == DATAFILE_RECORD_TYPE_NORMAL
+                    && let Some(keydir_entry) = self.keydir.get(&df_entry.key)
+                    && keydir_entry.file_id == id
+                    && keydir_entry.value_offset == df_entry.value_offset
+                {
+                    // Positive outcome - extract value
+                    let mut hasher = df_entry.header.crc();
+                    hasher.update(&df_entry.key);
+
+                    // No need to stream the value in chunks as we need it allocated to perform the
+                    // new write anyway
+                    let value =
+                        df.read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)?;
+                    hasher.update(&value);
+
+                    if hasher.finalize() != df_entry.header.crc {
+                        return Err(BitcaskError::DatafileError(DatafileError::CrcMismatch));
+                    }
+
+                    self.write_record(DatafileRecord::new(&df_entry.key, &value)?)?; // We want to
+                    // keep original time stamp
+                }
+                // Otherwise we ignore the value as it is either dead or the tombstone itself
+            }
+        }
+
+        todo!("Remove old datafiles");
 
         Ok(())
     }
