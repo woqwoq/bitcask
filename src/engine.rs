@@ -1,5 +1,5 @@
 use std::{
-    fs::read_dir,
+    fs::{self, read_dir},
     io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -222,6 +222,10 @@ impl BitcaskInstance {
         self.write_record(DatafileRecord::new(key, value)?)
     }
 
+    pub fn len(&self) -> usize {
+        self.keydir.len()
+    }
+
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
         if let Some(keydir_entry) = self.keydir.get(key) {
             let reader = if self.writer.id == keydir_entry.file_id {
@@ -368,7 +372,7 @@ impl BitcaskInstance {
         .filter(|&id| id < self.writer.id)
         .collect();
 
-        for id in candidate_ids {
+        for id in candidate_ids.clone() {
             let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
             let mut iter = DatafileRecordIterator::new(&df)?;
 
@@ -399,7 +403,21 @@ impl BitcaskInstance {
             }
         }
 
-        todo!("Remove old datafiles");
+        self.remove_old_readers_post_merge(candidate_ids)?;
+
+        Ok(())
+    }
+
+    fn remove_old_readers_post_merge(&mut self, ids: Vec<u32>) -> Result<(), BitcaskError> {
+        for id in ids {
+            self.readers.pop(&id); // Evict the file from LRU
+            fs::remove_file(Datafile::generate_filename(
+                // Remove the file from file system
+                &self.dir,
+                id,
+                &self.options.datafile_extension,
+            )?)?;
+        }
 
         Ok(())
     }
@@ -1202,6 +1220,65 @@ mod tests {
                         .sum::<u64>(),
                 (entry_total_size + ENTRY_SIZE) as u64
             );
+        }
+    }
+    mod merge {
+        use std::fs;
+
+        use super::*;
+
+        #[test]
+        fn merge() {
+            let (temp_dir, options, mut db) = init_test();
+
+            const ENTRY_COUNT: usize = 500;
+            const ENTRY_SIZE: usize = 29;
+
+            for i in 0..ENTRY_COUNT as u32 {
+                db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+            }
+
+            let datafiles_to_house_payload: usize =
+                (ENTRY_COUNT * ENTRY_SIZE).div_ceil(options.datafile_max_size.get_size());
+            let datafiles_to_house_dead_payload: usize =
+                (2 * ENTRY_COUNT * ENTRY_SIZE).div_ceil(options.datafile_max_size.get_size());
+
+            assert_eq!(db.writer.id, datafiles_to_house_payload as u32);
+            assert_eq!(db.len(), ENTRY_COUNT);
+
+            for i in 0..ENTRY_COUNT as u32 {
+                db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+            }
+            assert_eq!(db.writer.id, datafiles_to_house_dead_payload as u32);
+            assert_eq!(db.len(), ENTRY_COUNT);
+
+            assert!(db.merge().is_ok());
+
+            assert_eq!(
+                db.writer.id,
+                datafiles_to_house_dead_payload as u32 // All sealed during merge
+                    + datafiles_to_house_payload as u32 // New files to house the data
+            );
+            assert_eq!(db.len(), ENTRY_COUNT); // All KV pairs should be still present
+            assert_eq!(db.readers.len(), datafiles_to_house_payload - 1); // LRU Should have only 1
+            // 1 reader post-merge as the rest were evicted
+
+            // Old datafiles should be gone from the filesystem
+            for id in 0..datafiles_to_house_dead_payload as u32 {
+                assert!(
+                    !Datafile::generate_filename(temp_dir.path(), id, &options.datafile_extension)
+                        .unwrap()
+                        .exists()
+                );
+            }
+
+            // Old KV pairs should be still valid
+            for i in 0..ENTRY_COUNT as u32 {
+                assert_eq!(
+                    db.get(&i.to_be_bytes()).unwrap(),
+                    Some(Box::from(i.to_be_bytes()))
+                );
+            }
         }
     }
 }
