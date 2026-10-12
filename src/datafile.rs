@@ -31,7 +31,7 @@ impl Datafile {
         id: u32,
         datafile_extension: &str,
     ) -> Result<Datafile, DatafileError> {
-        let filename = Self::generate_filename(dir, id, datafile_extension)?;
+        let filename = Self::generate_filename(dir, id, datafile_extension);
 
         let file = OpenOptions::new()
             .read(true)
@@ -56,7 +56,7 @@ impl Datafile {
         writeable: bool,
         is_writer: bool,
     ) -> Result<Datafile, DatafileError> {
-        let filename = Self::generate_filename(dir, id, datafile_extension)?;
+        let filename = Self::generate_filename(dir, id, datafile_extension);
 
         let file = OpenOptions::new()
             .read(true)
@@ -257,12 +257,8 @@ impl Datafile {
         self.is_writer = false;
     }
 
-    pub fn generate_filename(
-        dir: &Path,
-        file_id: u32,
-        datafile_extension: &str,
-    ) -> Result<PathBuf, DatafileError> {
-        Ok(dir.join(format!("{:08}.{}", file_id, datafile_extension)))
+    pub fn generate_filename(dir: &Path, file_id: u32, datafile_extension: &str) -> PathBuf {
+        dir.join(format!("{:08}.{}", file_id, datafile_extension))
     }
 
     fn file_size(&self) -> Result<u64, DatafileError> {
@@ -427,8 +423,7 @@ mod tests {
         fn open_datafile_as_writer_missing_file_err() {
             let temp_dir = tempfile::tempdir().unwrap();
             let options = BitcaskOptions::default();
-            let path = Datafile::generate_filename(temp_dir.path(), 1, &options.datafile_extension)
-                .unwrap();
+            let path = Datafile::generate_filename(temp_dir.path(), 1, &options.datafile_extension);
 
             let result = Datafile::open_datafile_as_writer(
                 temp_dir.path(),

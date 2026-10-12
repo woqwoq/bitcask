@@ -155,3 +155,21 @@ impl fmt::Display for DatafileError {
         }
     }
 }
+
+#[derive(Debug)]
+pub enum HintfileError {
+    IO(Error),
+    SliceConversion(TryFromSliceError),
+}
+
+impl From<Error> for HintfileError {
+    fn from(value: Error) -> Self {
+        Self::IO(value)
+    }
+}
+
+impl From<TryFromSliceError> for HintfileError {
+    fn from(value: TryFromSliceError) -> Self {
+        Self::SliceConversion(value)
+    }
+}

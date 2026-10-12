@@ -5,6 +5,7 @@ use crate::{engine::BitcaskInstance, options::BitcaskOptions};
 mod datafile;
 mod engine;
 mod error;
+mod hint;
 mod keydir;
 mod options;
 mod record;

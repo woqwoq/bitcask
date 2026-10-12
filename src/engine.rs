@@ -420,7 +420,7 @@ impl BitcaskInstance {
                 &self.dir,
                 id,
                 &self.options.datafile_extension,
-            )?)?;
+            ))?;
         }
 
         Ok(())
@@ -490,7 +490,7 @@ mod tests {
 
     fn datafile_path(dir: &Path, id: u32) -> PathBuf {
         let options = BitcaskOptions::default();
-        Datafile::generate_filename(dir, id, &options.datafile_extension).unwrap()
+        Datafile::generate_filename(dir, id, &options.datafile_extension)
     }
 
     fn append_bytes(dir: &Path, id: u32, bytes: &[u8]) {
@@ -1227,8 +1227,6 @@ mod tests {
         }
     }
     mod merge {
-        use std::fs;
-
         use super::*;
 
         #[test]
@@ -1271,7 +1269,6 @@ mod tests {
             for id in 0..datafiles_to_house_dead_payload as u32 {
                 assert!(
                     !Datafile::generate_filename(temp_dir.path(), id, &options.datafile_extension)
-                        .unwrap()
                         .exists()
                 );
             }
