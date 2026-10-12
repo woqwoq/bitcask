@@ -1,6 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
+    os::unix::fs::FileExt,
     path::Path,
 };
 
@@ -88,6 +89,14 @@ impl HintfileRecordHeader {
 
         hasher
     }
+
+    pub fn size(&self) -> Result<usize, HintfileError> {
+        let size = u64::from(self.key_size)
+            .checked_add(HINTFILE_RECORD_HEADER_SIZE_BYTES as u64)
+            .ok_or(HintfileError::OversizedHintfileRecord)?;
+
+        usize::try_from(size).map_err(|_| HintfileError::OversizedHintfileRecord)
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -124,12 +133,19 @@ impl Hintfile {
 
         Ok(Self { file, id })
     }
+    pub fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
+        let mut buf = vec![0u8; count];
+
+        self.file.read_exact_at(&mut buf, offset)?;
+
+        Ok(Box::from(buf))
+    }
 
     pub fn append_hint_record(&mut self, hint: &HintfileRecord) -> Result<(), HintfileError> {
         Self::write_hint_record_to(&mut self.file, hint)
     }
 
-    pub fn write_hint_record_to<W: Write>(
+    fn write_hint_record_to<W: Write>(
         writer: &mut W,
         record: &HintfileRecord,
     ) -> Result<(), HintfileError> {
@@ -137,5 +153,47 @@ impl Hintfile {
         writer.write_all(&record.key)?;
 
         Ok(())
+    }
+
+    pub fn file_size(&self) -> Result<u64, HintfileError> {
+        Ok(self.file.metadata()?.len())
+    }
+}
+
+pub struct HintfileIterator<'a> {
+    hintfile: &'a Hintfile,
+    fsz: u64,
+    offset: u64,
+}
+
+impl<'a> HintfileIterator<'a> {
+    pub fn new(hintfile: &'a Hintfile) -> Result<Self, HintfileError> {
+        let fsz = hintfile.file_size()?;
+        Ok(Self {
+            hintfile,
+            fsz,
+            offset: 0,
+        })
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<HintfileRecord>, HintfileError> {
+        if self.offset >= self.fsz {
+            return Ok(None);
+        }
+
+        let header = HintfileRecordHeader::decode(
+            &self
+                .hintfile
+                .read_bytes(self.offset, HINTFILE_RECORD_HEADER_SIZE_BYTES)?,
+        )?;
+
+        let key = self.hintfile.read_bytes(
+            self.offset + HINTFILE_RECORD_HEADER_SIZE_BYTES as u64,
+            header.key_size as usize,
+        )?;
+
+        self.offset += header.size()? as u64;
+
+        Ok(Some(HintfileRecord { header, key }))
     }
 }

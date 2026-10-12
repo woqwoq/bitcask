@@ -160,6 +160,7 @@ impl fmt::Display for DatafileError {
 pub enum HintfileError {
     IO(Error),
     SliceConversion(TryFromSliceError),
+    OversizedHintfileRecord,
 }
 
 impl From<Error> for HintfileError {
