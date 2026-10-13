@@ -194,6 +194,10 @@ impl Hintfile {
     pub fn file_size(&self) -> Result<u64, HintfileError> {
         Ok(self.file.metadata()?.len())
     }
+
+    pub fn sync(&mut self) -> Result<(), HintfileError> {
+        self.file.sync_data().map_err(HintfileError::IO)
+    }
 }
 
 pub struct HintfileIterator<'a> {

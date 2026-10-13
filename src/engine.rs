@@ -375,11 +375,14 @@ impl BitcaskInstance {
         .filter(|&id| id < self.writer.id)
         .collect();
 
+        let mut hf = Hintfile::new_or_open_existing(
+            &self.dir,
+            self.writer.id,
+            &self.options.hintfile_extension,
+        )?;
         for id in candidate_ids.clone() {
             let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
             let mut iter = DatafileRecordIterator::new(&df)?;
-            let mut hf =
-                Hintfile::new_or_open_existing(&self.dir, id, &self.options.hintfile_extension)?;
 
             while let Some(df_entry) = iter.next_record()? {
                 if df_entry.header.record_type == DATAFILE_RECORD_TYPE_NORMAL
@@ -411,6 +414,7 @@ impl BitcaskInstance {
                     // TODO: Remove the clone, think of a way to write the entry
                     // TODO: Adjust the offest to point to the value instead of the start
                     let record_start_offset = self.write_datafile_record(record.clone())?; // We want to keep original timestamp
+                    // TODO: Add lifetime to HintfileRecord
                     self.write_hintfile_record(&mut hf, record, record_start_offset)?;
                 }
                 // Otherwise we ignore the value as it is either dead or the tombstone itself
@@ -435,7 +439,10 @@ impl BitcaskInstance {
                 self.writer.id,
                 &self.options.hintfile_extension,
             )?;
-            drop(std::mem::replace(hf, new)); // Seal old hintfile
+
+            let mut old = std::mem::replace(hf, new);
+            old.sync()?; // Sync before releasing the handle
+            drop(old); // Seal old hintfile
         }
 
         let value_offset =
@@ -458,12 +465,15 @@ impl BitcaskInstance {
             ))?;
 
             // Remove the reader's hintfile from filesystem
-            fs::remove_file(Datafile::generate_filename(
+            let hf = Datafile::generate_filename(
                 // Remove the file from file system
                 &self.dir,
                 id,
                 &self.options.hintfile_extension,
-            ))?;
+            );
+            if hf.exists() {
+                fs::remove_file(hf)?;
+            }
         }
 
         Ok(())
@@ -488,6 +498,7 @@ mod tests {
         datafile::Datafile,
         engine::{BitcaskInstance, BitcaskRecoveryHandler, BitcaskStartupHandler},
         error::{BitcaskError, DatafileError},
+        hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile, HintfileRecord},
         keydir::{KeyDir, KeyDirEntry},
         options::{BitcaskOptions, DatafileMaxSize},
         record::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
@@ -1272,7 +1283,28 @@ mod tests {
 
     #[test]
     fn write_hintfile_record() {
-        todo!();
+        let (temp_dir, options, mut db) = init_test();
+
+        let mut hf = Hintfile::new_or_open_existing(
+            temp_dir.path(),
+            db.writer.id,
+            &options.hintfile_extension,
+        )
+        .unwrap();
+
+        const HINT_ENTRY_SIZE: usize = HINTFILE_RECORD_HEADER_SIZE_BYTES + 1;
+
+        assert_eq!(hf.id, 1);
+        let record = DatafileRecord::new(b"1", b"1").unwrap();
+        assert!(db.write_hintfile_record(&mut hf, record, 0).is_ok());
+        assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
+
+        db.switch_writer_datafile().unwrap();
+        assert_eq!(hf.id, 1);
+        let record = DatafileRecord::new(b"2", b"2").unwrap();
+        assert!(db.write_hintfile_record(&mut hf, record, 0).is_ok());
+        assert_eq!(hf.id, 2);
+        assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
     }
 
     mod merge {
