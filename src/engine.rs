@@ -10,6 +10,7 @@ use lru::LruCache;
 use crate::{
     datafile::{Datafile, DatafileRecordIterator},
     error::{BitcaskError, DatafileError},
+    hint::Hintfile,
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
     record::{
@@ -377,6 +378,7 @@ impl BitcaskInstance {
         for id in candidate_ids.clone() {
             let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
             let mut iter = DatafileRecordIterator::new(&df)?;
+            let mut hf = Hintfile::new_or_open_existing(&self.dir, id, "hint")?;
 
             while let Some(df_entry) = iter.next_record()? {
                 if df_entry.header.record_type == DATAFILE_RECORD_TYPE_NORMAL
@@ -408,7 +410,7 @@ impl BitcaskInstance {
                     // TODO: Remove the clone, think of a way to write the entry
                     // TODO: Adjust the offest to point to the value instead of the start
                     let record_start_offset = self.write_datafile_record(record.clone())?; // We want to keep original timestamp
-                    self.write_hintfile_record(record, record_start_offset)?;
+                    self.write_hintfile_record(&mut hf, record, record_start_offset)?;
                 }
                 // Otherwise we ignore the value as it is either dead or the tombstone itself
             }
@@ -422,11 +424,21 @@ impl BitcaskInstance {
     // TODO: Implement the actual interaction
     fn write_hintfile_record(
         &mut self,
+        hf: &mut Hintfile,
         record: DatafileRecord,
         record_start_offset: u64,
     ) -> Result<(), BitcaskError> {
+        // When a writer switchover has occured
+        if hf.id != self.writer.id {
+            let new = Hintfile::new_or_open_existing(&self.dir, self.writer.id, "hint")?;
+            drop(std::mem::replace(hf, new)); // Seal old hintfile
+        }
+
         let value_offset =
             record_start_offset + DATAFILE_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
+
+        hf.append_hint_record(record, value_offset)?;
+
         Ok(())
     }
 

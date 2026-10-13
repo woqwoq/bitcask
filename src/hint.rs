@@ -7,11 +7,7 @@ use std::{
 
 use crc32fast::Hasher;
 
-use crate::{
-    datafile::Datafile,
-    error::HintfileError,
-    record::{DatafileRecord, DatafileRecordHeader},
-};
+use crate::{datafile::Datafile, error::HintfileError, record::DatafileRecord};
 
 const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
 
@@ -133,7 +129,8 @@ impl HintfileRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self, HintfileError> {
         let header = HintfileRecordHeader::decode(bytes)?;
 
-        let key = &bytes[HINTFILE_RECORD_HEADER_SIZE_BYTES..header.key_size as usize];
+        let key = &bytes[HINTFILE_RECORD_HEADER_SIZE_BYTES
+            ..HINTFILE_RECORD_HEADER_SIZE_BYTES + header.key_size as usize];
 
         Ok(Self {
             header,
@@ -148,13 +145,17 @@ pub struct Hintfile {
 }
 
 impl Hintfile {
-    pub fn new(dir: &Path, id: u32, datafile_extension: &str) -> Result<Self, HintfileError> {
-        let filename = Datafile::generate_filename(dir, id, datafile_extension);
+    pub fn new_or_open_existing(
+        dir: &Path,
+        id: u32,
+        hintfile_extension: &str,
+    ) -> Result<Self, HintfileError> {
+        let filename = Datafile::generate_filename(dir, id, hintfile_extension);
 
         let file = OpenOptions::new()
             .read(true)
             .append(true)
-            .create_new(true)
+            .create(true)
             .open(filename)?;
 
         Ok(Self { file, id })
@@ -351,7 +352,6 @@ mod test {
 
     mod hintfile {
         use crate::{
-            error::HintfileError,
             hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile, HintfileRecord},
             record::DatafileRecord,
         };
@@ -362,44 +362,49 @@ mod test {
             let temp_dir = tempfile::tempdir().unwrap();
 
             {
-                let hintfile = Hintfile::new(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
+                let hintfile =
+                    Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
 
                 assert_eq!(hintfile.id, 1);
                 assert_eq!(hintfile.file_size().unwrap(), 0);
             }
 
-            assert!(matches!(
-                Hintfile::new(temp_dir.path(), 1, HINTFILE_EXTENSION),
-                Err(HintfileError::IO(_))
-            ));
+            assert!(Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).is_ok());
         }
 
         #[test]
         fn append_read() {
             let temp_dir = tempfile::tempdir().unwrap();
 
-            let mut hintfile = Hintfile::new(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
+            let mut hintfile =
+                Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
 
-            const RECORD_SIZE_BYTES: usize = 29;
+            const RECORD_SIZE_BYTES: usize = HINTFILE_RECORD_HEADER_SIZE_BYTES + 4;
 
             let mut offset = 0u64;
+
+            let mut records: Vec<DatafileRecord> = Vec::new();
+
             for i in 0..100u32 {
                 let record = DatafileRecord::new(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
-                let rsz = record.size().unwrap();
+                let ksz = record.header.key_size;
+                records.push(record.clone());
 
                 assert!(hintfile.append_hint_record(record, offset).is_ok());
-                offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + rsz as u64;
+                offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + ksz as u64;
             }
 
             let mut offset = 0u64;
-            for i in 0..100u32 {
+            for expected in records {
                 let bytes = hintfile.read_bytes(offset, RECORD_SIZE_BYTES).unwrap();
-                let expected = DatafileRecord::new(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
                 let record = HintfileRecord::decode(&bytes).unwrap();
 
-                offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
+                assert_eq!(
+                    record,
+                    HintfileRecord::from_datafile_record(expected, offset)
+                );
 
-                assert_eq!()
+                offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
             }
         }
     }

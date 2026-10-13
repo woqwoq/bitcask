@@ -5,6 +5,7 @@ use crate::record::DATAFILE_HEADER_SIZE_BYTES;
 #[derive(Debug)]
 pub enum BitcaskError {
     DatafileError(DatafileError),
+    HintfileError(HintfileError),
 
     DatafileMissing(usize),
     InvalidDBPath(Error),
@@ -13,6 +14,12 @@ pub enum BitcaskError {
     PathIsFile,
     RecordLargerThanMaxDatafileSize(usize),
     FatalReplayFailure(DatafileError),
+}
+
+impl From<HintfileError> for BitcaskError {
+    fn from(value: HintfileError) -> Self {
+        Self::HintfileError(value)
+    }
 }
 
 impl From<ParseIntError> for BitcaskError {
@@ -37,6 +44,8 @@ impl fmt::Display for BitcaskError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BitcaskError::DatafileError(e) => write!(f, "datafile error: {e}"),
+            BitcaskError::HintfileError(e) => write!(f, "hintfile error: {e:?}"), // TODO:
+            // Add display for HintfileError
             BitcaskError::DatafileMissing(id) => write!(
                 f,
                 "datafile with id {id} is missing: the file could not be found on disk"
