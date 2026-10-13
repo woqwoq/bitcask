@@ -10,6 +10,7 @@ use crc32fast::Hasher;
 use crate::{
     datafile::{Datafile, DatafileRecordIteratorEntry},
     error::HintfileError,
+    record::DatafileRecord,
 };
 
 const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
@@ -30,24 +31,40 @@ pub struct HintfileRecordHeader {
 }
 
 impl HintfileRecordHeader {
-    pub fn from_datafile_record_iterator_entry(
-        iterator_entry: &DatafileRecordIteratorEntry,
-    ) -> Self {
-        let mut hasher = Hasher::new();
-
-        hasher.update(&iterator_entry.header.timestamp.to_be_bytes());
-        hasher.update(&iterator_entry.header.key_size.to_be_bytes());
-        hasher.update(&iterator_entry.header.value_size.to_be_bytes());
-        hasher.update(&iterator_entry.value_offset.to_be_bytes());
-        hasher.update(&iterator_entry.key);
+    pub fn from_datafile_record(record: &DatafileRecord, value_offset: u64) -> Self {
+        let crc = Self::crc_for(
+            record.header.timestamp,
+            record.header.key_size,
+            record.header.value_size,
+            value_offset,
+            &record.key,
+        );
 
         Self {
-            crc: hasher.finalize(),
-            timestamp: iterator_entry.header.timestamp,
-            key_size: iterator_entry.header.key_size,
-            value_size: iterator_entry.header.value_size,
-            value_offset: iterator_entry.value_offset,
+            crc,
+            timestamp: record.header.timestamp,
+            key_size: record.header.key_size,
+            value_size: record.header.value_size,
+            value_offset,
         }
+    }
+
+    fn crc_for(
+        timestamp: u64,
+        key_size: u32,
+        value_size: u32,
+        value_offset: u64,
+        key: &[u8],
+    ) -> u32 {
+        let mut hasher = Hasher::new();
+
+        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(&key_size.to_be_bytes());
+        hasher.update(&value_size.to_be_bytes());
+        hasher.update(&value_offset.to_be_bytes());
+        hasher.update(key);
+
+        hasher.finalize()
     }
 
     pub fn encode(&self) -> [u8; HINTFILE_RECORD_HEADER_SIZE_BYTES] {
@@ -106,12 +123,10 @@ pub struct HintfileRecord {
 }
 
 impl HintfileRecord {
-    pub fn from_datafile_record_iterator_entry(
-        iterator_entry: DatafileRecordIteratorEntry,
-    ) -> Self {
+    pub fn from_datafile_record(df_record: DatafileRecord, value_offset: u64) -> Self {
         Self {
-            header: HintfileRecordHeader::from_datafile_record_iterator_entry(&iterator_entry),
-            key: iterator_entry.key,
+            header: HintfileRecordHeader::from_datafile_record(&df_record, value_offset),
+            key: df_record.key,
         }
     }
 }
@@ -141,8 +156,17 @@ impl Hintfile {
         Ok(Box::from(buf))
     }
 
-    pub fn append_hint_record(&mut self, hint: &HintfileRecord) -> Result<(), HintfileError> {
-        Self::write_hint_record_to(&mut self.file, hint)
+    pub fn append_hint_record(
+        &mut self,
+        df_record: DatafileRecord,
+        value_offset: u64,
+    ) -> Result<(), HintfileError> {
+        Self::write_hint_record_to(
+            &mut self.file,
+            &HintfileRecord::from_datafile_record(df_record, value_offset),
+        )?;
+
+        Ok(())
     }
 
     fn write_hint_record_to<W: Write>(
@@ -195,5 +219,122 @@ impl<'a> HintfileIterator<'a> {
         self.offset += header.size()? as u64;
 
         Ok(Some(HintfileRecord { header, key }))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    mod record {
+        use crate::{
+            datafile::DatafileRecordIteratorEntry,
+            hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, HintfileRecord, HintfileRecordHeader},
+            record::{DatafileRecord, DatafileRecordHeader},
+        };
+
+        #[test]
+        fn header_from_datafile_record_iterator_entry() {
+            let key = b"1";
+            let value = 1u32.to_be_bytes();
+
+            let df_record = DatafileRecord::new(key, &value).unwrap();
+            let value_offset = 142u64;
+
+            let hintfile_header =
+                HintfileRecordHeader::from_datafile_record(&df_record, value_offset);
+
+            let expected_crc = HintfileRecordHeader::crc_for(
+                df_record.header.timestamp,
+                df_record.header.key_size,
+                df_record.header.value_size,
+                value_offset,
+                key,
+            );
+
+            assert_eq!(hintfile_header.timestamp, df_record.header.timestamp);
+            assert_eq!(hintfile_header.key_size, df_record.header.key_size);
+            assert_eq!(hintfile_header.value_size, df_record.header.value_size);
+            assert_eq!(hintfile_header.value_offset, value_offset);
+            assert_eq!(hintfile_header.crc, expected_crc);
+        }
+
+        #[test]
+        fn header_encode_decode() {
+            let key = b"1";
+            let value = 1u32.to_be_bytes();
+
+            let df_record = DatafileRecord::new(key, &value).unwrap();
+            let value_offset = 142u64;
+
+            let hintfile_header =
+                HintfileRecordHeader::from_datafile_record(&df_record, value_offset);
+
+            let mut expected_encoding: Vec<u8> = Vec::new();
+            expected_encoding.extend_from_slice(&hintfile_header.crc.to_be_bytes());
+            expected_encoding.extend_from_slice(&hintfile_header.timestamp.to_be_bytes());
+            expected_encoding.extend_from_slice(&hintfile_header.key_size.to_be_bytes());
+            expected_encoding.extend_from_slice(&hintfile_header.value_size.to_be_bytes());
+            expected_encoding.extend_from_slice(&hintfile_header.value_offset.to_be_bytes());
+
+            assert_eq!(hintfile_header.encode(), expected_encoding.as_slice());
+            assert_eq!(
+                HintfileRecordHeader::decode(&expected_encoding).unwrap(),
+                hintfile_header
+            );
+            assert_eq!(
+                HintfileRecordHeader::decode(&hintfile_header.encode()).unwrap(),
+                hintfile_header
+            );
+        }
+
+        #[test]
+        fn crc() {
+            let key = b"1";
+            let value = 1u32.to_be_bytes();
+
+            let df_record = DatafileRecord::new(key, &value).unwrap();
+            let value_offset = 142u64;
+
+            let hintfile_header =
+                HintfileRecordHeader::from_datafile_record(&df_record, value_offset);
+
+            let mut hasher = hintfile_header.crc();
+            hasher.update(key);
+
+            assert_eq!(hasher.finalize(), hintfile_header.crc);
+        }
+
+        #[test]
+        fn size() {
+            let key = b"1";
+            let value = 1u32.to_be_bytes();
+
+            let df_record = DatafileRecord::new(key, &value).unwrap();
+            let value_offset = 142u64;
+
+            let hintfile_header =
+                HintfileRecordHeader::from_datafile_record(&df_record, value_offset);
+
+            assert_eq!(
+                hintfile_header.size().unwrap(),
+                HINTFILE_RECORD_HEADER_SIZE_BYTES + 1
+            );
+        }
+
+        #[test]
+        fn record_from_datafile_record_iterator_entry() {
+            let key = b"1";
+            let value = 1u32.to_be_bytes();
+
+            let df_record = DatafileRecord::new(key, &value).unwrap();
+            let value_offset = 142u64;
+
+            let hintfile_header =
+                HintfileRecordHeader::from_datafile_record(&df_record, value_offset);
+
+            let hintfile_record = HintfileRecord::from_datafile_record(df_record, value_offset);
+
+            assert_eq!(hintfile_record.header, hintfile_header);
+            assert_eq!(hintfile_record.key.to_vec(), Vec::from(key));
+        }
     }
 }

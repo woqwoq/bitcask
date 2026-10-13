@@ -8,7 +8,7 @@ use std::{
 use lru::LruCache;
 
 use crate::{
-    datafile::{Datafile, DatafileRecordIterator, DatafileRecordIteratorEntry},
+    datafile::{Datafile, DatafileRecordIterator},
     error::{BitcaskError, DatafileError},
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
@@ -219,7 +219,9 @@ impl BitcaskInstance {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
-        self.write_record(DatafileRecord::new(key, value)?)
+        let _ = self.write_datafile_record(DatafileRecord::new(key, value)?)?;
+
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -256,7 +258,7 @@ impl BitcaskInstance {
         }
     }
 
-    fn write_record(&mut self, record: DatafileRecord) -> Result<(), BitcaskError> {
+    fn write_datafile_record(&mut self, record: DatafileRecord) -> Result<u64, BitcaskError> {
         let rsz = record.size()?;
 
         // If our record is larger than the writer max size, we either throw an
@@ -285,12 +287,12 @@ impl BitcaskInstance {
 
         self.commit_keydir_write(record, offset)?; // Append entry to the keydir
 
-        Ok(())
+        Ok(offset)
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
         if self.keydir.contains(key) {
-            self.write_record(DatafileRecord::new_tombstone(key)?)?;
+            self.write_datafile_record(DatafileRecord::new_tombstone(key)?)?;
         }
 
         Ok(())
@@ -386,6 +388,7 @@ impl BitcaskInstance {
                     let mut hasher = df_entry.header.crc();
                     hasher.update(&df_entry.key);
 
+                    // TODO: Possibly stream-write the value for hasher and write
                     // No need to stream the value in chunks as we need it allocated to perform the
                     // new write anyway
                     let value =
@@ -396,12 +399,16 @@ impl BitcaskInstance {
                         return Err(BitcaskError::DatafileError(DatafileError::CrcMismatch));
                     }
 
-                    self.write_record(DatafileRecord::with_timestamp(
+                    let record = DatafileRecord::with_timestamp(
                         &df_entry.key,
                         &value,
                         df_entry.header.timestamp,
-                    )?)?; // We want to
-                    // keep original time stamp
+                    )?;
+
+                    // TODO: Remove the clone, think of a way to write the entry
+                    // TODO: Adjust the offest to point to the value instead of the start
+                    let record_start_offset = self.write_datafile_record(record.clone())?; // We want to keep original timestamp
+                    self.write_hintfile_record(record, record_start_offset)?;
                 }
                 // Otherwise we ignore the value as it is either dead or the tombstone itself
             }
@@ -409,6 +416,15 @@ impl BitcaskInstance {
 
         self.remove_old_readers_post_merge(candidate_ids)?;
 
+        Ok(())
+    }
+
+    // TODO: Implement the actual interaction
+    fn write_hintfile_record(
+        &mut self,
+        record: DatafileRecord,
+        value_offset: u64,
+    ) -> Result<(), BitcaskError> {
         Ok(())
     }
 
