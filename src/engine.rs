@@ -378,7 +378,8 @@ impl BitcaskInstance {
         for id in candidate_ids.clone() {
             let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
             let mut iter = DatafileRecordIterator::new(&df)?;
-            let mut hf = Hintfile::new_or_open_existing(&self.dir, id, "hint")?;
+            let mut hf =
+                Hintfile::new_or_open_existing(&self.dir, id, &self.options.hintfile_extension)?;
 
             while let Some(df_entry) = iter.next_record()? {
                 if df_entry.header.record_type == DATAFILE_RECORD_TYPE_NORMAL
@@ -421,7 +422,6 @@ impl BitcaskInstance {
         Ok(())
     }
 
-    // TODO: Implement the actual interaction
     fn write_hintfile_record(
         &mut self,
         hf: &mut Hintfile,
@@ -430,7 +430,11 @@ impl BitcaskInstance {
     ) -> Result<(), BitcaskError> {
         // When a writer switchover has occured
         if hf.id != self.writer.id {
-            let new = Hintfile::new_or_open_existing(&self.dir, self.writer.id, "hint")?;
+            let new = Hintfile::new_or_open_existing(
+                &self.dir,
+                self.writer.id,
+                &self.options.hintfile_extension,
+            )?;
             drop(std::mem::replace(hf, new)); // Seal old hintfile
         }
 
@@ -445,11 +449,20 @@ impl BitcaskInstance {
     fn remove_old_readers_post_merge(&mut self, ids: Vec<u32>) -> Result<(), BitcaskError> {
         for id in ids {
             self.readers.pop(&id); // Evict the file from LRU
+
+            // Remove the reader datafile from filesystem
+            fs::remove_file(Datafile::generate_filename(
+                &self.dir,
+                id,
+                &self.options.datafile_extension,
+            ))?;
+
+            // Remove the reader's hintfile from filesystem
             fs::remove_file(Datafile::generate_filename(
                 // Remove the file from file system
                 &self.dir,
                 id,
-                &self.options.datafile_extension,
+                &self.options.hintfile_extension,
             ))?;
         }
 
@@ -1256,7 +1269,15 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn write_hintfile_record() {
+        todo!();
+    }
+
     mod merge {
+        use crate::hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile};
+
         use super::*;
 
         #[test]
@@ -1264,16 +1285,24 @@ mod tests {
             let (temp_dir, options, mut db) = init_test();
 
             const ENTRY_COUNT: usize = 500;
-            const ENTRY_SIZE: usize = 29;
+            const ENTRY_SIZE: usize = DATAFILE_HEADER_SIZE_BYTES + 4 + 4;
+            const HINT_ENTRY_SIZE: usize = HINTFILE_RECORD_HEADER_SIZE_BYTES + 4;
+            let entries_to_fit_on_single_df = options.datafile_max_size.get_size() / ENTRY_SIZE;
+
+            let entries_on_active_writer = match ENTRY_COUNT % entries_to_fit_on_single_df {
+                0 => entries_to_fit_on_single_df,
+                remainder => remainder,
+            };
 
             for i in 0..ENTRY_COUNT as u32 {
                 db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
             }
 
             let datafiles_to_house_payload: usize =
-                (ENTRY_COUNT * ENTRY_SIZE).div_ceil(options.datafile_max_size.get_size());
+                ENTRY_COUNT.div_ceil(entries_to_fit_on_single_df);
+
             let datafiles_to_house_dead_payload: usize =
-                (2 * ENTRY_COUNT * ENTRY_SIZE).div_ceil(options.datafile_max_size.get_size());
+                (2 * ENTRY_COUNT).div_ceil(entries_to_fit_on_single_df);
 
             assert_eq!(db.writer.id, datafiles_to_house_payload as u32);
             assert_eq!(db.len(), ENTRY_COUNT);
@@ -1292,7 +1321,12 @@ mod tests {
                     + datafiles_to_house_payload as u32 // New files to house the data
             );
             assert_eq!(db.len(), ENTRY_COUNT); // All KV pairs should be still present
-            assert_eq!(db.readers.len(), datafiles_to_house_payload - 1); // LRU Should have only 1
+            assert_eq!(
+                db.readers.len(),
+                options
+                    .reader_lru_cache_size
+                    .min(datafiles_to_house_payload - 1)
+            ); // LRU Should have only 1
             // 1 reader post-merge as the rest were evicted
 
             // Old datafiles should be gone from the filesystem
@@ -1310,6 +1344,24 @@ mod tests {
                     Some(Box::from(i.to_be_bytes()))
                 );
             }
+
+            // Hints should be written to the new datafiles including writer
+            for (id, _) in db.readers {
+                let hf = Hintfile::new_or_open_existing(temp_dir.path(), id, "hint").unwrap();
+
+                assert_eq!(
+                    hf.file_size().unwrap(),
+                    (entries_to_fit_on_single_df * HINT_ENTRY_SIZE) as u64
+                );
+            }
+
+            assert_eq!(
+                Hintfile::new_or_open_existing(temp_dir.path(), db.writer.id, "hint")
+                    .unwrap()
+                    .file_size()
+                    .unwrap(),
+                (entries_on_active_writer * HINT_ENTRY_SIZE) as u64
+            );
         }
     }
 }

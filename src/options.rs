@@ -1,4 +1,6 @@
 pub const DEFAULT_DATAFILE_EXTENSION: &str = "db";
+pub const DEFAULT_HINTFILE_EXTENSION: &str = "hint";
+
 pub const DEFAULT_LRU_CACHED_READERS_COUNT: usize = 10;
 pub const DEFAULT_DATAFILE_SIZE_BYTES: usize = 10000;
 
@@ -68,6 +70,7 @@ pub struct BitcaskOptions {
     pub datafile_max_size: DatafileMaxSize,
     pub reuse_old_writer_on_startup: bool,
     pub datafile_extension: String,
+    pub hintfile_extension: String,
     pub reader_lru_cache_size: usize,
 }
 
@@ -98,6 +101,10 @@ impl BitcaskOptions {
         self.datafile_extension = new.to_string();
         self
     }
+    pub fn hintfile_extension(mut self, new: &str) -> Self {
+        self.hintfile_extension = new.to_string();
+        self
+    }
     pub fn reader_lru_cache_size(mut self, new: usize) -> Self {
         self.reader_lru_cache_size = new;
         self
@@ -117,6 +124,7 @@ impl Default for BitcaskOptions {
             datafile_max_size: DatafileMaxSize::default(),
             reuse_old_writer_on_startup: false,
             datafile_extension: DEFAULT_DATAFILE_EXTENSION.to_string(),
+            hintfile_extension: DEFAULT_HINTFILE_EXTENSION.to_string(),
             reader_lru_cache_size: DEFAULT_LRU_CACHED_READERS_COUNT,
         }
     }

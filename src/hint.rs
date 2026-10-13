@@ -9,7 +9,7 @@ use crc32fast::Hasher;
 
 use crate::{datafile::Datafile, error::HintfileError, record::DatafileRecord};
 
-const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
+pub const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
 
 const HINTFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
 const HINTFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
