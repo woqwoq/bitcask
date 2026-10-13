@@ -8,9 +8,9 @@ use std::{
 use crc32fast::Hasher;
 
 use crate::{
-    datafile::{Datafile, DatafileRecordIteratorEntry},
+    datafile::Datafile,
     error::HintfileError,
-    record::DatafileRecord,
+    record::{DatafileRecord, DatafileRecordHeader},
 };
 
 const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
@@ -128,6 +128,17 @@ impl HintfileRecord {
             header: HintfileRecordHeader::from_datafile_record(&df_record, value_offset),
             key: df_record.key,
         }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, HintfileError> {
+        let header = HintfileRecordHeader::decode(bytes)?;
+
+        let key = &bytes[HINTFILE_RECORD_HEADER_SIZE_BYTES..header.key_size as usize];
+
+        Ok(Self {
+            header,
+            key: Box::from(key),
+        })
     }
 }
 
@@ -335,6 +346,61 @@ mod test {
 
             assert_eq!(hintfile_record.header, hintfile_header);
             assert_eq!(hintfile_record.key.to_vec(), Vec::from(key));
+        }
+    }
+
+    mod hintfile {
+        use crate::{
+            error::HintfileError,
+            hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile, HintfileRecord},
+            record::DatafileRecord,
+        };
+        const HINTFILE_EXTENSION: &str = "hint";
+
+        #[test]
+        fn new() {
+            let temp_dir = tempfile::tempdir().unwrap();
+
+            {
+                let hintfile = Hintfile::new(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
+
+                assert_eq!(hintfile.id, 1);
+                assert_eq!(hintfile.file_size().unwrap(), 0);
+            }
+
+            assert!(matches!(
+                Hintfile::new(temp_dir.path(), 1, HINTFILE_EXTENSION),
+                Err(HintfileError::IO(_))
+            ));
+        }
+
+        #[test]
+        fn append_read() {
+            let temp_dir = tempfile::tempdir().unwrap();
+
+            let mut hintfile = Hintfile::new(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
+
+            const RECORD_SIZE_BYTES: usize = 29;
+
+            let mut offset = 0u64;
+            for i in 0..100u32 {
+                let record = DatafileRecord::new(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+                let rsz = record.size().unwrap();
+
+                assert!(hintfile.append_hint_record(record, offset).is_ok());
+                offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + rsz as u64;
+            }
+
+            let mut offset = 0u64;
+            for i in 0..100u32 {
+                let bytes = hintfile.read_bytes(offset, RECORD_SIZE_BYTES).unwrap();
+                let expected = DatafileRecord::new(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+                let record = HintfileRecord::decode(&bytes).unwrap();
+
+                offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
+
+                assert_eq!()
+            }
         }
     }
 }

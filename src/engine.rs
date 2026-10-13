@@ -423,8 +423,10 @@ impl BitcaskInstance {
     fn write_hintfile_record(
         &mut self,
         record: DatafileRecord,
-        value_offset: u64,
+        record_start_offset: u64,
     ) -> Result<(), BitcaskError> {
+        let value_offset =
+            record_start_offset + DATAFILE_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
         Ok(())
     }
 
