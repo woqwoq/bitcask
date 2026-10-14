@@ -19,11 +19,51 @@ use crate::{
     },
 };
 
+pub struct MergeTracker {
+    pub bytes_written: u64,
+    pub dead_bytes_written: u64,
+}
+
+impl MergeTracker {
+    pub fn new() -> Self {
+        Self {
+            bytes_written: 0,
+            dead_bytes_written: 0,
+        }
+    }
+
+    pub fn write(&mut self, size: u64) {
+        self.bytes_written += size;
+    }
+
+    pub fn remove(&mut self, size: u64) {
+        self.dead_bytes_written += size;
+    }
+
+    pub fn reset(&mut self) {
+        self.bytes_written = 0;
+        self.dead_bytes_written = 0;
+    }
+
+    pub fn should_merge(&self, options: &BitcaskOptions) -> bool {
+        if self.bytes_written != 0
+            && (self.dead_bytes_written * 100 / self.bytes_written) as u8
+                > options.merge_dead_space_threshold_percent
+            && self.dead_bytes_written > options.merge_dead_space_threshold_bytes
+        {
+            return true;
+        }
+
+        false
+    }
+}
+
 pub struct BitcaskInstance {
     dir: PathBuf,                         // For opening files through LRU
     pub(crate) keydir: KeyDir,            // In-memory keydir map
     pub writer: Datafile,                 // Writer file handle
     pub readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
+    pub merge_tracker: MergeTracker,      // For tracking dead space and trigger compaction
     write_count: usize,                   // Write count tracker for sync
     options: BitcaskOptions,              // User-customisable options
 }
@@ -231,12 +271,17 @@ impl BitcaskInstance {
             writer,
             dir,
             readers,
+            merge_tracker: MergeTracker::new(),
             write_count: 0,
             options,
         })
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
+        if self.merge_tracker.should_merge(&self.options) {
+            self.merge()?; // Will also provide a fresh new writer
+        }
+
         let _ = self.write_datafile_record(&DatafileRecord::new(key, value)?)?;
 
         Ok(())
@@ -310,6 +355,10 @@ impl BitcaskInstance {
 
     pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
         if self.keydir.contains(key) {
+            if self.merge_tracker.should_merge(&self.options) {
+                self.merge()?; // Will also provide a fresh new writer
+            }
+
             self.write_datafile_record(&DatafileRecord::new_tombstone(key)?)?;
         }
 
@@ -336,6 +385,8 @@ impl BitcaskInstance {
         offset: u64,
     ) -> Result<(), BitcaskError> {
         let ksz = record.header.key_size;
+        let header_and_key_size = DATAFILE_HEADER_SIZE_BYTES as u32 + ksz;
+        let old_vsz = self.keydir.get(&record.key).map_or(0, |kde| kde.value_size);
 
         match record.header.record_type {
             DATAFILE_RECORD_TYPE_NORMAL => {
@@ -346,9 +397,19 @@ impl BitcaskInstance {
                     offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
                     record.header.timestamp,
                 );
+
+                if old_vsz > 0 {
+                    self.merge_tracker
+                        .remove(header_and_key_size as u64 + old_vsz as u64);
+                }
+                self.merge_tracker
+                    .write(header_and_key_size as u64 + record.header.value_size as u64);
             }
             DATAFILE_RECORD_TYPE_TOMBSTONE => {
                 self.keydir.remove(&record.key);
+
+                self.merge_tracker
+                    .remove(header_and_key_size as u64 + old_vsz as u64);
             }
             _ => return Err(DatafileError::UnexpectedDatafileRecordType)?,
         }
@@ -437,6 +498,7 @@ impl BitcaskInstance {
 
         self.remove_old_readers_post_merge(candidate_ids)?;
 
+        self.merge_tracker.reset();
         self.switch_writer_datafile()?; // Seal the last writer to avoid inconsistencies between
         // hintfile and datafile
 
@@ -1440,6 +1502,47 @@ mod tests {
                     .unwrap(),
                 0
             );
+        }
+
+        #[test]
+        fn merge_tracker() {
+            let temp_dir = tempfile::tempdir().unwrap();
+
+            const ENTRY_COUNT: usize = 100;
+            const ENTRY_SIZE: usize = DATAFILE_HEADER_SIZE_BYTES + 4 + 4;
+
+            let options = BitcaskOptions::default()
+                .merge_dead_space_min_bytes((ENTRY_COUNT * ENTRY_SIZE) as u64 - 1u64);
+            let mut db = BitcaskInstance::open(
+                temp_dir.path().to_path_buf(),
+                BitcaskOptions::default().clone(),
+            )
+            .unwrap();
+
+            for i in 0..ENTRY_COUNT as u32 {
+                db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+            }
+
+            assert_eq!(
+                db.merge_tracker.bytes_written,
+                (ENTRY_SIZE * ENTRY_COUNT) as u64
+            );
+            assert_eq!(db.merge_tracker.dead_bytes_written, 0u64);
+
+            for i in 0..ENTRY_COUNT as u32 {
+                db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+            }
+
+            assert_eq!(
+                db.merge_tracker.bytes_written,
+                (2 * ENTRY_SIZE * ENTRY_COUNT) as u64
+            );
+            assert_eq!(
+                db.merge_tracker.dead_bytes_written,
+                (ENTRY_SIZE * ENTRY_COUNT) as u64
+            );
+
+            assert!(db.merge_tracker.should_merge(&options));
         }
     }
 }

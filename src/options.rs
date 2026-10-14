@@ -4,6 +4,9 @@ pub const DEFAULT_HINTFILE_EXTENSION: &str = "hint";
 pub const DEFAULT_LRU_CACHED_READERS_COUNT: usize = 10;
 pub const DEFAULT_DATAFILE_SIZE_BYTES: usize = 10000;
 
+pub const DEFAULT_MERGE_DEAD_SPACE_PERCENT_THRESHOLD: u8 = 40;
+pub const DEFAULT_MERGE_DEAD_SPACE_BYTE_THRESHOLD: u64 = 65565;
+
 #[derive(Clone, PartialEq)]
 pub enum RecoveryMode {
     TolerateCorruptedTailRecords, // Last reader failure -> truncate until failure, or fatal
@@ -68,6 +71,8 @@ pub struct BitcaskOptions {
     pub recovery_mode: RecoveryMode,
     pub sync_frequency: SyncFrequency,
     pub datafile_max_size: DatafileMaxSize,
+    pub merge_dead_space_threshold_percent: u8,
+    pub merge_dead_space_threshold_bytes: u64,
     pub reuse_old_writer_on_startup: bool,
     pub datafile_extension: String,
     pub hintfile_extension: String,
@@ -91,6 +96,14 @@ impl BitcaskOptions {
     }
     pub fn datafile_max_size(mut self, new: DatafileMaxSize) -> Self {
         self.datafile_max_size = new;
+        self
+    }
+    pub fn merge_dead_space_threshold(mut self, new: u8) -> Self {
+        self.merge_dead_space_threshold_percent = new;
+        self
+    }
+    pub fn merge_dead_space_min_bytes(mut self, new: u64) -> Self {
+        self.merge_dead_space_threshold_bytes = new;
         self
     }
     pub fn reuse_old_writer_on_startup(mut self, new: bool) -> Self {
@@ -122,6 +135,8 @@ impl Default for BitcaskOptions {
             recovery_mode: RecoveryMode::default(),
             sync_frequency: SyncFrequency::default(),
             datafile_max_size: DatafileMaxSize::default(),
+            merge_dead_space_threshold_percent: DEFAULT_MERGE_DEAD_SPACE_PERCENT_THRESHOLD,
+            merge_dead_space_threshold_bytes: DEFAULT_MERGE_DEAD_SPACE_BYTE_THRESHOLD,
             reuse_old_writer_on_startup: false,
             datafile_extension: DEFAULT_DATAFILE_EXTENSION.to_string(),
             hintfile_extension: DEFAULT_HINTFILE_EXTENSION.to_string(),
