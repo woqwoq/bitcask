@@ -10,12 +10,12 @@ use lru::LruCache;
 use crate::{
     datafile::{Datafile, DatafileRecordIterator},
     error::{BitcaskError, DatafileError},
-    hint::Hintfile,
+    hint::{Hintfile, HintfileIterator},
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
     record::{
         DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
-        DatafileRecord,
+        DatafileRecord, DatafileRecordHeader,
     },
 };
 
@@ -50,7 +50,7 @@ impl BitcaskRecoveryHandler {
         Datafile::open_reader_for_recovery(&self.dir, id, offset, &self.datafile_extension)
     }
 
-    pub fn recover_post_failure(
+    pub fn recover_post_df_failure(
         &self,
         mut df: Datafile,
         error: DatafileError,
@@ -85,18 +85,16 @@ impl BitcaskRecoveryHandler {
     }
 }
 
-pub struct BitcaskStartupHandler {
+pub struct BitcaskStartupHandler<'a> {
     dir: PathBuf,
-    reuse_old_writer_on_startup: bool,
-    datafile_extension: String,
+    options: &'a BitcaskOptions,
 }
 
-impl BitcaskStartupHandler {
-    pub fn new(dir: &Path, options: &BitcaskOptions) -> Self {
+impl<'a> BitcaskStartupHandler<'a> {
+    pub fn new(dir: &Path, options: &'a BitcaskOptions) -> Self {
         Self {
             dir: dir.to_path_buf(),
-            reuse_old_writer_on_startup: options.reuse_old_writer_on_startup,
-            datafile_extension: options.datafile_extension.clone(),
+            options,
         }
     }
 
@@ -104,7 +102,7 @@ impl BitcaskStartupHandler {
         let id = df.id;
         let offset = df.offset;
         drop(df);
-        Datafile::open_datafile_as_writer(&self.dir, id, offset, &self.datafile_extension)
+        Datafile::open_datafile_as_writer(&self.dir, id, offset, &self.options.datafile_extension)
     }
 
     pub fn parse_db_datafile_ids_at_path(
@@ -145,15 +143,25 @@ impl BitcaskStartupHandler {
         keydir: &mut KeyDir,
         readers: &mut LruCache<u32, Datafile>,
     ) -> Result<Option<Datafile>, BitcaskError> {
-        let ids = Self::parse_db_datafile_ids_at_path(&self.dir, &self.datafile_extension)?;
+        let df_ids =
+            Self::parse_db_datafile_ids_at_path(&self.dir, &self.options.datafile_extension)?;
+        let last = df_ids.last().cloned();
 
-        let last = ids.last().cloned();
-        for id in ids {
-            let mut df = Datafile::open_reader(&self.dir, id, &self.datafile_extension)?;
+        for id in df_ids {
             let is_last = Some(id) == last;
-            if let Err(e) = df.replay(keydir) {
-                df = recovery_handler.recover_post_failure(df, e, is_last)?;
-            }
+            let mut df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
+
+            match Hintfile::open_if_exists(&self.dir, id, &self.options.hintfile_extension)? {
+                Some(hf) => {
+                    hf.replay(keydir)?; // If a hintfile exists, we replay from it
+                }
+                None => {
+                    // Otherwise we replay the whole datafile
+                    if let Err(e) = df.replay(keydir) {
+                        df = recovery_handler.recover_post_df_failure(df, e, is_last)?;
+                    }
+                }
+            };
 
             if is_last {
                 return Ok(Some(df));
@@ -171,7 +179,7 @@ impl BitcaskStartupHandler {
         readers: &mut LruCache<u32, Datafile>,
     ) -> Result<Datafile, BitcaskError> {
         if let Some(df) = latest_datafile {
-            if self.reuse_old_writer_on_startup {
+            if self.options.reuse_old_writer_on_startup {
                 return Ok(self.reopen_datafile_as_writer(df)?);
             }
 
@@ -181,14 +189,14 @@ impl BitcaskStartupHandler {
             return Ok(Datafile::new_writer(
                 &self.dir,
                 id + 1,
-                &self.datafile_extension,
+                &self.options.datafile_extension,
             )?);
         }
 
         Ok(Datafile::new_writer(
             &self.dir,
             1,
-            &self.datafile_extension,
+            &self.options.datafile_extension,
         )?)
     }
 }
@@ -562,11 +570,11 @@ mod tests {
             .sum()
     }
 
-    fn replay_env(
+    fn replay_env<'a>(
         dir: &Path,
-        options: &BitcaskOptions,
+        options: &'a BitcaskOptions,
     ) -> (
-        BitcaskStartupHandler,
+        BitcaskStartupHandler<'a>,
         BitcaskRecoveryHandler,
         KeyDir,
         LruCache<u32, Datafile>,

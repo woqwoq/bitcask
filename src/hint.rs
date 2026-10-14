@@ -7,7 +7,7 @@ use std::{
 
 use crc32fast::Hasher;
 
-use crate::{datafile::Datafile, error::HintfileError, record::DatafileRecord};
+use crate::{datafile::Datafile, error::HintfileError, keydir::KeyDir, record::DatafileRecord};
 
 pub const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
 
@@ -160,6 +160,64 @@ impl Hintfile {
 
         Ok(Self { file, id })
     }
+
+    pub fn replay(&self, keydir: &mut KeyDir) -> Result<usize, HintfileError> {
+        let mut start_offset = 0;
+        let fsz = self.file_size()?;
+        let mut count: usize = 0;
+
+        while start_offset < fsz {
+            let header = HintfileRecordHeader::decode(
+                &self.read_bytes(start_offset, HINTFILE_RECORD_HEADER_SIZE_BYTES)?,
+            )?;
+
+            let mut hasher = header.crc();
+
+            let key = self.read_bytes(
+                start_offset + HINTFILE_RECORD_HEADER_SIZE_BYTES as u64,
+                header.key_size as usize,
+            )?;
+
+            hasher.update(&key);
+
+            if hasher.finalize() != header.crc {
+                return Err(HintfileError::CrcMismatch);
+            }
+
+            keydir.put(
+                key,
+                self.id,
+                header.value_size,
+                header.value_offset,
+                header.timestamp,
+            );
+            count += 1;
+
+            start_offset += header.size()? as u64;
+        }
+
+        Ok(count)
+    }
+
+    pub fn open_if_exists(
+        dir: &Path,
+        id: u32,
+        hintfile_extension: &str,
+    ) -> Result<Option<Self>, HintfileError> {
+        let filename = Datafile::generate_filename(dir, id, hintfile_extension);
+
+        if !filename.exists() {
+            return Ok(None);
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .open(filename)?;
+
+        Ok(Some(Self { file, id }))
+    }
     pub fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
         let mut buf = vec![0u8; count];
 
@@ -173,10 +231,12 @@ impl Hintfile {
         df_record: &DatafileRecord,
         value_offset: u64,
     ) -> Result<(), HintfileError> {
-        // TODO: Pass header and &key reference to avoid key.copy downstream
+        // Instead of building HintfileRecord and copying the key, we write it disassembled into
+        // header and key from the beginning.
         Self::write_hint_record_to(
             &mut self.file,
-            &HintfileRecord::from_datafile_record(df_record, value_offset),
+            HintfileRecordHeader::from_datafile_record(df_record, value_offset),
+            &df_record.key,
         )?;
 
         Ok(())
@@ -184,10 +244,11 @@ impl Hintfile {
 
     fn write_hint_record_to<W: Write>(
         writer: &mut W,
-        record: &HintfileRecord,
+        header: HintfileRecordHeader,
+        key: &[u8],
     ) -> Result<(), HintfileError> {
-        writer.write_all(&record.header.encode())?;
-        writer.write_all(&record.key)?;
+        writer.write_all(&header.encode())?;
+        writer.write_all(key)?;
 
         Ok(())
     }
@@ -357,6 +418,7 @@ mod test {
     mod hintfile {
         use crate::{
             hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile, HintfileRecord},
+            keydir::KeyDir,
             record::DatafileRecord,
         };
         const HINTFILE_EXTENSION: &str = "hint";
@@ -409,6 +471,51 @@ mod test {
                 );
 
                 offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
+            }
+        }
+
+        #[test]
+        fn replay() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut records: Vec<HintfileRecord> = Vec::new();
+            let mut keydir = KeyDir::new();
+
+            assert!(
+                Hintfile::open_if_exists(temp_dir.path(), 2, HINTFILE_EXTENSION)
+                    .unwrap()
+                    .is_none()
+            );
+
+            {
+                let mut hintfile =
+                    Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
+
+                let mut offset = 0u64;
+
+                for i in 0..100u32 {
+                    let record = DatafileRecord::new(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+                    let ksz = record.header.key_size;
+
+                    assert!(hintfile.append_hint_record(&record, offset).is_ok());
+                    records.push(HintfileRecord::from_datafile_record(&record, offset));
+                    offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + ksz as u64;
+                }
+            }
+
+            let hintfile = Hintfile::open_if_exists(temp_dir.path(), 1, HINTFILE_EXTENSION)
+                .unwrap()
+                .unwrap();
+
+            assert!(hintfile.replay(&mut keydir).is_ok());
+
+            for record in records {
+                assert!(keydir.contains(&record.key));
+                let kde = keydir.get(&record.key).unwrap();
+
+                assert_eq!(kde.file_id, hintfile.id);
+                assert_eq!(kde.value_size, record.header.value_size);
+                assert_eq!(kde.value_offset, record.header.value_offset);
+                assert_eq!(kde.timestamp, record.header.timestamp);
             }
         }
     }

@@ -6,7 +6,7 @@ pub struct KeyDirEntry {
     pub file_id: u32, // ID (e.g. 00000001.data) of the file that contains the given value
     pub value_size: u32, // Size of the value in bytes
     pub value_offset: u64, // Absolute byyte offset to the location of the value in the  datafile
-    timestamp: u64,   // UNIX Timestamp when the entry was created
+    pub timestamp: u64, // UNIX Timestamp when the entry was created
 }
 
 impl KeyDirEntry {

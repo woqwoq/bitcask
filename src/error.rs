@@ -170,6 +170,7 @@ pub enum HintfileError {
     IO(Error),
     SliceConversion(TryFromSliceError),
     OversizedHintfileRecord,
+    CrcMismatch,
 }
 
 impl From<Error> for HintfileError {
