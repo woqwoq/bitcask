@@ -119,10 +119,10 @@ pub struct HintfileRecord {
 }
 
 impl HintfileRecord {
-    pub fn from_datafile_record(df_record: DatafileRecord, value_offset: u64) -> Self {
+    pub fn from_datafile_record(df_record: &DatafileRecord, value_offset: u64) -> Self {
         Self {
-            header: HintfileRecordHeader::from_datafile_record(&df_record, value_offset),
-            key: df_record.key,
+            header: HintfileRecordHeader::from_datafile_record(df_record, value_offset),
+            key: df_record.key.clone(),
         }
     }
 
@@ -170,9 +170,10 @@ impl Hintfile {
 
     pub fn append_hint_record(
         &mut self,
-        df_record: DatafileRecord,
+        df_record: &DatafileRecord,
         value_offset: u64,
     ) -> Result<(), HintfileError> {
+        // TODO: Pass header and &key reference to avoid key.copy downstream
         Self::write_hint_record_to(
             &mut self.file,
             &HintfileRecord::from_datafile_record(df_record, value_offset),
@@ -242,9 +243,8 @@ impl<'a> HintfileIterator<'a> {
 mod test {
     mod record {
         use crate::{
-            datafile::DatafileRecordIteratorEntry,
             hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, HintfileRecord, HintfileRecordHeader},
-            record::{DatafileRecord, DatafileRecordHeader},
+            record::DatafileRecord,
         };
 
         #[test]
@@ -347,7 +347,7 @@ mod test {
             let hintfile_header =
                 HintfileRecordHeader::from_datafile_record(&df_record, value_offset);
 
-            let hintfile_record = HintfileRecord::from_datafile_record(df_record, value_offset);
+            let hintfile_record = HintfileRecord::from_datafile_record(&df_record, value_offset);
 
             assert_eq!(hintfile_record.header, hintfile_header);
             assert_eq!(hintfile_record.key.to_vec(), Vec::from(key));
@@ -394,7 +394,7 @@ mod test {
                 let ksz = record.header.key_size;
                 records.push(record.clone());
 
-                assert!(hintfile.append_hint_record(record, offset).is_ok());
+                assert!(hintfile.append_hint_record(&record, offset).is_ok());
                 offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + ksz as u64;
             }
 
@@ -405,7 +405,7 @@ mod test {
 
                 assert_eq!(
                     record,
-                    HintfileRecord::from_datafile_record(expected, offset)
+                    HintfileRecord::from_datafile_record(&expected, offset)
                 );
 
                 offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;

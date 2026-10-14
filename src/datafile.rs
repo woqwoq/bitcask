@@ -109,6 +109,8 @@ impl Datafile {
                 &self.read_bytes(start_offset, DATAFILE_HEADER_SIZE_BYTES)?,
             )?;
 
+            // TODO: Make sure VSZ is not overflowing the file???
+
             let mut hasher = header.crc();
 
             let key = self.read_bytes(

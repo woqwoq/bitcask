@@ -220,7 +220,7 @@ impl BitcaskInstance {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
-        let _ = self.write_datafile_record(DatafileRecord::new(key, value)?)?;
+        let _ = self.write_datafile_record(&DatafileRecord::new(key, value)?)?;
 
         Ok(())
     }
@@ -259,7 +259,7 @@ impl BitcaskInstance {
         }
     }
 
-    fn write_datafile_record(&mut self, record: DatafileRecord) -> Result<u64, BitcaskError> {
+    fn write_datafile_record(&mut self, record: &DatafileRecord) -> Result<u64, BitcaskError> {
         let rsz = record.size()?;
 
         // If our record is larger than the writer max size, we either throw an
@@ -280,7 +280,7 @@ impl BitcaskInstance {
             self.switch_writer_datafile()?;
         }
 
-        let offset = self.commit_datafile_write(&record)?; // Write record first, so that it can be
+        let offset = self.commit_datafile_write(record)?; // Write record first, so that it can be
         // replayed in case of a crash.
         self.write_count += 1;
 
@@ -293,7 +293,7 @@ impl BitcaskInstance {
 
     pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
         if self.keydir.contains(key) {
-            self.write_datafile_record(DatafileRecord::new_tombstone(key)?)?;
+            self.write_datafile_record(&DatafileRecord::new_tombstone(key)?)?;
         }
 
         Ok(())
@@ -315,7 +315,7 @@ impl BitcaskInstance {
 
     fn commit_keydir_write(
         &mut self,
-        record: DatafileRecord,
+        record: &DatafileRecord,
         offset: u64,
     ) -> Result<(), BitcaskError> {
         let ksz = record.header.key_size;
@@ -323,7 +323,7 @@ impl BitcaskInstance {
         match record.header.record_type {
             DATAFILE_RECORD_TYPE_NORMAL => {
                 self.keydir.put(
-                    record.key,
+                    record.key.clone(),
                     self.writer.id,
                     record.header.value_size,
                     offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
@@ -411,11 +411,8 @@ impl BitcaskInstance {
                         df_entry.header.timestamp,
                     )?;
 
-                    // TODO: Remove the clone, think of a way to write the entry
-                    // TODO: Adjust the offest to point to the value instead of the start
-                    let record_start_offset = self.write_datafile_record(record.clone())?; // We want to keep original timestamp
-                    // TODO: Add lifetime to HintfileRecord
-                    self.write_hintfile_record(&mut hf, record, record_start_offset)?;
+                    let record_start_offset = self.write_datafile_record(&record)?; // We want to keep original timestamp
+                    self.write_hintfile_record(&mut hf, &record, record_start_offset)?;
                 }
                 // Otherwise we ignore the value as it is either dead or the tombstone itself
             }
@@ -429,7 +426,7 @@ impl BitcaskInstance {
     fn write_hintfile_record(
         &mut self,
         hf: &mut Hintfile,
-        record: DatafileRecord,
+        record: &DatafileRecord,
         record_start_offset: u64,
     ) -> Result<(), BitcaskError> {
         // When a writer switchover has occured
@@ -498,7 +495,7 @@ mod tests {
         datafile::Datafile,
         engine::{BitcaskInstance, BitcaskRecoveryHandler, BitcaskStartupHandler},
         error::{BitcaskError, DatafileError},
-        hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile, HintfileRecord},
+        hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile},
         keydir::{KeyDir, KeyDirEntry},
         options::{BitcaskOptions, DatafileMaxSize},
         record::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
@@ -1151,21 +1148,21 @@ mod tests {
         let datafile_record = datafile_record_for_string_u32("hello world", 2);
         let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
 
-        assert!(db.commit_keydir_write(datafile_record.clone(), 0).is_ok());
+        assert!(db.commit_keydir_write(&datafile_record.clone(), 0).is_ok());
         assert_eq!(db.keydir.len(), 1);
         assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
 
         let datafile_record = datafile_record_for_string_u32("byeworld", 2);
         let expected = keydir_entry_for(&datafile_record, db.writer.id, 35);
 
-        assert!(db.commit_keydir_write(datafile_record.clone(), 35).is_ok());
+        assert!(db.commit_keydir_write(&datafile_record.clone(), 35).is_ok());
         assert_eq!(db.keydir.len(), 2);
         assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
 
         let datafile_record = datafile_record_for_string_u32("byeworld", 3);
         let expected = keydir_entry_for(&datafile_record, db.writer.id, 70);
 
-        assert!(db.commit_keydir_write(datafile_record.clone(), 70).is_ok());
+        assert!(db.commit_keydir_write(&datafile_record.clone(), 70).is_ok());
         assert_ne!(db.keydir.len(), 3);
         assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
     }
@@ -1296,13 +1293,13 @@ mod tests {
 
         assert_eq!(hf.id, 1);
         let record = DatafileRecord::new(b"1", b"1").unwrap();
-        assert!(db.write_hintfile_record(&mut hf, record, 0).is_ok());
+        assert!(db.write_hintfile_record(&mut hf, &record, 0).is_ok());
         assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
 
         db.switch_writer_datafile().unwrap();
         assert_eq!(hf.id, 1);
         let record = DatafileRecord::new(b"2", b"2").unwrap();
-        assert!(db.write_hintfile_record(&mut hf, record, 0).is_ok());
+        assert!(db.write_hintfile_record(&mut hf, &record, 0).is_ok());
         assert_eq!(hf.id, 2);
         assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
     }
