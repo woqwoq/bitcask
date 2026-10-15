@@ -1,6 +1,9 @@
 use std::{path::PathBuf, process};
 
-use crate::{engine::BitcaskInstance, options::BitcaskOptions};
+use crate::{
+    engine::BitcaskInstance,
+    options::{BitcaskOptions, DatafileMaxSize},
+};
 
 mod datafile;
 mod engine;
@@ -11,27 +14,17 @@ mod options;
 mod record;
 
 fn main() {
-    match BitcaskInstance::open(PathBuf::from("db"), BitcaskOptions::default()) {
+    let options = BitcaskOptions::default()
+        .merge_dead_space_threshold_percent(70)
+        .merge_dead_space_min_bytes(50000)
+        .datafile_max_size(DatafileMaxSize::SoftCappedBytes(64 * 1024 * 1024));
+
+    const ENTRY_COUNT: usize = 40000;
+
+    match BitcaskInstance::open(PathBuf::from("db"), options) {
         Ok(mut db) => {
-            for i in 0..2000u32 {
+            for i in 0..ENTRY_COUNT as u32 {
                 db.put(&i.to_be_bytes(), format!("{i}").as_bytes()).unwrap();
-            }
-
-            for i in 0..2000u32 {
-                if db.get(&i.to_be_bytes()).unwrap().unwrap()
-                    != Box::from(format!("{i}").as_bytes())
-                {
-                    println!("Miss: {}", i);
-                }
-            }
-
-            for i in 1800..2000u32 {
-                db.remove(&i.to_be_bytes()).unwrap();
-            }
-
-            println!("Writer:\n{}\n Readers:\n", db.writer);
-            for (_, df) in db.readers {
-                println!("{df}\n");
             }
         }
         Err(e) => {

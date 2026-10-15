@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub struct MergeTracker {
+    pub active: bool,
     pub bytes_written: u64,
     pub dead_bytes_written: u64,
 }
@@ -27,17 +28,22 @@ pub struct MergeTracker {
 impl MergeTracker {
     pub fn new() -> Self {
         Self {
+            active: true,
             bytes_written: 0,
             dead_bytes_written: 0,
         }
     }
 
     pub fn write(&mut self, size: u64) {
-        self.bytes_written += size;
+        if self.active {
+            self.bytes_written += size;
+        }
     }
 
     pub fn remove(&mut self, size: u64) {
-        self.dead_bytes_written += size;
+        if self.active {
+            self.dead_bytes_written += size;
+        }
     }
 
     pub fn reset(&mut self) {
@@ -46,7 +52,8 @@ impl MergeTracker {
     }
 
     pub fn should_merge(&self, options: &BitcaskOptions) -> bool {
-        if self.bytes_written != 0
+        if self.active
+            && self.bytes_written != 0
             && (self.dead_bytes_written * 100 / self.bytes_written) as u8
                 > options.merge_dead_space_threshold_percent
             && self.dead_bytes_written > options.merge_dead_space_threshold_bytes
@@ -278,10 +285,6 @@ impl BitcaskInstance {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
-        if self.merge_tracker.should_merge(&self.options) {
-            self.merge()?; // Will also provide a fresh new writer
-        }
-
         let _ = self.write_datafile_record(&DatafileRecord::new(key, value)?)?;
 
         Ok(())
@@ -355,10 +358,6 @@ impl BitcaskInstance {
 
     pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
         if self.keydir.contains(key) {
-            if self.merge_tracker.should_merge(&self.options) {
-                self.merge()?; // Will also provide a fresh new writer
-            }
-
             self.write_datafile_record(&DatafileRecord::new_tombstone(key)?)?;
         }
 
@@ -424,6 +423,11 @@ impl BitcaskInstance {
     }
 
     fn switch_writer_datafile(&mut self) -> Result<(), BitcaskError> {
+        if self.merge_tracker.should_merge(&self.options) {
+            self.merge()?; // Will also provide a fresh new writer
+            return Ok(());
+        }
+
         self.writer.demote_to_reader();
 
         let old_writer = &mut self.writer;
@@ -443,6 +447,8 @@ impl BitcaskInstance {
     }
 
     pub fn merge(&mut self) -> Result<(), BitcaskError> {
+        self.merge_tracker.reset();
+        self.merge_tracker.active = false;
         self.switch_writer_datafile()?; // Lock the latest writer
 
         let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
@@ -496,12 +502,11 @@ impl BitcaskInstance {
             }
         }
 
+        hf.sync()?; // Sync the final hintfile
         self.remove_old_readers_post_merge(candidate_ids)?;
-
-        self.merge_tracker.reset();
         self.switch_writer_datafile()?; // Seal the last writer to avoid inconsistencies between
         // hintfile and datafile
-
+        self.merge_tracker.active = true;
         Ok(())
     }
 

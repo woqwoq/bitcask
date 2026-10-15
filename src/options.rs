@@ -98,7 +98,7 @@ impl BitcaskOptions {
         self.datafile_max_size = new;
         self
     }
-    pub fn merge_dead_space_threshold(mut self, new: u8) -> Self {
+    pub fn merge_dead_space_threshold_percent(mut self, new: u8) -> Self {
         self.merge_dead_space_threshold_percent = new;
         self
     }
