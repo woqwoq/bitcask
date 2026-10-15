@@ -1,17 +1,9 @@
 use std::{path::PathBuf, process};
 
-use crate::{
+use bitcask::{
     engine::BitcaskInstance,
     options::{BitcaskOptions, DatafileMaxSize},
 };
-
-mod datafile;
-mod engine;
-mod error;
-mod hint;
-mod keydir;
-mod options;
-mod record;
 
 fn main() {
     let options = BitcaskOptions::default()

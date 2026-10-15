@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ahash = "0.8.12"
 crc32fast = "1.5.2"
 lru = "0.18.5"
 

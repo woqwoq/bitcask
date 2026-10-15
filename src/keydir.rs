@@ -1,4 +1,6 @@
-use std::{collections::HashMap, fmt::Display};
+use std::fmt::Display;
+
+use ahash::AHashMap;
 
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
 #[derive(Debug, PartialEq, Clone)]
@@ -21,14 +23,14 @@ impl KeyDirEntry {
 }
 
 pub struct KeyDir {
-    dir: HashMap<Box<[u8]>, KeyDirEntry>, // We are using Box<[u8]> instead of a vector to save 8
-                                          // bytes per key on the `capacity` field that vector would store
+    dir: AHashMap<Box<[u8]>, KeyDirEntry>, // We are using Box<[u8]> instead of a vector to save 8
+                                           // bytes per key on the `capacity` field that vector would store
 }
 
 impl KeyDir {
     pub fn new() -> Self {
         KeyDir {
-            dir: HashMap::new(),
+            dir: AHashMap::new(),
         }
     }
 
