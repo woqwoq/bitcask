@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Error, IoSlice, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
@@ -196,13 +196,36 @@ impl Datafile {
         Ok(start_offset)
     }
 
+    fn write_all_vectored<W: Write>(
+        writer: &mut W,
+        mut bufs: &mut [IoSlice<'_>],
+    ) -> Result<(), DatafileError> {
+        IoSlice::advance_slices(&mut bufs, 0);
+        while !bufs.is_empty() {
+            match writer.write_vectored(bufs) {
+                Ok(0) => {
+                    return Err(DatafileError::UnexpectedEOFDuringVectoredWrite);
+                }
+                Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(DatafileError::IO(e)),
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_record_to<W: Write>(
         writer: &mut W,
         record: &DatafileRecord,
     ) -> Result<(), DatafileError> {
-        writer.write_all(&record.header.encode())?;
-        writer.write_all(&record.key)?;
-        writer.write_all(&record.value)?;
+        let header = &record.header.encode();
+        let bufs = &mut [
+            IoSlice::new(header),
+            IoSlice::new(&record.key),
+            IoSlice::new(&record.value),
+        ];
+
+        Self::write_all_vectored(writer, bufs)?;
 
         Ok(())
     }

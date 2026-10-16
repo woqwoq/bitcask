@@ -111,7 +111,7 @@ fn db_put_delegate(
 }
 
 fn keydir_insertion(c: &mut Criterion) {
-    let sample_sizes = [10_000usize, 50_000, 10_0000];
+    let sample_sizes = [10_000usize, 50_000, 100_000];
 
     let mut group = c.benchmark_group("keydir_insertion");
 
@@ -127,7 +127,7 @@ fn keydir_insertion(c: &mut Criterion) {
 }
 
 fn keydir_get(c: &mut Criterion) {
-    let sample_sizes = [10_000usize, 50_000, 10_0000];
+    let sample_sizes = [10_000usize, 50_000, 100_000];
 
     let mut group = c.benchmark_group("keydir_get");
 
@@ -143,9 +143,9 @@ fn keydir_get(c: &mut Criterion) {
 }
 
 fn db_put_no_sync(c: &mut Criterion) {
-    let operation_counts = vec![10_000usize, 50_000, 10_0000];
+    let operation_counts = vec![10_000usize, 50_000, 100_000];
     let ksz = 4usize;
-    let vsz = 8usize;
+    let vsz = 512usize;
 
     let options = BitcaskOptions::default()
         .datafile_max_size(DatafileMaxSize::SoftCappedBytes(GB))
