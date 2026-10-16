@@ -143,24 +143,16 @@ fn keydir_get(c: &mut Criterion) {
 }
 
 fn db_put_no_sync(c: &mut Criterion) {
-    let operation_counts = vec![10_000usize, 50_000, 100_000];
+    let operation_counts = vec![10_000usize, 50_000, 100_000, 1_000_000];
     let ksz = 4usize;
-    let vsz = 512usize;
+    let vsz = KB;
 
     let options = BitcaskOptions::default()
         .datafile_max_size(DatafileMaxSize::SoftCappedBytes(GB))
         .merge_dead_space_min_bytes(GB as u64)
         .sync_frequency(SyncFrequency::Never);
 
-    db_put_delegate(
-        options,
-        "db_put_no_sync",
-        100,
-        operation_counts,
-        ksz,
-        vsz,
-        c,
-    );
+    db_put_delegate(options, "db_put_no_sync", 10, operation_counts, ksz, vsz, c);
 }
 
 criterion_group!(benches, keydir_insertion, keydir_get, db_put_no_sync);

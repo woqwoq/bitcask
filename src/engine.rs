@@ -290,6 +290,8 @@ impl BitcaskInstance {
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
+        self.writer.flush()?;
+
         if let Some(keydir_entry) = self.keydir.get(key) {
             let reader = if self.writer.id == keydir_entry.file_id {
                 &self.writer
@@ -418,6 +420,8 @@ impl BitcaskInstance {
     }
 
     fn switch_writer_datafile(&mut self) -> Result<(), BitcaskError> {
+        self.writer.flush()?;
+
         if self.merge_tracker.should_merge(&self.options) {
             self.merge()?; // Will also provide a fresh new writer
             return Ok(());
@@ -736,6 +740,7 @@ mod tests {
             let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
 
             assert!(db.put(key.as_bytes(), &value.to_be_bytes()).is_ok());
+            db.writer.flush().unwrap();
 
             let mut expected_bytes = Vec::new();
             Datafile::write_record_to(&mut expected_bytes, &datafile_record).unwrap();
@@ -882,6 +887,8 @@ mod tests {
             let mut missed_reader =
                 Datafile::new_writer(&db.dir, 3, &db.options.datafile_extension).unwrap();
             assert!(missed_reader.append_record(&record).is_ok());
+            missed_reader.flush().unwrap();
+
             missed_reader.is_writer = false;
 
             // Prepare KeyDir to store a mapping of the key to the file that isn't present in LRU
@@ -1517,7 +1524,9 @@ mod tests {
             const ENTRY_SIZE: usize = DATAFILE_HEADER_SIZE_BYTES + 4 + 4;
 
             let options = BitcaskOptions::default()
+                .merge_dead_space_threshold_percent(40)
                 .merge_dead_space_min_bytes((ENTRY_COUNT * ENTRY_SIZE) as u64 - 1u64);
+
             let mut db = BitcaskInstance::open(
                 temp_dir.path().to_path_buf(),
                 BitcaskOptions::default().clone(),

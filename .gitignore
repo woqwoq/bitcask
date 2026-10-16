@@ -1,3 +1,5 @@
 /target
 db/
 profile.json.gz
+profile_log/
+.DS_Store

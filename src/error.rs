@@ -93,6 +93,7 @@ pub enum DatafileError {
     TornWrite,
     TruncateFailure(Error),
     UnexpectedEOFDuringVectoredWrite,
+    UnexpectedEOFDuringBufferedWrite(Error),
 }
 
 impl From<Error> for DatafileError {
@@ -164,6 +165,9 @@ impl fmt::Display for DatafileError {
             }
             DatafileError::UnexpectedEOFDuringVectoredWrite => {
                 write!(f, "unexpected EOF during a vectored write")
+            }
+            DatafileError::UnexpectedEOFDuringBufferedWrite(e) => {
+                write!(f, "unexpected EOF during a buffered write: {e}")
             }
         }
     }

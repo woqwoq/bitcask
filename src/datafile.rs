@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{Error, IoSlice, Write},
+    io::{BufWriter, IoSlice, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
@@ -9,17 +9,17 @@ use std::{
 use crate::{
     error::DatafileError,
     keydir::KeyDir,
-    options::{DatafileMaxSize, SyncMode},
+    options::{DatafileMaxSize, KB, SyncMode},
     record::{
         DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
         DatafileRecord, DatafileRecordHeader,
     },
 };
 
-pub const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 4096;
+pub const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 4 * KB;
 
 pub struct Datafile {
-    file: File,
+    file: BufWriter<File>,
     pub id: u32,
     pub offset: u64,
     pub is_writer: bool,
@@ -40,7 +40,7 @@ impl Datafile {
             .open(filename)?;
 
         Ok(Datafile {
-            file,
+            file: BufWriter::with_capacity(8 * KB, file),
             id,
             offset: 0,
             is_writer: true,
@@ -66,7 +66,7 @@ impl Datafile {
             .open(filename)?;
 
         Ok(Datafile {
-            file,
+            file: BufWriter::new(file),
             id,
             offset,
             is_writer,
@@ -100,7 +100,7 @@ impl Datafile {
     }
 
     pub fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
-        let file_size = self.file.metadata().unwrap().len();
+        let file_size = self.file.get_ref().metadata().unwrap().len();
         let mut start_offset = 0;
 
         while start_offset < file_size {
@@ -127,7 +127,7 @@ impl Datafile {
                 let to_read = DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES
                     .min(header.value_size as usize - value_bytes_read);
 
-                let bytes = self.file.read_at(
+                let bytes = self.file.get_ref().read_at(
                     &mut value_buffer[..to_read],
                     start_offset
                         + DATAFILE_HEADER_SIZE_BYTES as u64
@@ -176,6 +176,7 @@ impl Datafile {
 
     pub fn truncate(&mut self, new_size: u64) -> Result<(), DatafileError> {
         self.file
+            .get_ref()
             .set_len(new_size)
             .map_err(DatafileError::TruncateFailure)
     }
@@ -191,7 +192,8 @@ impl Datafile {
         self.move_writer_offset(record.size()? as u64)?;
 
         // Commit
-        Self::write_record_to(&mut self.file, record)?;
+        // Self::write_record_to(self.file.get_mut(), record)?;
+        self.write_buffered(record)?;
 
         Ok(start_offset)
     }
@@ -211,6 +213,25 @@ impl Datafile {
                 Err(e) => return Err(DatafileError::IO(e)),
             }
         }
+        Ok(())
+    }
+
+    fn write_buffered(&mut self, record: &DatafileRecord) -> Result<(), DatafileError> {
+        self.file
+            .write_all(&record.header.encode())
+            .map_err(DatafileError::UnexpectedEOFDuringBufferedWrite)?;
+        self.file
+            .write_all(&record.key)
+            .map_err(DatafileError::UnexpectedEOFDuringBufferedWrite)?;
+        self.file
+            .write_all(&record.value)
+            .map_err(DatafileError::UnexpectedEOFDuringBufferedWrite)?;
+
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), DatafileError> {
+        self.file.flush()?;
         Ok(())
     }
 
@@ -252,9 +273,11 @@ impl Datafile {
     }
 
     pub fn sync(&mut self, mode: &SyncMode) -> Result<(), DatafileError> {
+        self.file.flush()?;
+
         match mode {
-            SyncMode::SyncAll => self.file.sync_all(),
-            SyncMode::SyncData => self.file.sync_data(),
+            SyncMode::SyncAll => self.file.get_ref().sync_all(),
+            SyncMode::SyncData => self.file.get_ref().sync_data(),
         }
         .map_err(DatafileError::SyncError)
     }
@@ -273,7 +296,7 @@ impl Datafile {
     pub fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, DatafileError> {
         let mut buf = vec![0u8; count];
 
-        self.file.read_exact_at(&mut buf, offset)?;
+        self.file.get_ref().read_exact_at(&mut buf, offset)?;
 
         Ok(Box::from(buf))
     }
@@ -287,7 +310,7 @@ impl Datafile {
     }
 
     fn file_size(&self) -> Result<u64, DatafileError> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file.get_ref().metadata()?.len())
     }
 }
 
@@ -395,6 +418,7 @@ mod tests {
             let record_size = datafile_record.size().unwrap();
 
             let offset = df.append_record(&datafile_record).unwrap();
+            df.flush().unwrap();
             assert_eq!(offset, 0);
             assert_eq!(df.offset, record_size as u64);
 
