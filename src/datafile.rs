@@ -188,12 +188,12 @@ impl Datafile {
 
         let start_offset = self.offset;
 
-        // Move offset, so first so we fail-fast before we commit the transaction
-        self.move_writer_offset(record.size()? as u64)?;
-
         // Commit
         // Self::write_record_to(self.file.get_mut(), record)?;
         self.write_buffered(record)?;
+
+        // Move internal writer offset
+        self.move_writer_offset(record.size()? as u64)?;
 
         Ok(start_offset)
     }
@@ -309,7 +309,7 @@ impl Datafile {
         dir.join(format!("{:08}.{}", file_id, datafile_extension))
     }
 
-    fn file_size(&self) -> Result<u64, DatafileError> {
+    pub fn file_size(&self) -> Result<u64, DatafileError> {
         Ok(self.file.get_ref().metadata()?.len())
     }
 }

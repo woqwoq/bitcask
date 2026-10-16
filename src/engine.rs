@@ -107,7 +107,7 @@ impl BitcaskRecoveryHandler {
             RecoveryMode::TolerateCorruptedTailRecords => {
                 if !is_last {
                     // Failure in non-last datafiles is fatal
-                    return Err(BitcaskError::FatalReplayFailure(error));
+                    return Err(BitcaskError::FatalDatafileReplayFailure(error));
                 }
 
                 df = Self::reopen_reader_for_recovery(dir, options, df)?;
@@ -118,20 +118,30 @@ impl BitcaskRecoveryHandler {
                         if e.kind() == ErrorKind::UnexpectedEof {
                             df.truncate(df.offset)?
                         } else {
-                            return Err(BitcaskError::FatalReplayFailure(DatafileError::IO(e)));
+                            return Err(BitcaskError::FatalDatafileReplayFailure(
+                                DatafileError::IO(e),
+                            ));
                         }
                     }
                     DatafileError::CrcMismatch => df.truncate(df.offset)?,
-                    e => return Err(BitcaskError::FatalReplayFailure(e)),
+                    e => return Err(BitcaskError::FatalDatafileReplayFailure(e)),
                 }
                 Ok(df)
             }
-            RecoveryMode::AbsoluteConsistency => Err(BitcaskError::FatalReplayFailure(error)),
+            RecoveryMode::AbsoluteConsistency => {
+                Err(BitcaskError::FatalDatafileReplayFailure(error))
+            }
         }
     }
 
-    pub fn recover_post_hf_replay_failure(_e: HintfileError) {
-        todo!()
+    pub fn recover_post_hf_replay_failure(
+        e: HintfileError,
+        options: &BitcaskOptions,
+    ) -> Result<(), BitcaskError> {
+        match options.recovery_mode {
+            RecoveryMode::AbsoluteConsistency => Err(BitcaskError::FatalHintfileReplayFailure(e)),
+            RecoveryMode::TolerateCorruptedTailRecords => Ok(()),
+        }
     }
 }
 
@@ -144,7 +154,7 @@ impl BitcaskStartupHandler {
         df: Datafile,
     ) -> Result<Datafile, DatafileError> {
         let id = df.id;
-        let offset = df.offset;
+        let offset = df.file_size()?;
         drop(df);
         Datafile::open_datafile_as_writer(dir, id, offset, &options.datafile_extension)
     }
@@ -194,19 +204,24 @@ impl BitcaskStartupHandler {
             let is_last = Some(id) == last;
             let mut df = Datafile::open_reader(dir, id, &options.datafile_extension)?;
 
-            match Hintfile::open_if_exists(dir, id, &options.hintfile_extension)? {
-                Some(hf) => {
-                    if let Err(e) = hf.replay(keydir) {
-                        BitcaskRecoveryHandler::recover_post_hf_replay_failure(e);
-                    }
-                }
-                None => {
-                    if let Err(e) = df.replay(keydir) {
-                        df = BitcaskRecoveryHandler::recover_post_df_replay_failure(
-                            dir, options, df, e, is_last,
-                        )?;
-                    }
-                }
+            let hint_entries_read =
+                match Hintfile::open_if_exists(dir, id, &options.hintfile_extension)? {
+                    Some(hf) => match hf.replay(keydir) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            BitcaskRecoveryHandler::recover_post_hf_replay_failure(e, options)?;
+                            0
+                        }
+                    },
+                    None => 0,
+                };
+
+            if hint_entries_read == 0
+                && let Err(e) = df.replay(keydir)
+            {
+                df = BitcaskRecoveryHandler::recover_post_df_replay_failure(
+                    dir, options, df, e, is_last,
+                )?;
             }
 
             if is_last {
@@ -1241,7 +1256,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(BitcaskError::FatalReplayFailure(
+                Err(BitcaskError::FatalDatafileReplayFailure(
                     DatafileError::UnexpectedDatafileRecordType
                 ))
             ));
@@ -1250,6 +1265,79 @@ mod tests {
                 std::fs::metadata(datafile_path(dir, 1)).unwrap().len(),
                 good_len + bytes.len() as u64
             );
+        }
+
+        #[test]
+        fn replay_fallback_to_datafile_when_hf_empty() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let options = BitcaskOptions::default();
+
+            // Create database with 2 entries, create a hintfile for the writer
+            {
+                let mut db =
+                    BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+
+                db.put(b"1", b"1").unwrap();
+                db.put(b"2", b"2").unwrap();
+
+                Hintfile::new_or_open_existing(
+                    temp_dir.path(),
+                    db.writer.id,
+                    &options.hintfile_extension,
+                )
+                .unwrap();
+            }
+
+            // Verify the database has the 2 entries even though the hintfile was empty
+            // Perform merge (append 2 records from above to hintfile), reopen hintfile and add a fake record
+            {
+                let mut db =
+                    BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+
+                assert_eq!(db.writer.id, 2);
+                assert_eq!(db.len(), 2);
+
+                db.merge().unwrap(); // Writes the values to the hintfile
+
+                let mut hf = Hintfile::new_or_open_existing(
+                    temp_dir.path(),
+                    db.writer.id,
+                    &options.hintfile_extension,
+                )
+                .unwrap();
+
+                hf.append_hint_record(&DatafileRecord::new(b"3", b"3").unwrap(), 0)
+                    .unwrap();
+            }
+
+            // Reopen database and verify all records were loaded from hintfile (fake one should be
+            // present)
+            let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+            assert_eq!(db.writer.id, 5);
+            assert_eq!(db.len(), 3);
+        }
+
+        #[test]
+        fn reopen_datafile_as_writer_opens_with_offset_set() {
+            let options = BitcaskOptions::default();
+            let temp_dir = tempfile::tempdir().unwrap();
+
+            {
+                let mut df =
+                    Datafile::new_writer(temp_dir.path(), 1, &options.datafile_extension).unwrap();
+
+                df.append_record(&DatafileRecord::new(b"1", b"1").unwrap())
+                    .unwrap();
+            }
+
+            let df =
+                Datafile::open_reader(temp_dir.path(), 1, &options.datafile_extension).unwrap();
+
+            let df =
+                BitcaskStartupHandler::reopen_datafile_as_writer(temp_dir.path(), &options, df)
+                    .unwrap();
+
+            assert_eq!(df.offset, df.file_size().unwrap());
         }
     }
 

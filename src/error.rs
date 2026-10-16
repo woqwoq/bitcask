@@ -13,7 +13,8 @@ pub enum BitcaskError {
     DatafileNameError(ParseIntError),
     PathIsFile,
     RecordLargerThanMaxDatafileSize(usize),
-    FatalReplayFailure(DatafileError),
+    FatalDatafileReplayFailure(DatafileError),
+    FatalHintfileReplayFailure(HintfileError),
 }
 
 impl From<HintfileError> for BitcaskError {
@@ -68,9 +69,14 @@ impl fmt::Display for BitcaskError {
                 f,
                 "record of {size} bytes is larger than the maximum datafile size and cannot be written"
             ),
-            BitcaskError::FatalReplayFailure(e) => write!(
+            BitcaskError::FatalDatafileReplayFailure(e) => write!(
                 f,
                 "fatal error while replaying datafiles during startup: {e}"
+            ),
+            BitcaskError::FatalHintfileReplayFailure(e) => write!(
+                // TODO: Add display for HintfileError
+                f,
+                "fatal error while replaying hintfiles during startup: {e:?}"
             ),
         }
     }
@@ -178,6 +184,8 @@ pub enum HintfileError {
     IO(Error),
     SliceConversion(TryFromSliceError),
     OversizedHintfileRecord,
+    UndersizedHintfileHeader(usize),
+    UndersizedHintfileKey { actual: usize, expected: usize },
     CrcMismatch,
 }
 

@@ -77,6 +77,10 @@ impl HintfileRecordHeader {
     }
 
     pub(crate) fn decode(buf: &[u8]) -> Result<Self, HintfileError> {
+        if HINTFILE_RECORD_HEADER_SIZE_BYTES > buf.len() {
+            return Err(HintfileError::UndersizedHintfileHeader(buf.len()));
+        }
+
         let crc: [u8; HINTFILE_HEADER_CRC_SIZE_BYTES] = buf[0..4].try_into()?;
         let timestamp: [u8; HINTFILE_HEADER_TIMESTAMP_SIZE_BYTES] = buf[4..12].try_into()?;
         let key_size: [u8; HINTFILE_HEADER_KEY_SIZE_SIZE_BYTES] = buf[12..16].try_into()?;
@@ -127,7 +131,18 @@ impl HintfileRecord {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, HintfileError> {
+        let hintfile_size = bytes.len() as u64;
         let header = HintfileRecordHeader::decode(bytes)?;
+
+        let expected_datafile_size_with_key =
+            HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + u64::from(header.key_size);
+
+        if expected_datafile_size_with_key > hintfile_size {
+            return Err(HintfileError::UndersizedHintfileKey {
+                expected: expected_datafile_size_with_key as usize,
+                actual: hintfile_size as usize,
+            });
+        }
 
         let key = &bytes[HINTFILE_RECORD_HEADER_SIZE_BYTES
             ..HINTFILE_RECORD_HEADER_SIZE_BYTES + header.key_size as usize];

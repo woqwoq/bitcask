@@ -185,8 +185,8 @@ impl DatafileRecord {
             });
         }
 
-        let key_bytes: Box<[u8]> =
-            Box::from(&bytes[DATAFILE_HEADER_SIZE_BYTES..expected_datafile_size_with_key as usize]);
+        let key_bytes =
+            &bytes[DATAFILE_HEADER_SIZE_BYTES..expected_datafile_size_with_key as usize];
 
         let expected_datafile_size_with_kv =
             expected_datafile_size_with_key + u64::from(header.value_size);
@@ -197,10 +197,8 @@ impl DatafileRecord {
             });
         }
 
-        let value_bytes: Box<[u8]> = Box::from(
-            &bytes
-                [expected_datafile_size_with_key as usize..expected_datafile_size_with_kv as usize],
-        );
+        let value_bytes = &bytes
+            [expected_datafile_size_with_key as usize..expected_datafile_size_with_kv as usize];
 
         if header.crc
             != DatafileRecordHeader::get_crc_for(
@@ -208,8 +206,8 @@ impl DatafileRecord {
                 header.timestamp,
                 header.key_size,
                 header.value_size,
-                &key_bytes,
-                &value_bytes,
+                key_bytes,
+                value_bytes,
             )
         {
             return Err(DatafileError::CrcMismatch);
@@ -217,8 +215,8 @@ impl DatafileRecord {
 
         Ok(Self {
             header,
-            key: key_bytes,
-            value: value_bytes,
+            key: Box::from(key_bytes),
+            value: Box::from(value_bytes),
         })
     }
 }
