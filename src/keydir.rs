@@ -27,6 +27,12 @@ pub struct KeyDir {
                                            // bytes per key on the `capacity` field that vector would store
 }
 
+impl Default for KeyDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyDir {
     pub fn new() -> Self {
         KeyDir {
@@ -103,13 +109,13 @@ mod tests {
 
     #[test]
     fn new_is_empty() {
-        let keydir = KeyDir::new();
+        let keydir = KeyDir::default();
         assert_eq!(keydir.len(), 0);
     }
 
     #[test]
     fn put_then_get() {
-        let mut keydir = KeyDir::new();
+        let mut keydir = KeyDir::default();
         assert_eq!(keydir.len(), 0);
 
         let key = "hello world".as_bytes();

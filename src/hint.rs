@@ -9,7 +9,7 @@ use crc32fast::Hasher;
 
 use crate::{datafile::Datafile, error::HintfileError, keydir::KeyDir, record::DatafileRecord};
 
-pub const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
+pub(crate) const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
 
 const HINTFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
 const HINTFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
@@ -18,16 +18,16 @@ const HINTFILE_HEADER_VALUE_SIZE_SIZE_BYTES: usize = 4;
 const HINTFILE_HEADER_VALUE_OFFSET_SIZE_BYTES: usize = 8;
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct HintfileRecordHeader {
-    pub crc: u32,          // CRC32 of all fields below
-    pub timestamp: u64,    // UNIX Timestamp of the original entry
-    pub key_size: u32,     // Size of the key in bytes
-    pub value_size: u32,   // Size of the value in bytes
-    pub value_offset: u64, // Offset of the value in the source datafile
+pub(crate) struct HintfileRecordHeader {
+    pub(crate) crc: u32,          // CRC32 of all fields below
+    pub(crate) timestamp: u64,    // UNIX Timestamp of the original entry
+    pub(crate) key_size: u32,     // Size of the key in bytes
+    pub(crate) value_size: u32,   // Size of the value in bytes
+    pub(crate) value_offset: u64, // Offset of the value in the source datafile
 }
 
 impl HintfileRecordHeader {
-    pub fn from_datafile_record(record: &DatafileRecord, value_offset: u64) -> Self {
+    pub(crate) fn from_datafile_record(record: &DatafileRecord, value_offset: u64) -> Self {
         let crc = Self::crc_for(
             record.header.timestamp,
             record.header.key_size,
@@ -63,7 +63,7 @@ impl HintfileRecordHeader {
         hasher.finalize()
     }
 
-    pub fn encode(&self) -> [u8; HINTFILE_RECORD_HEADER_SIZE_BYTES] {
+    pub(crate) fn encode(&self) -> [u8; HINTFILE_RECORD_HEADER_SIZE_BYTES] {
         let mut arr: [u8; HINTFILE_RECORD_HEADER_SIZE_BYTES] =
             [0; HINTFILE_RECORD_HEADER_SIZE_BYTES];
 
@@ -76,7 +76,7 @@ impl HintfileRecordHeader {
         arr
     }
 
-    pub fn decode(buf: &[u8]) -> Result<Self, HintfileError> {
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self, HintfileError> {
         let crc: [u8; HINTFILE_HEADER_CRC_SIZE_BYTES] = buf[0..4].try_into()?;
         let timestamp: [u8; HINTFILE_HEADER_TIMESTAMP_SIZE_BYTES] = buf[4..12].try_into()?;
         let key_size: [u8; HINTFILE_HEADER_KEY_SIZE_SIZE_BYTES] = buf[12..16].try_into()?;
@@ -92,7 +92,7 @@ impl HintfileRecordHeader {
         })
     }
 
-    pub fn crc(&self) -> Hasher {
+    pub(crate) fn crc(&self) -> Hasher {
         let mut hasher = Hasher::new();
 
         hasher.update(&self.timestamp.to_be_bytes());
@@ -103,7 +103,7 @@ impl HintfileRecordHeader {
         hasher
     }
 
-    pub fn size(&self) -> Result<usize, HintfileError> {
+    pub(crate) fn size(&self) -> Result<usize, HintfileError> {
         let size = u64::from(self.key_size)
             .checked_add(HINTFILE_RECORD_HEADER_SIZE_BYTES as u64)
             .ok_or(HintfileError::OversizedHintfileRecord)?;
@@ -113,20 +113,20 @@ impl HintfileRecordHeader {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct HintfileRecord {
-    pub header: HintfileRecordHeader, // Header
-    pub key: Box<[u8]>,               // The actual key
+pub(crate) struct HintfileRecord {
+    pub(crate) header: HintfileRecordHeader, // Header
+    pub(crate) key: Box<[u8]>,               // The actual key
 }
 
 impl HintfileRecord {
-    pub fn from_datafile_record(df_record: &DatafileRecord, value_offset: u64) -> Self {
+    pub(crate) fn from_datafile_record(df_record: &DatafileRecord, value_offset: u64) -> Self {
         Self {
             header: HintfileRecordHeader::from_datafile_record(df_record, value_offset),
             key: df_record.key.clone(),
         }
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, HintfileError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, HintfileError> {
         let header = HintfileRecordHeader::decode(bytes)?;
 
         let key = &bytes[HINTFILE_RECORD_HEADER_SIZE_BYTES
@@ -139,13 +139,13 @@ impl HintfileRecord {
     }
 }
 
-pub struct Hintfile {
+pub(crate) struct Hintfile {
     file: File,
-    pub id: u32,
+    pub(crate) id: u32,
 }
 
 impl Hintfile {
-    pub fn new_or_open_existing(
+    pub(crate) fn new_or_open_existing(
         dir: &Path,
         id: u32,
         hintfile_extension: &str,
@@ -161,7 +161,7 @@ impl Hintfile {
         Ok(Self { file, id })
     }
 
-    pub fn replay(&self, keydir: &mut KeyDir) -> Result<usize, HintfileError> {
+    pub(crate) fn replay(&self, keydir: &mut KeyDir) -> Result<usize, HintfileError> {
         let mut start_offset = 0;
         let fsz = self.file_size()?;
         let mut count: usize = 0;
@@ -199,7 +199,7 @@ impl Hintfile {
         Ok(count)
     }
 
-    pub fn open_if_exists(
+    pub(crate) fn open_if_exists(
         dir: &Path,
         id: u32,
         hintfile_extension: &str,
@@ -218,7 +218,8 @@ impl Hintfile {
 
         Ok(Some(Self { file, id }))
     }
-    pub fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
+
+    fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
         let mut buf = vec![0u8; count];
 
         self.file.read_exact_at(&mut buf, offset)?;
@@ -226,7 +227,7 @@ impl Hintfile {
         Ok(Box::from(buf))
     }
 
-    pub fn append_hint_record(
+    pub(crate) fn append_hint_record(
         &mut self,
         df_record: &DatafileRecord,
         value_offset: u64,
@@ -253,23 +254,23 @@ impl Hintfile {
         Ok(())
     }
 
-    pub fn file_size(&self) -> Result<u64, HintfileError> {
+    pub(crate) fn file_size(&self) -> Result<u64, HintfileError> {
         Ok(self.file.metadata()?.len())
     }
 
-    pub fn sync(&mut self) -> Result<(), HintfileError> {
+    pub(crate) fn sync(&mut self) -> Result<(), HintfileError> {
         self.file.sync_data().map_err(HintfileError::IO)
     }
 }
 
-pub struct HintfileIterator<'a> {
+pub(crate) struct HintfileIterator<'a> {
     hintfile: &'a Hintfile,
     fsz: u64,
     offset: u64,
 }
 
 impl<'a> HintfileIterator<'a> {
-    pub fn new(hintfile: &'a Hintfile) -> Result<Self, HintfileError> {
+    pub(crate) fn new(hintfile: &'a Hintfile) -> Result<Self, HintfileError> {
         let fsz = hintfile.file_size()?;
         Ok(Self {
             hintfile,
@@ -278,7 +279,7 @@ impl<'a> HintfileIterator<'a> {
         })
     }
 
-    pub fn next_record(&mut self) -> Result<Option<HintfileRecord>, HintfileError> {
+    pub(crate) fn next_record(&mut self) -> Result<Option<HintfileRecord>, HintfileError> {
         if self.offset >= self.fsz {
             return Ok(None);
         }
@@ -478,7 +479,7 @@ mod test {
         fn replay() {
             let temp_dir = tempfile::tempdir().unwrap();
             let mut records: Vec<HintfileRecord> = Vec::new();
-            let mut keydir = KeyDir::new();
+            let mut keydir = KeyDir::default();
 
             assert!(
                 Hintfile::open_if_exists(temp_dir.path(), 2, HINTFILE_EXTENSION)

@@ -7,41 +7,26 @@ pub const DEFAULT_DATAFILE_SIZE_BYTES: usize = 10000;
 pub const DEFAULT_MERGE_DEAD_SPACE_PERCENT_THRESHOLD: u8 = 40;
 pub const DEFAULT_MERGE_DEAD_SPACE_BYTE_THRESHOLD: u64 = 65565;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Default)]
 pub enum RecoveryMode {
+    #[default]
     TolerateCorruptedTailRecords, // Last reader failure -> truncate until failure, or fatal
-    AbsoluteConsistency,          // Any failure -> fatal
+    AbsoluteConsistency, // Any failure -> fatal
 }
 
-impl Default for RecoveryMode {
-    fn default() -> Self {
-        Self::TolerateCorruptedTailRecords
-    }
-}
-
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Default)]
 pub enum SyncMode {
     SyncData,
+    #[default]
     SyncAll,
 }
 
-impl Default for SyncMode {
-    fn default() -> Self {
-        Self::SyncAll
-    }
-}
-
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Default)]
 pub enum SyncFrequency {
     EveryWrite,
     EveryNthWrite(usize),
+    #[default]
     Never,
-}
-
-impl Default for SyncFrequency {
-    fn default() -> Self {
-        Self::Never
-    }
 }
 
 #[derive(Clone, PartialEq)]

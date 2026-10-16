@@ -43,7 +43,7 @@ fn fill_database_from_vec(db: &mut BitcaskInstance, kv: DatabaseKVPairs) {
 }
 
 pub fn prepare_random_fill_keydir(n: usize) -> KeyDir {
-    let mut keydir = KeyDir::new();
+    let mut keydir = KeyDir::default();
     for i in 0..n {
         keydir.put(
             Box::from(i.to_be_bytes()),

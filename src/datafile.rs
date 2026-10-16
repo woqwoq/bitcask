@@ -502,7 +502,7 @@ mod tests {
             }
             let _ = df.file.rewind();
 
-            let mut keydir = KeyDir::new();
+            let mut keydir = KeyDir::default();
 
             df.replay(&mut keydir).unwrap();
 
@@ -540,7 +540,7 @@ mod tests {
 
             let _ = df.file.rewind();
 
-            let mut keydir = KeyDir::new();
+            let mut keydir = KeyDir::default();
 
             df.replay(&mut keydir).unwrap();
 
@@ -571,7 +571,7 @@ mod tests {
             );
             let _ = df.file.rewind();
 
-            let mut keydir = KeyDir::new();
+            let mut keydir = KeyDir::default();
 
             assert!(df.replay(&mut keydir).is_ok());
         }
