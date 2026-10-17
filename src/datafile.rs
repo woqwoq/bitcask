@@ -198,36 +198,8 @@ impl Datafile {
         Ok(start_offset)
     }
 
-    fn write_all_vectored<W: Write>(
-        writer: &mut W,
-        mut bufs: &mut [IoSlice<'_>],
-    ) -> Result<(), DatafileError> {
-        IoSlice::advance_slices(&mut bufs, 0);
-        while !bufs.is_empty() {
-            match writer.write_vectored(bufs) {
-                Ok(0) => {
-                    return Err(DatafileError::UnexpectedEOFDuringVectoredWrite);
-                }
-                Ok(n) => IoSlice::advance_slices(&mut bufs, n),
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(DatafileError::IO(e)),
-            }
-        }
-        Ok(())
-    }
-
     fn write_buffered(&mut self, record: &DatafileRecord) -> Result<(), DatafileError> {
-        self.file
-            .write_all(&record.header.encode())
-            .map_err(DatafileError::UnexpectedEOFDuringBufferedWrite)?;
-        self.file
-            .write_all(&record.key)
-            .map_err(DatafileError::UnexpectedEOFDuringBufferedWrite)?;
-        self.file
-            .write_all(&record.value)
-            .map_err(DatafileError::UnexpectedEOFDuringBufferedWrite)?;
-
-        Ok(())
+        Self::write_record_to(&mut self.file, record)
     }
 
     pub fn flush(&mut self) -> Result<(), DatafileError> {
@@ -239,15 +211,15 @@ impl Datafile {
         writer: &mut W,
         record: &DatafileRecord,
     ) -> Result<(), DatafileError> {
-        let header = &record.header.encode();
-        let bufs = &mut [
-            IoSlice::new(header),
-            IoSlice::new(&record.key),
-            IoSlice::new(&record.value),
-        ];
-
-        Self::write_all_vectored(writer, bufs)?;
-
+        writer
+            .write_all(&record.header.encode())
+            .map_err(DatafileError::UnexpectedEOFDuringWrite)?;
+        writer
+            .write_all(&record.key)
+            .map_err(DatafileError::UnexpectedEOFDuringWrite)?;
+        writer
+            .write_all(&record.value)
+            .map_err(DatafileError::UnexpectedEOFDuringWrite)?;
         Ok(())
     }
 

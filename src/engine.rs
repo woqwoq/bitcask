@@ -58,12 +58,20 @@ impl MergeTracker {
     }
 
     pub fn should_merge(&self, options: &BitcaskOptions) -> bool {
+        let dead = self.dead_bytes_written as u128;
+        let total = self.bytes_written as u128;
+        let threshold = options.merge_dead_space_threshold_percent as u128;
+
         if self.active
-            && self.bytes_written != 0
-            && (self.dead_bytes_written * 100 / self.bytes_written) as u8
-                > options.merge_dead_space_threshold_percent
+            && total > 0
+            && (dead * 100) > (threshold * total)
             && self.dead_bytes_written > options.merge_dead_space_threshold_bytes
         {
+            println!(
+                "Merging...\nDead: {dead}/{perc}%, Total:{total}, Threshold: {threshold}",
+                perc = (dead * 100) / total
+            );
+
             return true;
         }
 
@@ -134,6 +142,7 @@ impl BitcaskRecoveryHandler {
         }
     }
 
+    // TODO: Implement handling for TolerateCorruptedTailRecords
     pub fn recover_post_hf_replay_failure(
         e: HintfileError,
         options: &BitcaskOptions,
@@ -191,6 +200,7 @@ impl BitcaskStartupHandler {
         Ok(ids)
     }
 
+    // TODO: Increment merge tracker inside replay
     pub fn replay_and_init_readers(
         dir: &Path,
         options: &BitcaskOptions,
@@ -261,7 +271,7 @@ impl BitcaskStartupHandler {
 
 impl BitcaskInstance {
     pub fn open(dir: PathBuf, options: BitcaskOptions) -> Result<Self, BitcaskError> {
-        let mut keydir = KeyDir::default();
+        let mut keydir = KeyDir::with_capacity(options.expected_keydir_max_size);
         let mut readers: LruCache<u32, Datafile> =
             LruCache::new(NonZeroUsize::new(options.reader_lru_cache_size).unwrap());
 
@@ -305,10 +315,9 @@ impl BitcaskInstance {
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
-        self.writer.flush()?;
-
         if let Some(keydir_entry) = self.keydir.get(key) {
             let reader = if self.writer.id == keydir_entry.file_id {
+                self.writer.flush()?;
                 &self.writer
             } else if let Some(reader) = self.readers.get(&keydir_entry.file_id) {
                 reader
