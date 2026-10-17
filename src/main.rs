@@ -9,6 +9,7 @@ fn main() {
     let options = BitcaskOptions::default()
         .merge_dead_space_threshold_percent(70)
         .merge_dead_space_min_bytes((48 * MB) as u64)
+        .expected_keydir_max_size(10_000_000)
         .datafile_max_size(DatafileMaxSize::SoftCappedBytes(64 * MB));
 
     const ENTRY_COUNT: usize = 10_000_000;

@@ -1,3 +1,5 @@
+use crate::record::DATAFILE_HEADER_SIZE_BYTES;
+
 pub const KB: usize = 1024;
 pub const MB: usize = KB * KB;
 pub const GB: usize = KB * MB;
@@ -10,6 +12,8 @@ pub const DEFAULT_DATAFILE_SIZE_BYTES: usize = 10 * KB;
 
 pub const DEFAULT_MERGE_DEAD_SPACE_PERCENT_THRESHOLD: u8 = 80;
 pub const DEFAULT_MERGE_DEAD_SPACE_BYTE_THRESHOLD: u64 = (8 * KB) as u64;
+
+pub const EXPECTED_KEYDIR_MAX_SIZE: usize = 0;
 
 #[derive(Clone, PartialEq, Default)]
 pub enum RecoveryMode {
@@ -66,6 +70,7 @@ pub struct BitcaskOptions {
     pub datafile_extension: String,
     pub hintfile_extension: String,
     pub reader_lru_cache_size: usize,
+    pub expected_keydir_max_size: usize,
 }
 
 impl BitcaskOptions {
@@ -84,14 +89,28 @@ impl BitcaskOptions {
         self
     }
     pub fn datafile_max_size(mut self, new: DatafileMaxSize) -> Self {
+        if new.get_size() <= DATAFILE_HEADER_SIZE_BYTES {
+            panic!(
+                "DatafileMaxSize has to be set to a value greater than {DATAFILE_HEADER_SIZE_BYTES}"
+            )
+        }
+
         self.datafile_max_size = new;
         self
     }
     pub fn merge_dead_space_threshold_percent(mut self, new: u8) -> Self {
+        if new == 0 {
+            panic!("merge_dead_space_threshold_percent cannot be set to 0")
+        }
+
         self.merge_dead_space_threshold_percent = new;
         self
     }
     pub fn merge_dead_space_min_bytes(mut self, new: u64) -> Self {
+        if new == 0 {
+            panic!("merge_dead_space_min_bytes cannot be set to 0")
+        }
+
         self.merge_dead_space_threshold_bytes = new;
         self
     }
@@ -100,19 +119,35 @@ impl BitcaskOptions {
         self
     }
     pub fn datafile_extension(mut self, new: &str) -> Self {
+        if new.is_empty() {
+            panic!("datafile_extension cannot be empty")
+        }
+
         self.datafile_extension = new.to_string();
         self
     }
     pub fn hintfile_extension(mut self, new: &str) -> Self {
+        if new.is_empty() {
+            panic!("hintfile_extension cannot be empty")
+        }
+
         self.hintfile_extension = new.to_string();
         self
     }
     pub fn reader_lru_cache_size(mut self, new: usize) -> Self {
+        if new == 0 {
+            panic!("reader_lru_cache_size cannot be set to 0")
+        }
+
         self.reader_lru_cache_size = new;
         self
     }
     pub fn recovery_mode(mut self, new: RecoveryMode) -> Self {
         self.recovery_mode = new;
+        self
+    }
+    pub fn expected_keydir_max_size(mut self, new: usize) -> Self {
+        self.expected_keydir_max_size = new;
         self
     }
 }
@@ -130,6 +165,7 @@ impl Default for BitcaskOptions {
             datafile_extension: DEFAULT_DATAFILE_EXTENSION.to_string(),
             hintfile_extension: DEFAULT_HINTFILE_EXTENSION.to_string(),
             reader_lru_cache_size: DEFAULT_LRU_CACHED_READERS_COUNT,
+            expected_keydir_max_size: EXPECTED_KEYDIR_MAX_SIZE,
         }
     }
 }

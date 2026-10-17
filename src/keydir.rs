@@ -40,6 +40,12 @@ impl KeyDir {
         }
     }
 
+    pub fn with_capacity(n: usize) -> Self {
+        KeyDir {
+            dir: AHashMap::with_capacity(n),
+        }
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<&KeyDirEntry> {
         self.dir.get(key)
     }
