@@ -1,13 +1,15 @@
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::{BufWriter, Write},
     os::unix::fs::FileExt,
     path::Path,
 };
 
 use crc32fast::Hasher;
 
-use crate::{datafile::Datafile, error::HintfileError, keydir::KeyDir, record::DatafileRecord};
+use crate::{
+    datafile::Datafile, error::HintfileError, keydir::KeyDir, options::KB, record::DatafileRecord,
+};
 
 pub(crate) const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
 
@@ -155,7 +157,7 @@ impl HintfileRecord {
 }
 
 pub(crate) struct Hintfile {
-    file: File,
+    file: BufWriter<File>,
     pub(crate) id: u32,
 }
 
@@ -173,7 +175,10 @@ impl Hintfile {
             .create(true)
             .open(filename)?;
 
-        Ok(Self { file, id })
+        Ok(Self {
+            file: BufWriter::with_capacity(8 * KB, file),
+            id,
+        })
     }
 
     pub(crate) fn replay(&self, keydir: &mut KeyDir) -> Result<usize, HintfileError> {
@@ -231,13 +236,16 @@ impl Hintfile {
             .create(false)
             .open(filename)?;
 
-        Ok(Some(Self { file, id }))
+        Ok(Some(Self {
+            file: BufWriter::with_capacity(8 * KB, file),
+            id,
+        }))
     }
 
     fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
         let mut buf = vec![0u8; count];
 
-        self.file.read_exact_at(&mut buf, offset)?;
+        self.file.get_ref().read_exact_at(&mut buf, offset)?;
 
         Ok(Box::from(buf))
     }
@@ -270,11 +278,11 @@ impl Hintfile {
     }
 
     pub(crate) fn file_size(&self) -> Result<u64, HintfileError> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file.get_ref().metadata()?.len())
     }
 
     pub(crate) fn sync(&mut self) -> Result<(), HintfileError> {
-        self.file.sync_data().map_err(HintfileError::IO)
+        self.file.get_mut().sync_data().map_err(HintfileError::IO)
     }
 }
 
