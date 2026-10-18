@@ -284,6 +284,11 @@ impl Hintfile {
     pub(crate) fn sync(&mut self) -> Result<(), HintfileError> {
         self.file.get_mut().sync_data().map_err(HintfileError::IO)
     }
+
+    pub fn flush(&mut self) -> Result<(), HintfileError> {
+        self.file.flush()?;
+        Ok(())
+    }
 }
 
 pub(crate) struct HintfileIterator<'a> {
@@ -483,6 +488,8 @@ mod test {
                 assert!(hintfile.append_hint_record(&record, offset).is_ok());
                 offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + ksz as u64;
             }
+
+            hintfile.flush().unwrap();
 
             let mut offset = 0u64;
             for expected in records {
