@@ -206,27 +206,27 @@ impl BitcaskStartupHandler {
         options: &BitcaskOptions,
         keydir: &mut KeyDir,
         readers: &mut LruCache<u32, Datafile>,
-    ) -> Result<Option<Datafile>, BitcaskError> {
+    ) -> Result<(Option<Datafile>, u64), BitcaskError> {
         let df_ids = Self::parse_db_datafile_ids_at_path(dir, &options.datafile_extension)?;
         let last = df_ids.last().cloned();
+        let mut total_df_size = 0u64;
 
         for id in df_ids {
             let is_last = Some(id) == last;
             let mut df = Datafile::open_reader(dir, id, &options.datafile_extension)?;
 
-            let hint_entries_read =
-                match Hintfile::open_if_exists(dir, id, &options.hintfile_extension)? {
-                    Some(hf) => match hf.replay(keydir) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            BitcaskRecoveryHandler::recover_post_hf_replay_failure(e, options)?;
-                            0
-                        }
-                    },
-                    None => 0,
-                };
+            let hint_count = match Hintfile::open_if_exists(dir, id, &options.hintfile_extension)? {
+                Some(hf) => match hf.replay(keydir) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        BitcaskRecoveryHandler::recover_post_hf_replay_failure(e, options)?;
+                        0
+                    }
+                },
+                None => 0,
+            };
 
-            if hint_entries_read == 0
+            if hint_count == 0
                 && let Err(e) = df.replay(keydir)
             {
                 df = BitcaskRecoveryHandler::recover_post_df_replay_failure(
@@ -234,14 +234,16 @@ impl BitcaskStartupHandler {
                 )?;
             }
 
+            total_df_size += df.file_size()?;
+
             if is_last {
-                return Ok(Some(df));
+                return Ok((Some(df), total_df_size));
             }
 
             readers.put(id, df);
         }
 
-        Ok(None)
+        Ok((None, total_df_size))
     }
 
     pub fn create_writer_with_options(
@@ -271,16 +273,21 @@ impl BitcaskStartupHandler {
 
 impl BitcaskInstance {
     pub fn open(dir: PathBuf, options: BitcaskOptions) -> Result<Self, BitcaskError> {
+        let mut merge_tracker = MergeTracker::new();
         let mut keydir = KeyDir::with_capacity(options.expected_keydir_max_size);
         let mut readers: LruCache<u32, Datafile> =
             LruCache::new(NonZeroUsize::new(options.reader_lru_cache_size).unwrap());
 
-        let latest_datafile = BitcaskStartupHandler::replay_and_init_readers(
+        let (latest_datafile, total_df_size) = BitcaskStartupHandler::replay_and_init_readers(
             &dir,
             &options,
             &mut keydir,
             &mut readers,
         )?;
+
+        // Restore merge tracker state
+        merge_tracker.write(total_df_size);
+        merge_tracker.remove(total_df_size.saturating_sub(keydir.get_live_log_size()));
 
         let writer = BitcaskStartupHandler::create_writer_with_options(
             &dir,
@@ -294,7 +301,7 @@ impl BitcaskInstance {
             writer,
             dir,
             readers,
-            merge_tracker: MergeTracker::default(),
+            merge_tracker,
             write_count: 0,
             options,
         })
@@ -406,11 +413,10 @@ impl BitcaskInstance {
     ) -> Result<(), BitcaskError> {
         let ksz = record.header.key_size;
         let header_and_key_size = DATAFILE_HEADER_SIZE_BYTES as u32 + ksz;
-        let old_vsz = self.keydir.get(&record.key).map_or(0, |kde| kde.value_size);
 
         match record.header.record_type {
             DATAFILE_RECORD_TYPE_NORMAL => {
-                self.keydir.put(
+                let old = self.keydir.put(
                     record.key.clone(),
                     self.writer.id,
                     record.header.value_size,
@@ -418,18 +424,26 @@ impl BitcaskInstance {
                     record.header.timestamp,
                 );
 
-                if old_vsz > 0 {
+                if let Some(old_val) = old {
                     self.merge_tracker
-                        .remove(header_and_key_size as u64 + old_vsz as u64);
+                        .remove(header_and_key_size as u64 + old_val.value_size as u64); // mark old
+                    // value dead
                 }
                 self.merge_tracker
-                    .write(header_and_key_size as u64 + record.header.value_size as u64);
+                    .write(header_and_key_size as u64 + record.header.value_size as u64); // mark
+                // the new value as active
             }
             DATAFILE_RECORD_TYPE_TOMBSTONE => {
-                self.keydir.remove(&record.key);
+                let old = self.keydir.remove(&record.key);
 
-                self.merge_tracker
-                    .remove(header_and_key_size as u64 + old_vsz as u64);
+                self.merge_tracker.write(header_and_key_size as u64); // mark the tombstone written
+                self.merge_tracker.remove(header_and_key_size as u64); // mark the tombstone dead
+                // on arrival
+                if let Some(old_val) = old {
+                    self.merge_tracker
+                        .remove(header_and_key_size as u64 + old_val.value_size as u64); // mark old
+                    // value dead
+                }
             }
             _ => return Err(DatafileError::UnexpectedDatafileRecordType)?,
         }
@@ -525,6 +539,7 @@ impl BitcaskInstance {
             }
         }
 
+        hf.flush()?; // Flush the buffer
         hf.sync()?; // Sync the final hintfile
         self.remove_old_readers_post_merge(candidate_ids)?;
         self.switch_writer_datafile()?; // Seal the last writer to avoid inconsistencies between
@@ -548,6 +563,7 @@ impl BitcaskInstance {
             )?;
 
             let mut old = std::mem::replace(hf, new);
+            old.flush()?; // Flush the buffer
             old.sync()?; // Sync before releasing the handle
             drop(old); // Seal old hintfile
         }
@@ -1031,7 +1047,7 @@ mod tests {
 
             let (mut keydir, mut readers) = replay_env(dir, &options);
 
-            let latest_datafile = BitcaskStartupHandler::replay_and_init_readers(
+            let (latest_datafile, _) = BitcaskStartupHandler::replay_and_init_readers(
                 dir,
                 &options,
                 &mut keydir,
@@ -1078,7 +1094,7 @@ mod tests {
 
             let (mut keydir, mut readers) = replay_env(temp_dir.path(), &options);
 
-            let latest_datafile = BitcaskStartupHandler::replay_and_init_readers(
+            let (latest_datafile, _) = BitcaskStartupHandler::replay_and_init_readers(
                 temp_dir.path(),
                 &options,
                 &mut keydir,
@@ -1131,7 +1147,7 @@ mod tests {
 
             let (mut keydir, mut readers) = replay_env(dir, &options);
 
-            let latest_datafile = BitcaskStartupHandler::replay_and_init_readers(
+            let (latest_datafile, _) = BitcaskStartupHandler::replay_and_init_readers(
                 dir,
                 &options,
                 &mut keydir,
@@ -1295,6 +1311,8 @@ mod tests {
                     &options.hintfile_extension,
                 )
                 .unwrap();
+
+                assert_eq!(db.merge_tracker.bytes_written, (23 * 2));
             }
 
             // Verify the database has the 2 entries even though the hintfile was empty
@@ -1303,6 +1321,7 @@ mod tests {
                 let mut db =
                     BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
 
+                assert_eq!(db.merge_tracker.bytes_written, (23 * 2));
                 assert_eq!(db.writer.id, 2);
                 assert_eq!(db.len(), 2);
 
@@ -1347,6 +1366,78 @@ mod tests {
                     .unwrap();
 
             assert_eq!(df.offset, df.file_size().unwrap());
+        }
+
+        #[test]
+        fn replay_restores_merge_tracker_state() {
+            let options = BitcaskOptions::default();
+            let temp_dir = tempfile::tempdir().unwrap();
+
+            const ENTRY_COUNT: usize = 100;
+            const DEAD_ENTRY_COUNT: usize = 50;
+            const TOMBSTONED_ENTRY_COUNT: usize = 10;
+            const ENTRY_SIZE: usize = 29;
+
+            {
+                let mut db =
+                    BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+
+                for i in 0..ENTRY_COUNT as u32 {
+                    db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+                }
+
+                assert_eq!(
+                    db.merge_tracker.bytes_written,
+                    (ENTRY_COUNT * ENTRY_SIZE) as u64
+                );
+
+                for i in 0..DEAD_ENTRY_COUNT as u32 {
+                    db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+                }
+
+                assert_eq!(
+                    db.merge_tracker.bytes_written,
+                    (ENTRY_COUNT * ENTRY_SIZE) as u64 + (DEAD_ENTRY_COUNT * ENTRY_SIZE) as u64
+                );
+
+                assert_eq!(
+                    db.merge_tracker.dead_bytes_written,
+                    (DEAD_ENTRY_COUNT * ENTRY_SIZE) as u64
+                );
+
+                for i in DEAD_ENTRY_COUNT as u32..(DEAD_ENTRY_COUNT + TOMBSTONED_ENTRY_COUNT) as u32
+                {
+                    db.remove(&i.to_be_bytes()).unwrap();
+                }
+
+                assert_eq!(
+                    db.merge_tracker.bytes_written,
+                    (ENTRY_COUNT * ENTRY_SIZE) as u64
+                        + (DEAD_ENTRY_COUNT * ENTRY_SIZE) as u64
+                        + (TOMBSTONED_ENTRY_COUNT * (DATAFILE_HEADER_SIZE_BYTES + 4)) as u64
+                );
+                assert_eq!(
+                    db.merge_tracker.dead_bytes_written,
+                    (DEAD_ENTRY_COUNT * ENTRY_SIZE) as u64
+                        + (TOMBSTONED_ENTRY_COUNT * ENTRY_SIZE) as u64
+                        + (TOMBSTONED_ENTRY_COUNT * (DATAFILE_HEADER_SIZE_BYTES + 4)) as u64
+                );
+            }
+
+            {
+                let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options).unwrap();
+                assert_eq!(
+                    db.merge_tracker.bytes_written,
+                    (DEAD_ENTRY_COUNT * ENTRY_SIZE + ENTRY_COUNT * ENTRY_SIZE) as u64
+                        + (TOMBSTONED_ENTRY_COUNT * (DATAFILE_HEADER_SIZE_BYTES + 4)) as u64
+                );
+                assert_eq!(
+                    db.merge_tracker.dead_bytes_written,
+                    (DEAD_ENTRY_COUNT * ENTRY_SIZE) as u64
+                        + (TOMBSTONED_ENTRY_COUNT * ENTRY_SIZE) as u64
+                        + (TOMBSTONED_ENTRY_COUNT * (DATAFILE_HEADER_SIZE_BYTES + 4)) as u64
+                );
+            }
         }
     }
 
@@ -1503,12 +1594,14 @@ mod tests {
         assert_eq!(hf.id, 1);
         let record = DatafileRecord::new(b"1", b"1").unwrap();
         assert!(db.write_hintfile_record(&mut hf, &record, 0).is_ok());
+        hf.flush().unwrap();
         assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
 
         db.switch_writer_datafile().unwrap();
         assert_eq!(hf.id, 1);
         let record = DatafileRecord::new(b"2", b"2").unwrap();
         assert!(db.write_hintfile_record(&mut hf, &record, 0).is_ok());
+        hf.flush().unwrap();
         assert_eq!(hf.id, 2);
         assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
     }

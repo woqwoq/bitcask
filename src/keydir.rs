@@ -2,6 +2,8 @@ use std::fmt::Display;
 
 use ahash::AHashMap;
 
+use crate::record::DATAFILE_HEADER_SIZE_BYTES;
+
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
 #[derive(Debug, PartialEq, Clone)]
 pub struct KeyDirEntry {
@@ -57,15 +59,22 @@ impl KeyDir {
         value_size: u32,
         value_offset: u64,
         timestamp: u64,
-    ) {
+    ) -> Option<KeyDirEntry> {
         self.dir.insert(
             key,
             KeyDirEntry::new(file_id, value_size, value_offset, timestamp),
-        );
+        )
     }
 
-    pub fn remove(&mut self, key: &[u8]) {
-        self.dir.remove(key);
+    pub fn get_live_log_size(&self) -> u64 {
+        self.dir
+            .iter()
+            .map(|(k, v)| DATAFILE_HEADER_SIZE_BYTES as u64 + k.len() as u64 + v.value_size as u64)
+            .sum()
+    }
+
+    pub fn remove(&mut self, key: &[u8]) -> Option<KeyDirEntry> {
+        self.dir.remove(key)
     }
 
     pub fn contains(&self, key: &[u8]) -> bool {
