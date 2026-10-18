@@ -121,7 +121,7 @@ impl DatafileRecordHeader {
         })
     }
 
-    pub fn size(&self) -> Result<usize, DatafileError> {
+    pub fn payload_size(&self) -> Result<usize, DatafileError> {
         let size = u64::from(self.key_size)
             .checked_add(u64::from(self.value_size))
             .and_then(|kv| kv.checked_add(DATAFILE_HEADER_SIZE_BYTES as u64))
@@ -169,7 +169,7 @@ impl DatafileRecord {
     }
 
     pub fn size(&self) -> Result<usize, DatafileError> {
-        self.header.size()
+        self.header.payload_size()
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {

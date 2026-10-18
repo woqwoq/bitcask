@@ -483,6 +483,7 @@ impl BitcaskInstance {
         Ok(())
     }
 
+    // TODO: Bufferize reads during merge
     pub fn merge(&mut self) -> Result<(), BitcaskError> {
         self.merge_tracker.reset();
         self.merge_tracker.active = false;
@@ -545,6 +546,7 @@ impl BitcaskInstance {
         self.switch_writer_datafile()?; // Seal the last writer to avoid inconsistencies between
         // hintfile and datafile
         self.merge_tracker.active = true;
+        self.merge_tracker.write(self.keydir.get_live_log_size());
         Ok(())
     }
 

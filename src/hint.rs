@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{BufWriter, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
     path::Path,
 };
@@ -182,21 +182,22 @@ impl Hintfile {
     }
 
     pub(crate) fn replay(&self, keydir: &mut KeyDir) -> Result<usize, HintfileError> {
-        let mut start_offset = 0;
         let fsz = self.file_size()?;
+        let mut start_offset = 0;
         let mut count: usize = 0;
 
+        let mut reader = BufReader::with_capacity(8 * KB, self.file.get_ref());
+        reader.seek(SeekFrom::Start(0))?;
+
         while start_offset < fsz {
-            let header = HintfileRecordHeader::decode(
-                &self.read_bytes(start_offset, HINTFILE_RECORD_HEADER_SIZE_BYTES)?,
-            )?;
+            let header = HintfileRecordHeader::decode(&Self::read_exact_bytes(
+                &mut reader,
+                HINTFILE_RECORD_HEADER_SIZE_BYTES,
+            )?)?;
 
             let mut hasher = header.crc();
 
-            let key = self.read_bytes(
-                start_offset + HINTFILE_RECORD_HEADER_SIZE_BYTES as u64,
-                header.key_size as usize,
-            )?;
+            let key = Self::read_exact_bytes(&mut reader, header.key_size as usize)?;
 
             hasher.update(&key);
 
@@ -242,10 +243,18 @@ impl Hintfile {
         }))
     }
 
-    fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
+    fn read_exact_bytes_at(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
         let mut buf = vec![0u8; count];
 
         self.file.get_ref().read_exact_at(&mut buf, offset)?;
+
+        Ok(Box::from(buf))
+    }
+
+    fn read_exact_bytes<R: Read>(reader: &mut R, count: usize) -> Result<Box<[u8]>, HintfileError> {
+        let mut buf = vec![0u8; count];
+
+        reader.read_exact(&mut buf)?;
 
         Ok(Box::from(buf))
     }
@@ -315,10 +324,10 @@ impl<'a> HintfileIterator<'a> {
         let header = HintfileRecordHeader::decode(
             &self
                 .hintfile
-                .read_bytes(self.offset, HINTFILE_RECORD_HEADER_SIZE_BYTES)?,
+                .read_exact_bytes_at(self.offset, HINTFILE_RECORD_HEADER_SIZE_BYTES)?,
         )?;
 
-        let key = self.hintfile.read_bytes(
+        let key = self.hintfile.read_exact_bytes_at(
             self.offset + HINTFILE_RECORD_HEADER_SIZE_BYTES as u64,
             header.key_size as usize,
         )?;
@@ -493,7 +502,9 @@ mod test {
 
             let mut offset = 0u64;
             for expected in records {
-                let bytes = hintfile.read_bytes(offset, RECORD_SIZE_BYTES).unwrap();
+                let bytes = hintfile
+                    .read_exact_bytes_at(offset, RECORD_SIZE_BYTES)
+                    .unwrap();
                 let record = HintfileRecord::decode(&bytes).unwrap();
 
                 assert_eq!(
