@@ -42,5 +42,5 @@ jobs:
         path: target/nextest/ci/junit.xml
         reporter: java-junit
 
-    - name: Run Hotpath Prfiler
-      run: cargo run --profile profiling --features hotpath >> $GITHUB_STEP_SUMMARY
+    - name: Run Hotpath Profiler
+      run: cargo run --profile profiling --features hotpath -- --count 100000 >> $GITHUB_STEP_SUMMARY
