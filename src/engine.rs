@@ -91,6 +91,7 @@ pub struct BitcaskInstance {
 
 pub struct BitcaskRecoveryHandler;
 
+#[hotpath::measure_all]
 impl BitcaskRecoveryHandler {
     pub fn reopen_reader_for_recovery(
         dir: &Path,
@@ -156,6 +157,7 @@ impl BitcaskRecoveryHandler {
 
 pub struct BitcaskStartupHandler;
 
+#[hotpath::measure_all]
 impl BitcaskStartupHandler {
     pub fn reopen_datafile_as_writer(
         dir: &Path,
@@ -271,6 +273,7 @@ impl BitcaskStartupHandler {
     }
 }
 
+#[hotpath::measure_all]
 impl BitcaskInstance {
     pub fn open(dir: PathBuf, options: BitcaskOptions) -> Result<Self, BitcaskError> {
         let mut merge_tracker = MergeTracker::new();

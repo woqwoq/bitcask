@@ -5,6 +5,7 @@ use bitcask::{
     options::{BitcaskOptions, DatafileMaxSize, MB},
 };
 
+#[hotpath::main]
 fn main() {
     let options = BitcaskOptions::default()
         .merge_dead_space_threshold_percent(49)
@@ -16,6 +17,9 @@ fn main() {
 
     match BitcaskInstance::open(PathBuf::from("db"), options) {
         Ok(mut db) => {
+            for i in 0..ENTRY_COUNT as u128 {
+                db.put(&i.to_be_bytes(), format!("{i}").as_bytes()).unwrap();
+            }
             for i in 0..ENTRY_COUNT as u128 {
                 db.put(&i.to_be_bytes(), format!("{i}").as_bytes()).unwrap();
             }

@@ -163,6 +163,7 @@ pub(crate) struct Hintfile {
     pub(crate) id: u32,
 }
 
+#[hotpath::measure_all]
 impl Hintfile {
     pub(crate) fn new_or_open_existing(
         dir: &Path,

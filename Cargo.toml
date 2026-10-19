@@ -7,11 +7,17 @@ edition = "2024"
 ahash = "0.8.12"
 crc32fast = "1.5.2"
 lru = "0.18.5"
+hotpath = "0.28.6"
 
 [dev-dependencies]
 tempfile = "3.27.0"
 criterion = "0.8.2"
 rand = "0.10.3"
+
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-prometheus = ["hotpath/hotpath-prometheus"]
 
 [profile.profiling]
 inherits = "release"
