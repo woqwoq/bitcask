@@ -25,6 +25,7 @@ pub struct Datafile {
     pub is_writer: bool,
 }
 
+#[hotpath::measure_all]
 impl Datafile {
     pub fn new_writer(
         dir: &Path,
@@ -327,6 +328,7 @@ pub struct DatafileRecordIterator<'a> {
     offset: u64,
 }
 
+#[hotpath::measure_all]
 impl<'a> DatafileRecordIterator<'a> {
     pub fn new(datafile: &'a Datafile) -> Result<Self, DatafileError> {
         let mut reader = BufReader::new(datafile.file.get_ref());
@@ -335,6 +337,7 @@ impl<'a> DatafileRecordIterator<'a> {
         Ok(Self { reader, offset: 0 })
     }
 
+    #[hotpath::measure]
     fn read_exact_bytes(&mut self, count: usize) -> Result<Option<Box<[u8]>>, DatafileError> {
         let mut buf = vec![0u8; count];
 
@@ -350,6 +353,7 @@ impl<'a> DatafileRecordIterator<'a> {
         }
     }
 
+    #[hotpath::measure]
     fn read_header(&mut self) -> Result<Option<[u8; DATAFILE_HEADER_SIZE_BYTES]>, DatafileError> {
         let mut buf = [0u8; DATAFILE_HEADER_SIZE_BYTES];
 
@@ -365,6 +369,7 @@ impl<'a> DatafileRecordIterator<'a> {
         }
     }
 
+    #[hotpath::measure]
     pub fn next_record(&mut self) -> Result<Option<DatafileRecordIteratorEntry>, DatafileError> {
         if let Some(header) = self.read_header()? {
             let header = DatafileRecordHeader::decode(&header)?;
@@ -374,8 +379,7 @@ impl<'a> DatafileRecordIterator<'a> {
                     self.offset + DATAFILE_HEADER_SIZE_BYTES as u64 + header.key_size as u64;
 
                 self.offset += header.payload_size()? as u64;
-                self.reader
-                    .seek(SeekFrom::Current(header.value_size as i64))?;
+                self.reader.seek_relative(header.value_size as i64)?;
 
                 return Ok(Some(DatafileRecordIteratorEntry::new(
                     header,
