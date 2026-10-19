@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, IoSlice, Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, ErrorKind, IoSlice, Read, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
@@ -306,12 +306,6 @@ impl Display for Datafile {
     }
 }
 
-pub struct DatafileRecordIterator<'a> {
-    datafile: &'a Datafile,
-    fsz: u64,
-    offset: u64,
-}
-
 pub struct DatafileRecordIteratorEntry {
     pub header: DatafileRecordHeader,
     pub key: Box<[u8]>,
@@ -328,41 +322,71 @@ impl DatafileRecordIteratorEntry {
     }
 }
 
+pub struct DatafileRecordIterator<'a> {
+    reader: BufReader<&'a File>,
+    offset: u64,
+}
+
 impl<'a> DatafileRecordIterator<'a> {
     pub fn new(datafile: &'a Datafile) -> Result<Self, DatafileError> {
-        let fsz = datafile.file_size()?;
-        Ok(Self {
-            datafile,
-            fsz,
-            offset: 0,
-        })
+        let mut reader = BufReader::new(datafile.file.get_ref());
+        reader.seek(SeekFrom::Start(0))?;
+
+        Ok(Self { reader, offset: 0 })
+    }
+
+    fn read_exact_bytes(&mut self, count: usize) -> Result<Option<Box<[u8]>>, DatafileError> {
+        let mut buf = vec![0u8; count];
+
+        match self.reader.read_exact(&mut buf) {
+            Err(e) => {
+                if e.kind() == ErrorKind::UnexpectedEof {
+                    Ok(None)
+                } else {
+                    Err(DatafileError::IO(e))
+                }
+            }
+            Ok(()) => Ok(Some(Box::from(buf))),
+        }
+    }
+
+    fn read_header(&mut self) -> Result<Option<[u8; DATAFILE_HEADER_SIZE_BYTES]>, DatafileError> {
+        let mut buf = [0u8; DATAFILE_HEADER_SIZE_BYTES];
+
+        match self.reader.read_exact(&mut buf) {
+            Err(e) => {
+                if e.kind() == ErrorKind::UnexpectedEof {
+                    Ok(None)
+                } else {
+                    Err(DatafileError::IO(e))
+                }
+            }
+            Ok(()) => Ok(Some(buf)),
+        }
     }
 
     pub fn next_record(&mut self) -> Result<Option<DatafileRecordIteratorEntry>, DatafileError> {
-        if self.offset >= self.fsz {
+        if let Some(header) = self.read_header()? {
+            let header = DatafileRecordHeader::decode(&header)?;
+
+            if let Some(key) = self.read_exact_bytes(header.key_size as usize)? {
+                let value_offset =
+                    self.offset + DATAFILE_HEADER_SIZE_BYTES as u64 + header.key_size as u64;
+
+                self.offset += header.payload_size()? as u64;
+                self.reader
+                    .seek(SeekFrom::Current(header.value_size as i64))?;
+
+                return Ok(Some(DatafileRecordIteratorEntry::new(
+                    header,
+                    key,
+                    value_offset,
+                )));
+            }
             return Ok(None);
         }
 
-        let header = DatafileRecordHeader::decode(
-            &self
-                .datafile
-                .read_bytes(self.offset, DATAFILE_HEADER_SIZE_BYTES)?,
-        )?;
-
-        let key = self.datafile.read_bytes(
-            self.offset + DATAFILE_HEADER_SIZE_BYTES as u64,
-            header.key_size as usize,
-        )?;
-
-        let value_offset = self.offset + DATAFILE_HEADER_SIZE_BYTES as u64 + header.key_size as u64;
-
-        self.offset += header.payload_size()? as u64;
-
-        Ok(Some(DatafileRecordIteratorEntry::new(
-            header,
-            key,
-            value_offset,
-        )))
+        Ok(None)
     }
 }
 
@@ -642,6 +666,44 @@ mod tests {
             ); // The reader should still be immutable record-wise
 
             assert!(reader.truncate(offset).is_ok());
+        }
+    }
+
+    mod iterator {
+        use crate::datafile::DatafileRecordIterator;
+
+        use super::*;
+
+        #[test]
+        fn iterator() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            let mut records: Vec<DatafileRecord> = Vec::new();
+
+            // Pre-fill datafile
+            for i in 0..50usize {
+                let record =
+                    DatafileRecord::new(format!("{i}").as_bytes(), &i.to_be_bytes()).unwrap();
+                assert!(df.append_record(&record).is_ok());
+                records.push(record);
+            }
+            df.flush().unwrap();
+
+            let mut iter = DatafileRecordIterator::new(&df).unwrap();
+
+            for (i, record) in records.iter().enumerate() {
+                println!("{i}");
+                let iter_record = iter.next_record().unwrap().unwrap();
+
+                assert_eq!(iter_record.header, record.header);
+                assert_eq!(iter_record.key, record.key);
+            }
         }
     }
 }

@@ -78,7 +78,7 @@ impl HintfileRecordHeader {
         arr
     }
 
-    pub(crate) fn decode(buf: &[u8]) -> Result<Self, HintfileError> {
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
         if HINTFILE_RECORD_HEADER_SIZE_BYTES > buf.len() {
             return Err(HintfileError::UndersizedHintfileHeader(buf.len()));
         }
@@ -109,7 +109,7 @@ impl HintfileRecordHeader {
         hasher
     }
 
-    pub(crate) fn size(&self) -> Result<usize, HintfileError> {
+    pub(crate) fn size(&self) -> Result<usize> {
         let size = u64::from(self.key_size)
             .checked_add(HINTFILE_RECORD_HEADER_SIZE_BYTES as u64)
             .ok_or(HintfileError::OversizedHintfileRecord)?;
@@ -132,7 +132,7 @@ impl HintfileRecord {
         }
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, HintfileError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let hintfile_size = bytes.len() as u64;
         let header = HintfileRecordHeader::decode(bytes)?;
 
@@ -156,6 +156,8 @@ impl HintfileRecord {
     }
 }
 
+type Result<R> = core::result::Result<R, HintfileError>;
+
 pub(crate) struct Hintfile {
     file: BufWriter<File>,
     pub(crate) id: u32,
@@ -166,7 +168,7 @@ impl Hintfile {
         dir: &Path,
         id: u32,
         hintfile_extension: &str,
-    ) -> Result<Self, HintfileError> {
+    ) -> Result<Self> {
         let filename = Datafile::generate_filename(dir, id, hintfile_extension);
 
         let file = OpenOptions::new()
@@ -181,7 +183,7 @@ impl Hintfile {
         })
     }
 
-    pub(crate) fn replay(&self, keydir: &mut KeyDir) -> Result<usize, HintfileError> {
+    pub(crate) fn replay(&self, keydir: &mut KeyDir) -> Result<usize> {
         let fsz = self.file_size()?;
         let mut start_offset = 0;
         let mut count: usize = 0;
@@ -224,7 +226,7 @@ impl Hintfile {
         dir: &Path,
         id: u32,
         hintfile_extension: &str,
-    ) -> Result<Option<Self>, HintfileError> {
+    ) -> Result<Option<Self>> {
         let filename = Datafile::generate_filename(dir, id, hintfile_extension);
 
         if !filename.exists() {
@@ -243,7 +245,7 @@ impl Hintfile {
         }))
     }
 
-    fn read_exact_bytes_at(&self, offset: u64, count: usize) -> Result<Box<[u8]>, HintfileError> {
+    fn read_exact_bytes_at(&self, offset: u64, count: usize) -> Result<Box<[u8]>> {
         let mut buf = vec![0u8; count];
 
         self.file.get_ref().read_exact_at(&mut buf, offset)?;
@@ -251,7 +253,7 @@ impl Hintfile {
         Ok(Box::from(buf))
     }
 
-    fn read_exact_bytes<R: Read>(reader: &mut R, count: usize) -> Result<Box<[u8]>, HintfileError> {
+    fn read_exact_bytes<R: Read>(reader: &mut R, count: usize) -> Result<Box<[u8]>> {
         let mut buf = vec![0u8; count];
 
         reader.read_exact(&mut buf)?;
@@ -263,7 +265,7 @@ impl Hintfile {
         &mut self,
         df_record: &DatafileRecord,
         value_offset: u64,
-    ) -> Result<(), HintfileError> {
+    ) -> Result<()> {
         // Instead of building HintfileRecord and copying the key, we write it disassembled into
         // header and key from the beginning.
         Self::write_hint_record_to(
@@ -279,22 +281,22 @@ impl Hintfile {
         writer: &mut W,
         header: HintfileRecordHeader,
         key: &[u8],
-    ) -> Result<(), HintfileError> {
+    ) -> Result<()> {
         writer.write_all(&header.encode())?;
         writer.write_all(key)?;
 
         Ok(())
     }
 
-    pub(crate) fn file_size(&self) -> Result<u64, HintfileError> {
+    pub(crate) fn file_size(&self) -> Result<u64> {
         Ok(self.file.get_ref().metadata()?.len())
     }
 
-    pub(crate) fn sync(&mut self) -> Result<(), HintfileError> {
+    pub(crate) fn sync(&mut self) -> Result<()> {
         self.file.get_mut().sync_data().map_err(HintfileError::IO)
     }
 
-    pub fn flush(&mut self) -> Result<(), HintfileError> {
+    pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
         Ok(())
     }
@@ -307,7 +309,7 @@ pub(crate) struct HintfileIterator<'a> {
 }
 
 impl<'a> HintfileIterator<'a> {
-    pub(crate) fn new(hintfile: &'a Hintfile) -> Result<Self, HintfileError> {
+    pub(crate) fn new(hintfile: &'a Hintfile) -> Result<Self> {
         let fsz = hintfile.file_size()?;
         Ok(Self {
             hintfile,
@@ -316,7 +318,7 @@ impl<'a> HintfileIterator<'a> {
         })
     }
 
-    pub(crate) fn next_record(&mut self) -> Result<Option<HintfileRecord>, HintfileError> {
+    pub(crate) fn next_record(&mut self) -> Result<Option<HintfileRecord>> {
         if self.offset >= self.fsz {
             return Ok(None);
         }
