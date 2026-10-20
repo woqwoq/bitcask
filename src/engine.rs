@@ -3,6 +3,7 @@ use std::{
     io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use lru::LruCache;
@@ -14,7 +15,7 @@ use crate::{
         RemoveError,
     },
     hint::Hintfile,
-    keydir::KeyDir,
+    keydir::{KeyDir, KeyDirEntry},
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
     record::{
         DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
@@ -83,13 +84,13 @@ impl MergeTracker {
 }
 
 pub struct BitcaskInstance {
-    dir: PathBuf,                         // For opening files through LRU
-    pub(crate) keydir: KeyDir,            // In-memory keydir map
-    pub writer: Datafile,                 // Writer file handle
-    pub readers: LruCache<u32, Datafile>, // Use LRU cache to track recently used files
-    pub merge_tracker: MergeTracker,      // For tracking dead space and trigger compaction
-    write_count: usize,                   // Write count tracker for sync
-    options: BitcaskOptions,              // User-customisable options
+    dir: PathBuf,                                     // For opening files through LRU
+    pub(crate) keydir: KeyDir,                        // In-memory keydir map
+    pub writer: Datafile,                             // Writer file handle
+    pub readers: Mutex<LruCache<u32, Arc<Datafile>>>, // Use LRU cache to track recently used files
+    pub merge_tracker: MergeTracker, // For tracking dead space and trigger compaction
+    write_count: usize,              // Write count tracker for sync
+    options: BitcaskOptions,         // User-customisable options
 }
 
 pub struct BitcaskRecoveryHandler;
@@ -146,9 +147,7 @@ impl BitcaskRecoveryHandler {
                 }
                 Ok(df)
             }
-            RecoveryMode::AbsoluteConsistency => {
-                Err(OpenError::FatalDatafileReplay(error))
-            }
+            RecoveryMode::AbsoluteConsistency => Err(OpenError::FatalDatafileReplay(error)),
         }
     }
 
@@ -220,7 +219,7 @@ impl BitcaskStartupHandler {
         dir: &Path,
         options: &BitcaskOptions,
         keydir: &mut KeyDir,
-        readers: &mut LruCache<u32, Datafile>,
+        readers: &mut LruCache<u32, Arc<Datafile>>,
     ) -> Result<(Option<Datafile>, u64), OpenError> {
         let df_ids = Self::parse_db_datafile_ids_at_path(dir, &options.datafile_extension)?;
         let last = df_ids.last().cloned();
@@ -258,7 +257,7 @@ impl BitcaskStartupHandler {
                 return Ok((Some(df), total_df_size));
             }
 
-            readers.put(id, df);
+            readers.put(id, Arc::new(df));
         }
 
         Ok((None, total_df_size))
@@ -268,7 +267,7 @@ impl BitcaskStartupHandler {
         dir: &Path,
         options: &BitcaskOptions,
         latest_datafile: Option<Datafile>,
-        readers: &mut LruCache<u32, Datafile>,
+        readers: &mut LruCache<u32, Arc<Datafile>>,
     ) -> Result<Datafile, OpenError> {
         if let Some(df) = latest_datafile {
             if options.reuse_old_writer_on_startup
@@ -279,18 +278,13 @@ impl BitcaskStartupHandler {
             }
 
             let id = df.id;
-            readers.put(id, df);
+            readers.put(id, Arc::new(df));
 
-            return Datafile::new_writer(
-                dir,
-                id + 1,
-                &options.datafile_extension,
-            )
-            .map_err(OpenError::WriterInit);
+            return Datafile::new_writer(dir, id + 1, &options.datafile_extension)
+                .map_err(OpenError::WriterInit);
         }
 
-        Datafile::new_writer(dir, 1, &options.datafile_extension)
-            .map_err(OpenError::WriterInit)
+        Datafile::new_writer(dir, 1, &options.datafile_extension).map_err(OpenError::WriterInit)
     }
 }
 
@@ -299,7 +293,7 @@ impl BitcaskInstance {
     pub fn open(dir: PathBuf, options: BitcaskOptions) -> Result<Self, BitcaskError> {
         let mut merge_tracker = MergeTracker::new();
         let mut keydir = KeyDir::with_capacity(options.expected_keydir_max_size);
-        let mut readers: LruCache<u32, Datafile> =
+        let mut readers: LruCache<u32, Arc<Datafile>> =
             LruCache::new(NonZeroUsize::new(options.reader_lru_cache_size).unwrap());
 
         let (latest_datafile, total_df_size) = BitcaskStartupHandler::replay_and_init_readers(
@@ -324,7 +318,7 @@ impl BitcaskInstance {
             keydir,
             writer,
             dir,
-            readers,
+            readers: Mutex::new(readers),
             merge_tracker,
             write_count: 0,
             options,
@@ -346,45 +340,62 @@ impl BitcaskInstance {
         self.keydir.is_empty()
     }
 
+    fn read_from_writer(&self, keydir_entry: &KeyDirEntry) -> Result<Box<[u8]>, BitcaskError> {
+        Ok(self
+            .writer
+            .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+            .map_err(GetError::Datafile)?)
+    }
+
+    fn read_from_reader(
+        &self,
+        keydir_entry: &KeyDirEntry,
+        reader: &Datafile,
+    ) -> Result<Box<[u8]>, BitcaskError> {
+        Ok(reader
+            .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+            .map_err(GetError::Datafile)?)
+    }
+
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
         if let Some(keydir_entry) = self.keydir.get(key) {
             // If the current writer contains the entry
-            let reader = if self.writer.id == keydir_entry.file_id {
+            if keydir_entry.file_id == self.writer.id {
                 self.writer.flush().map_err(GetError::Datafile)?;
-                &self.writer
-                // If the LRU cache houses the reader containing the entry
-            } else if let Some(reader) = self.readers.get(&keydir_entry.file_id) {
-                reader
-            } else {
-                match Datafile::open_reader(
-                    &self.dir,
-                    keydir_entry.file_id,
-                    &self.options.datafile_extension,
-                ) {
-                    Ok(reader) => {
-                        let reader_id = reader.id;
-                        self.readers.put(reader_id, reader);
-                        self.readers
-                            .get(&reader_id)
-                            .ok_or(GetError::DatafileMissing(reader_id))?
-                    }
-                    Err(DatafileError::DatafileNotFound(_)) => {
-                        return Err(GetError::DatafileMissing(keydir_entry.file_id).into());
-                    }
-                    Err(e) => {
-                        return Err(GetError::Datafile(e).into());
-                    }
-                }
-            };
+                return Ok(Some(self.read_from_writer(keydir_entry)?));
+            }
 
-            let bytes = reader
-                .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
-                .map_err(GetError::Datafile)?;
+            // If the LRU cache houses the reader containing the entry
+            let reader =
+                if let Some(reader) = self.readers.lock().unwrap().get(&keydir_entry.file_id) {
+                    Arc::clone(reader)
+                } else {
+                    match Datafile::open_reader(
+                        &self.dir,
+                        keydir_entry.file_id,
+                        &self.options.datafile_extension,
+                    ) {
+                        Ok(reader) => {
+                            let reader_id = reader.id;
+                            let reader = Arc::new(reader);
+                            self.readers
+                                .lock()
+                                .unwrap()
+                                .put(reader_id, Arc::clone(&reader));
+                            reader
+                        }
+                        Err(DatafileError::DatafileNotFound(_)) => {
+                            return Err(GetError::DatafileMissing(keydir_entry.file_id).into());
+                        }
+                        Err(e) => {
+                            return Err(GetError::Datafile(e).into());
+                        }
+                    }
+                };
 
-            Ok(Some(bytes))
-        } else {
-            Ok(None)
+            return Ok(Some(self.read_from_reader(keydir_entry, &reader)?));
         }
+        Ok(None)
     }
 
     fn write_datafile_record(&mut self, record: &DatafileRecord) -> Result<u64, PutError> {
@@ -409,13 +420,16 @@ impl BitcaskInstance {
             self.switch_writer_datafile()?;
         }
 
-        let offset = self.commit_datafile_write(record).map_err(PutError::Datafile)?; // Write record first, so that it can be
+        let offset = self
+            .commit_datafile_write(record)
+            .map_err(PutError::Datafile)?; // Write record first, so that it can be
         // replayed in case of a crash.
         self.write_count += 1;
 
         self.sync_writer().map_err(PutError::Datafile)?; // Sync IO according to user's options
 
-        self.commit_keydir_write(record, offset).map_err(PutError::Datafile)?; // Append entry to the keydir
+        self.commit_keydir_write(record, offset)
+            .map_err(PutError::Datafile)?; // Append entry to the keydir
 
         Ok(offset)
     }
@@ -423,12 +437,11 @@ impl BitcaskInstance {
     pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
         if self.keydir.contains(key) {
             let record = DatafileRecord::new_tombstone(key).map_err(RemoveError::Datafile)?;
-            self.write_datafile_record(&record)
-                .map_err(|e| match e {
-                    PutError::Datafile(d) => RemoveError::Datafile(d),
-                    PutError::AutoMerge(m) => RemoveError::AutoMerge(m),
-                    PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
-                })?;
+            self.write_datafile_record(&record).map_err(|e| match e {
+                PutError::Datafile(d) => RemoveError::Datafile(d),
+                PutError::AutoMerge(m) => RemoveError::AutoMerge(m),
+                PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
+            })?;
         }
 
         Ok(())
@@ -512,7 +525,10 @@ impl BitcaskInstance {
 
         let old_writer = std::mem::replace(old_writer, new_writer);
 
-        self.readers.put(old_writer.id, old_writer);
+        self.readers
+            .lock()
+            .unwrap()
+            .put(old_writer.id, Arc::new(old_writer));
 
         Ok(())
     }
@@ -521,7 +537,7 @@ impl BitcaskInstance {
         self.writer.flush()?;
 
         if self.merge_tracker.should_merge(&self.options) {
-            self.merge_inner()?; // Will also provide a fresh new writer
+            self.merge()?; // Will also provide a fresh new writer
             self.merge_tracker.reset();
             self.merge_tracker.write(self.keydir.get_live_log_size());
             return Ok(());
@@ -532,7 +548,7 @@ impl BitcaskInstance {
         Ok(())
     }
 
-    pub fn merge(&mut self) -> Result<(), BitcaskError> {
+    pub fn merge(&mut self) -> Result<(), MergeError> {
         self.merge_tracker.active = false;
 
         let merge = self.merge_inner();
@@ -544,8 +560,7 @@ impl BitcaskInstance {
             self.merge_tracker.write(self.keydir.get_live_log_size());
         }
 
-        merge?;
-        Ok(())
+        merge
     }
 
     // TODO: Bufferize reads during merge
@@ -598,11 +613,12 @@ impl BitcaskInstance {
                         df_entry.header.timestamp,
                     )?;
 
-                    let record_start_offset = self.write_datafile_record(&record).map_err(|e| match e {
-                        PutError::Datafile(df_err) => MergeError::Datafile(df_err),
-                        PutError::AutoMerge(merge_err) => merge_err,
-                        PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
-                    })?; // We want to keep original timestamp
+                    let record_start_offset =
+                        self.write_datafile_record(&record).map_err(|e| match e {
+                            PutError::Datafile(df_err) => MergeError::Datafile(df_err),
+                            PutError::AutoMerge(merge_err) => merge_err,
+                            PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
+                        })?; // We want to keep original timestamp
                     self.write_hintfile_record(&mut hf, &record, record_start_offset)?;
                 }
                 // Otherwise we ignore the value as it is either dead or the tombstone itself
@@ -644,7 +660,7 @@ impl BitcaskInstance {
 
     fn remove_old_readers_post_merge(&mut self, ids: Vec<u32>) -> Result<(), MergeError> {
         for id in ids {
-            self.readers.pop(&id); // Evict the file from LRU
+            self.readers.lock().unwrap().pop(&id); // Evict the file from LRU
 
             // Remove the reader datafile from filesystem
             fs::remove_file(Datafile::generate_filename(
@@ -679,6 +695,7 @@ mod tests {
         ops::Div,
         os::unix::fs::symlink,
         path::{Path, PathBuf},
+        sync::Arc,
     };
 
     use lru::LruCache;
@@ -755,7 +772,7 @@ mod tests {
             .sum()
     }
 
-    fn replay_env(_dir: &Path, options: &BitcaskOptions) -> (KeyDir, LruCache<u32, Datafile>) {
+    fn replay_env(_dir: &Path, options: &BitcaskOptions) -> (KeyDir, LruCache<u32, Arc<Datafile>>) {
         (
             KeyDir::default(),
             LruCache::new(NonZeroUsize::new(options.reader_lru_cache_size).unwrap()),
@@ -773,7 +790,7 @@ mod tests {
             assert_eq!(db.writer.offset, 0);
             assert!(db.writer.is_writer);
 
-            assert!(db.readers.is_empty());
+            assert!(db.readers.lock().unwrap().is_empty());
             assert!(db.keydir.is_empty());
         }
 
@@ -807,7 +824,7 @@ mod tests {
                     db.writer.offset != 0
                 });
 
-                assert_eq!(db.readers.len(), fratio.floor() as usize);
+                assert_eq!(db.readers.lock().unwrap().len(), fratio.floor() as usize);
                 assert_eq!(db.keydir.len(), RECORD_COUNT);
             } // File handles should be released at this point
 
@@ -819,7 +836,7 @@ mod tests {
                 assert_eq!(db.writer.id, fratio.ceil() as u32 + 1); // New writer should be created
                 assert_eq!(db.writer.offset, 0);
 
-                assert_eq!(db.readers.len(), fratio.ceil() as usize);
+                assert_eq!(db.readers.lock().unwrap().len(), fratio.ceil() as usize);
                 assert_eq!(db.keydir.len(), RECORD_COUNT);
 
                 // 28B per entry - 2 readers and 1 writer to fit 1000 entries with 10K Datafile max length
@@ -1011,20 +1028,21 @@ mod tests {
             );
 
             // Make sure the datafile is not known
-            assert_eq!(db.readers.len(), 0);
+            assert_eq!(db.readers.lock().unwrap().len(), 0);
 
             assert_eq!(
                 db.get(key.as_bytes()).unwrap().unwrap(),
                 Box::from(value.to_be_bytes())
             );
             // Verify the missed reader has been discovered
-            assert_eq!(db.readers.len(), 1);
+            assert_eq!(db.readers.lock().unwrap().len(), 1);
         }
 
         #[test]
         fn get_missing_datafile_returns_error() {
             let (_, _, mut db) = init_test();
-            db.keydir.put(Box::from(b"missing_key" as &[u8]), 999, 10, 0, 12345);
+            db.keydir
+                .put(Box::from(b"missing_key" as &[u8]), 999, 10, 0, 12345);
             let res = db.get(b"missing_key");
             assert!(matches!(
                 res,
@@ -1553,15 +1571,19 @@ mod tests {
         assert_eq!(db.writer.id, 1);
         assert!(db.writer.is_writer);
         assert_eq!(db.writer.offset, 0);
-        assert_eq!(db.readers.len(), 0);
+        assert_eq!(db.readers.lock().unwrap().len(), 0);
 
         assert!(db.switch_writer_datafile().is_ok());
 
         // Make sure old writer is demoted and added to LRU cache of readers
-        assert_eq!(db.readers.len(), 1);
-        let old = db.readers.get(&1u32).unwrap();
-        assert_eq!(old.id, 1);
-        assert!(!old.is_writer);
+        {
+            let mut readers = db.readers.lock().unwrap();
+            assert_eq!(readers.len(), 1);
+            let old = readers.get(&1u32).unwrap();
+
+            assert_eq!(old.id, 1);
+            assert!(!old.is_writer);
+        }
 
         // Make sure new writer is created with proper id, role and offset
         assert_eq!(db.writer.id, 2);
@@ -1606,7 +1628,7 @@ mod tests {
             );
 
             assert_eq!(
-                db.readers.len(),
+                db.readers.lock().unwrap().len(),
                 entry_total_size.div(options.datafile_max_size.get_size())
             );
         }
@@ -1626,6 +1648,8 @@ mod tests {
             assert_eq!(
                 db.writer.offset
                     + db.readers
+                        .lock()
+                        .unwrap()
                         .iter()
                         .map(|(_, reader)| reader.offset)
                         .sum::<u64>(),
@@ -1633,7 +1657,7 @@ mod tests {
             );
 
             assert_eq!(
-                db.readers.len(),
+                db.readers.lock().unwrap().len(),
                 entry_total_size.div(options.datafile_max_size.get_size())
             );
 
@@ -1648,6 +1672,8 @@ mod tests {
             assert_eq!(
                 db.writer.offset
                     + db.readers
+                        .lock()
+                        .unwrap()
                         .iter()
                         .map(|(_, reader)| reader.offset)
                         .sum::<u64>(),
@@ -1729,7 +1755,7 @@ mod tests {
             );
             assert_eq!(db.len(), ENTRY_COUNT); // All KV pairs should be still present
             assert_eq!(
-                db.readers.len(),
+                db.readers.lock().unwrap().len(),
                 options
                     .reader_lru_cache_size
                     .min(datafiles_to_house_payload)
@@ -1754,23 +1780,27 @@ mod tests {
 
             // Hints should be written to the new datafiles including writer
             let last = db.writer.id - 1;
-            for (id, _) in db.readers {
-                let hf = Hintfile::open_if_exists(temp_dir.path(), id, "hint")
-                    .unwrap()
-                    .unwrap();
+            {
+                let readers = db.readers.lock().unwrap();
 
-                if id == last {
+                for (&id, _) in readers.iter() {
+                    let hf = Hintfile::open_if_exists(temp_dir.path(), id, "hint")
+                        .unwrap()
+                        .unwrap();
+
+                    if id == last {
+                        assert_eq!(
+                            hf.file_size().unwrap(),
+                            (entries_last_merge_writer * HINT_ENTRY_SIZE) as u64
+                        );
+                        continue;
+                    }
+
                     assert_eq!(
                         hf.file_size().unwrap(),
-                        (entries_last_merge_writer * HINT_ENTRY_SIZE) as u64
+                        (entries_to_fit_on_single_df * HINT_ENTRY_SIZE) as u64
                     );
-                    continue;
                 }
-
-                assert_eq!(
-                    hf.file_size().unwrap(),
-                    (entries_to_fit_on_single_df * HINT_ENTRY_SIZE) as u64
-                );
             }
 
             // Old writer used during merge has been sealed, so current one should be empty
