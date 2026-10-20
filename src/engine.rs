@@ -191,7 +191,10 @@ impl BitcaskStartupHandler {
 
             if let Some((name, ext)) = filename.rsplit_once('.') {
                 if ext == datafile_extension {
-                    ids.push(name.parse::<u32>()?);
+                    match name.parse::<u32>() {
+                        Ok(res) => ids.push(res),
+                        Err(_) => continue,
+                    }
                 }
             } else {
                 continue;
@@ -486,10 +489,23 @@ impl BitcaskInstance {
         Ok(())
     }
 
-    // TODO: Bufferize reads during merge
     pub fn merge(&mut self) -> Result<(), BitcaskError> {
-        self.merge_tracker.reset();
         self.merge_tracker.active = false;
+
+        let merge = self.merge_inner();
+
+        self.merge_tracker.active = true;
+
+        if merge.is_ok() {
+            self.merge_tracker.reset();
+            self.merge_tracker.write(self.keydir.get_live_log_size());
+        }
+
+        merge
+    }
+
+    // TODO: Bufferize reads during merge
+    fn merge_inner(&mut self) -> Result<(), BitcaskError> {
         self.switch_writer_datafile()?; // Lock the latest writer
 
         let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
@@ -500,11 +516,9 @@ impl BitcaskInstance {
         .filter(|&id| id < self.writer.id)
         .collect();
 
-        let mut hf = Hintfile::new_or_open_existing(
-            &self.dir,
-            self.writer.id,
-            &self.options.hintfile_extension,
-        )?;
+        let mut hf =
+            Hintfile::new_writer(&self.dir, self.writer.id, &self.options.hintfile_extension)?;
+
         for id in candidate_ids.clone() {
             let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
             let mut iter = DatafileRecordIterator::new(&df)?;
@@ -548,8 +562,6 @@ impl BitcaskInstance {
         self.remove_old_readers_post_merge(candidate_ids)?;
         self.switch_writer_datafile()?; // Seal the last writer to avoid inconsistencies between
         // hintfile and datafile
-        self.merge_tracker.active = true;
-        self.merge_tracker.write(self.keydir.get_live_log_size());
         Ok(())
     }
 
@@ -561,11 +573,8 @@ impl BitcaskInstance {
     ) -> Result<(), BitcaskError> {
         // When a writer switchover has occured
         if hf.id != self.writer.id {
-            let new = Hintfile::new_or_open_existing(
-                &self.dir,
-                self.writer.id,
-                &self.options.hintfile_extension,
-            )?;
+            let new =
+                Hintfile::new_writer(&self.dir, self.writer.id, &self.options.hintfile_extension)?;
 
             let mut old = std::mem::replace(hf, new);
             old.flush()?; // Flush the buffer
@@ -1310,12 +1319,8 @@ mod tests {
                 db.put(b"1", b"1").unwrap();
                 db.put(b"2", b"2").unwrap();
 
-                Hintfile::new_or_open_existing(
-                    temp_dir.path(),
-                    db.writer.id,
-                    &options.hintfile_extension,
-                )
-                .unwrap();
+                Hintfile::new_writer(temp_dir.path(), db.writer.id, &options.hintfile_extension)
+                    .unwrap();
 
                 assert_eq!(db.merge_tracker.bytes_written, (23 * 2));
             }
@@ -1332,7 +1337,7 @@ mod tests {
 
                 db.merge().unwrap(); // Writes the values to the hintfile
 
-                let mut hf = Hintfile::new_or_open_existing(
+                let mut hf = Hintfile::new_writer(
                     temp_dir.path(),
                     db.writer.id,
                     &options.hintfile_extension,
@@ -1587,12 +1592,9 @@ mod tests {
     fn write_hintfile_record() {
         let (temp_dir, options, mut db) = init_test();
 
-        let mut hf = Hintfile::new_or_open_existing(
-            temp_dir.path(),
-            db.writer.id,
-            &options.hintfile_extension,
-        )
-        .unwrap();
+        let mut hf =
+            Hintfile::new_writer(temp_dir.path(), db.writer.id, &options.hintfile_extension)
+                .unwrap();
 
         const HINT_ENTRY_SIZE: usize = HINTFILE_RECORD_HEADER_SIZE_BYTES + 1;
 
@@ -1685,7 +1687,9 @@ mod tests {
             // Hints should be written to the new datafiles including writer
             let last = db.writer.id - 1;
             for (id, _) in db.readers {
-                let hf = Hintfile::new_or_open_existing(temp_dir.path(), id, "hint").unwrap();
+                let hf = Hintfile::open_if_exists(temp_dir.path(), id, "hint")
+                    .unwrap()
+                    .unwrap();
 
                 if id == last {
                     assert_eq!(
@@ -1703,7 +1707,7 @@ mod tests {
 
             // Old writer used during merge has been sealed, so current one should be empty
             assert_eq!(
-                Hintfile::new_or_open_existing(temp_dir.path(), db.writer.id, "hint")
+                Hintfile::new_writer(temp_dir.path(), db.writer.id, "hint")
                     .unwrap()
                     .file_size()
                     .unwrap(),

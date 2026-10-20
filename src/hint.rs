@@ -165,17 +165,13 @@ pub(crate) struct Hintfile {
 
 #[hotpath::measure_all]
 impl Hintfile {
-    pub(crate) fn new_or_open_existing(
-        dir: &Path,
-        id: u32,
-        hintfile_extension: &str,
-    ) -> Result<Self> {
+    pub(crate) fn new_writer(dir: &Path, id: u32, hintfile_extension: &str) -> Result<Self> {
         let filename = Datafile::generate_filename(dir, id, hintfile_extension);
 
         let file = OpenOptions::new()
-            .read(true)
-            .append(true)
+            .write(true)
             .create(true)
+            .truncate(true)
             .open(filename)?;
 
         Ok(Self {
@@ -470,38 +466,42 @@ mod test {
 
             {
                 let hintfile =
-                    Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
+                    Hintfile::new_writer(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
 
                 assert_eq!(hintfile.id, 1);
                 assert_eq!(hintfile.file_size().unwrap(), 0);
             }
 
-            assert!(Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).is_ok());
+            assert!(Hintfile::new_writer(temp_dir.path(), 1, HINTFILE_EXTENSION).is_ok());
         }
 
         #[test]
         fn append_read() {
             let temp_dir = tempfile::tempdir().unwrap();
-
-            let mut hintfile =
-                Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
-
             const RECORD_SIZE_BYTES: usize = HINTFILE_RECORD_HEADER_SIZE_BYTES + 4;
-
-            let mut offset = 0u64;
-
             let mut records: Vec<DatafileRecord> = Vec::new();
 
-            for i in 0..100u32 {
-                let record = DatafileRecord::new(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
-                let ksz = record.header.key_size;
-                records.push(record.clone());
+            {
+                let mut hintfile =
+                    Hintfile::new_writer(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
 
-                assert!(hintfile.append_hint_record(&record, offset).is_ok());
-                offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + ksz as u64;
+                let mut offset = 0u64;
+
+                for i in 0..100u32 {
+                    let record = DatafileRecord::new(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+                    let ksz = record.header.key_size;
+                    records.push(record.clone());
+
+                    assert!(hintfile.append_hint_record(&record, offset).is_ok());
+                    offset += HINTFILE_RECORD_HEADER_SIZE_BYTES as u64 + ksz as u64;
+                }
+
+                hintfile.flush().unwrap();
             }
 
-            hintfile.flush().unwrap();
+            let hintfile = Hintfile::open_if_exists(temp_dir.path(), 1, HINTFILE_EXTENSION)
+                .unwrap()
+                .unwrap();
 
             let mut offset = 0u64;
             for expected in records {
@@ -533,7 +533,7 @@ mod test {
 
             {
                 let mut hintfile =
-                    Hintfile::new_or_open_existing(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
+                    Hintfile::new_writer(temp_dir.path(), 1, HINTFILE_EXTENSION).unwrap();
 
                 let mut offset = 0u64;
 
