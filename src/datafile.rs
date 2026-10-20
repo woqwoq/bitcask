@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, ErrorKind, IoSlice, Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
@@ -38,7 +38,14 @@ impl Datafile {
             .read(true)
             .append(true)
             .create_new(true)
-            .open(filename)?;
+            .open(filename)
+            .map_err(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    DatafileError::DatafileNotFound(e)
+                } else {
+                    DatafileError::Open(e)
+                }
+            })?;
 
         Ok(Datafile {
             file: BufWriter::with_capacity(8 * KB, file),
@@ -77,7 +84,7 @@ impl Datafile {
                     return Err(DatafileError::DatafileNotFound(e));
                 }
 
-                Err(DatafileError::IO(e))
+                Err(DatafileError::Open(e))
             }
         }
     }
@@ -109,24 +116,34 @@ impl Datafile {
     }
 
     pub fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
-        let file_size = self.file.get_ref().metadata()?.len();
+        let file_size = self.file_size()?;
         let mut start_offset = 0;
 
         let mut reader = BufReader::with_capacity(8 * KB, self.file.get_ref());
-        reader.seek(SeekFrom::Start(0))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| DatafileError::Read {
+                offset: 0,
+                source: e,
+            })?;
 
         while start_offset < file_size {
             // TODO: Handle unexpected eof
             let header = DatafileRecordHeader::decode(&Self::read_exact_bytes(
                 &mut reader,
                 DATAFILE_HEADER_SIZE_BYTES,
+                start_offset,
             )?)?;
 
             // TODO: Make sure VSZ is not overflowing the file???
 
             let mut hasher = header.crc();
 
-            let key = Self::read_exact_bytes(&mut reader, header.key_size as usize)?;
+            let key = Self::read_exact_bytes(
+                &mut reader,
+                header.key_size as usize,
+                start_offset + DATAFILE_HEADER_SIZE_BYTES as u64,
+            )?;
             hasher.update(&key);
 
             let mut value_buffer: [u8; DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES] =
@@ -137,7 +154,15 @@ impl Datafile {
                 let to_read = DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES
                     .min(header.value_size as usize - value_bytes_read);
 
-                let bytes = reader.read(&mut value_buffer[..to_read])?;
+                let bytes = reader.read(&mut value_buffer[..to_read]).map_err(|e| {
+                    DatafileError::Read {
+                        offset: start_offset
+                            + DATAFILE_HEADER_SIZE_BYTES as u64
+                            + header.key_size as u64
+                            + value_bytes_read as u64,
+                        source: e,
+                    }
+                })?;
 
                 if bytes == 0 {
                     break;
@@ -182,7 +207,7 @@ impl Datafile {
         self.file
             .get_ref()
             .set_len(new_size)
-            .map_err(DatafileError::TruncateFailure)?;
+            .map_err(DatafileError::Truncate)?;
         self.sync(&SyncMode::SyncAll)
     }
 
@@ -208,7 +233,7 @@ impl Datafile {
     }
 
     pub fn flush(&mut self) -> Result<(), DatafileError> {
-        self.file.flush()?;
+        self.file.flush().map_err(DatafileError::Flush)?;
         Ok(())
     }
 
@@ -218,13 +243,13 @@ impl Datafile {
     ) -> Result<(), DatafileError> {
         writer
             .write_all(&record.header.encode())
-            .map_err(DatafileError::UnexpectedEOFDuringWrite)?;
+            .map_err(DatafileError::Write)?;
         writer
             .write_all(&record.key)
-            .map_err(DatafileError::UnexpectedEOFDuringWrite)?;
+            .map_err(DatafileError::Write)?;
         writer
             .write_all(&record.value)
-            .map_err(DatafileError::UnexpectedEOFDuringWrite)?;
+            .map_err(DatafileError::Write)?;
         Ok(())
     }
 
@@ -250,13 +275,13 @@ impl Datafile {
     }
 
     pub fn sync(&mut self, mode: &SyncMode) -> Result<(), DatafileError> {
-        self.file.flush()?;
+        self.file.flush().map_err(DatafileError::Flush)?;
 
         match mode {
             SyncMode::SyncAll => self.file.get_ref().sync_all(),
             SyncMode::SyncData => self.file.get_ref().sync_data(),
         }
-        .map_err(DatafileError::SyncError)
+        .map_err(DatafileError::Sync)
     }
 
     fn move_writer_offset(&mut self, offset: u64) -> Result<(), DatafileError> {
@@ -273,15 +298,24 @@ impl Datafile {
     pub fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, DatafileError> {
         let mut buf = vec![0u8; count];
 
-        self.file.get_ref().read_exact_at(&mut buf, offset)?;
+        self.file
+            .get_ref()
+            .read_exact_at(&mut buf, offset)
+            .map_err(|source| DatafileError::Read { offset, source })?;
 
         Ok(Box::from(buf))
     }
 
-    fn read_exact_bytes<R: Read>(reader: &mut R, count: usize) -> Result<Box<[u8]>, DatafileError> {
+    fn read_exact_bytes<R: Read>(
+        reader: &mut R,
+        count: usize,
+        offset: u64,
+    ) -> Result<Box<[u8]>, DatafileError> {
         let mut buf = vec![0u8; count];
 
-        reader.read_exact(&mut buf)?;
+        reader
+            .read_exact(&mut buf)
+            .map_err(|source| DatafileError::Read { offset, source })?;
 
         Ok(Box::from(buf))
     }
@@ -295,7 +329,14 @@ impl Datafile {
     }
 
     pub fn file_size(&self) -> Result<u64, DatafileError> {
-        Ok(self.file.get_ref().metadata()?.len())
+        self.file
+            .get_ref()
+            .metadata()
+            .map_err(|e| DatafileError::Read {
+                offset: 0,
+                source: e,
+            })
+            .map(|m| m.len())
     }
 }
 
@@ -340,7 +381,10 @@ pub struct DatafileRecordIterator<'a> {
 impl<'a> DatafileRecordIterator<'a> {
     pub fn new(datafile: &'a Datafile) -> Result<Self, DatafileError> {
         let mut reader = BufReader::new(datafile.file.get_ref());
-        reader.seek(SeekFrom::Start(0))?;
+        reader.seek(SeekFrom::Start(0)).map_err(|e| DatafileError::Read {
+            offset: 0,
+            source: e,
+        })?;
 
         Ok(Self { reader, offset: 0 })
     }
@@ -353,7 +397,10 @@ impl<'a> DatafileRecordIterator<'a> {
                 if e.kind() == ErrorKind::UnexpectedEof {
                     Ok(None)
                 } else {
-                    Err(DatafileError::IO(e))
+                    Err(DatafileError::Read {
+                        offset: self.offset,
+                        source: e,
+                    })
                 }
             }
             Ok(()) => Ok(Some(Box::from(buf))),
@@ -368,7 +415,10 @@ impl<'a> DatafileRecordIterator<'a> {
                 if e.kind() == ErrorKind::UnexpectedEof {
                     Ok(None)
                 } else {
-                    Err(DatafileError::IO(e))
+                    Err(DatafileError::Read {
+                        offset: self.offset,
+                        source: e,
+                    })
                 }
             }
             Ok(()) => Ok(Some(buf)),
@@ -384,7 +434,12 @@ impl<'a> DatafileRecordIterator<'a> {
                     self.offset + DATAFILE_HEADER_SIZE_BYTES as u64 + header.key_size as u64;
 
                 self.offset += header.payload_size()? as u64;
-                self.reader.seek_relative(header.value_size as i64)?;
+                self.reader
+                    .seek_relative(header.value_size as i64)
+                    .map_err(|e| DatafileError::Read {
+                        offset: value_offset,
+                        source: e,
+                    })?;
 
                 return Ok(Some(DatafileRecordIteratorEntry::new(
                     header,

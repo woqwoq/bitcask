@@ -118,12 +118,14 @@ impl HintfileRecordHeader {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct HintfileRecord {
     pub(crate) header: HintfileRecordHeader, // Header
     pub(crate) key: Box<[u8]>,               // The actual key
 }
 
+#[allow(dead_code)]
 impl HintfileRecord {
     pub(crate) fn from_datafile_record(df_record: &DatafileRecord, value_offset: u64) -> Self {
         Self {
@@ -172,7 +174,8 @@ impl Hintfile {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(filename)?;
+            .open(filename)
+            .map_err(HintfileError::Open)?;
 
         Ok(Self {
             file: BufWriter::with_capacity(8 * KB, file),
@@ -186,7 +189,7 @@ impl Hintfile {
         let mut count: usize = 0;
 
         let mut reader = BufReader::with_capacity(8 * KB, self.file.get_ref());
-        reader.seek(SeekFrom::Start(0))?;
+        reader.seek(SeekFrom::Start(0)).map_err(HintfileError::Read)?;
 
         while start_offset < fsz {
             let header = HintfileRecordHeader::decode(&Self::read_exact_bytes(
@@ -234,7 +237,8 @@ impl Hintfile {
             .read(true)
             .write(false)
             .create(false)
-            .open(filename)?;
+            .open(filename)
+            .map_err(HintfileError::Open)?;
 
         Ok(Some(Self {
             file: BufWriter::with_capacity(8 * KB, file),
@@ -242,10 +246,14 @@ impl Hintfile {
         }))
     }
 
+    #[allow(dead_code)]
     fn read_exact_bytes_at(&self, offset: u64, count: usize) -> Result<Box<[u8]>> {
         let mut buf = vec![0u8; count];
 
-        self.file.get_ref().read_exact_at(&mut buf, offset)?;
+        self.file
+            .get_ref()
+            .read_exact_at(&mut buf, offset)
+            .map_err(HintfileError::Read)?;
 
         Ok(Box::from(buf))
     }
@@ -253,7 +261,7 @@ impl Hintfile {
     fn read_exact_bytes<R: Read>(reader: &mut R, count: usize) -> Result<Box<[u8]>> {
         let mut buf = vec![0u8; count];
 
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf).map_err(HintfileError::Read)?;
 
         Ok(Box::from(buf))
     }
@@ -279,32 +287,41 @@ impl Hintfile {
         header: HintfileRecordHeader,
         key: &[u8],
     ) -> Result<()> {
-        writer.write_all(&header.encode())?;
-        writer.write_all(key)?;
+        writer
+            .write_all(&header.encode())
+            .map_err(HintfileError::Write)?;
+        writer.write_all(key).map_err(HintfileError::Write)?;
 
         Ok(())
     }
 
     pub(crate) fn file_size(&self) -> Result<u64> {
-        Ok(self.file.get_ref().metadata()?.len())
+        Ok(self
+            .file
+            .get_ref()
+            .metadata()
+            .map_err(HintfileError::Read)?
+            .len())
     }
 
     pub(crate) fn sync(&mut self) -> Result<()> {
-        self.file.get_mut().sync_data().map_err(HintfileError::IO)
+        self.file.get_mut().sync_data().map_err(HintfileError::Sync)
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.file.flush()?;
+        self.file.flush().map_err(HintfileError::Flush)?;
         Ok(())
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct HintfileIterator<'a> {
     hintfile: &'a Hintfile,
     fsz: u64,
     offset: u64,
 }
 
+#[allow(dead_code)]
 impl<'a> HintfileIterator<'a> {
     pub(crate) fn new(hintfile: &'a Hintfile) -> Result<Self> {
         let fsz = hintfile.file_size()?;

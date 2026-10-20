@@ -9,7 +9,10 @@ use lru::LruCache;
 
 use crate::{
     datafile::{Datafile, DatafileRecordIterator},
-    error::{BitcaskError, DatafileError, HintfileError},
+    error::{
+        BitcaskError, DatafileError, GetError, HintfileError, MergeError, OpenError, PutError,
+        RemoveError,
+    },
     hint::Hintfile,
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
@@ -110,35 +113,41 @@ impl BitcaskRecoveryHandler {
         mut df: Datafile,
         error: DatafileError,
         is_last: bool,
-    ) -> Result<Datafile, BitcaskError> {
+    ) -> Result<Datafile, OpenError> {
         match options.recovery_mode {
             // Recover only the last datafile
             RecoveryMode::TolerateCorruptedTailRecords => {
                 if !is_last {
                     // Failure in non-last datafiles is fatal
-                    return Err(BitcaskError::FatalDatafileReplayFailure(error));
+                    return Err(OpenError::FatalDatafileReplay(error));
                 }
 
-                df = Self::reopen_reader_for_recovery(dir, options, df)?;
+                df = Self::reopen_reader_for_recovery(dir, options, df)
+                    .map_err(OpenError::FatalDatafileReplay)?;
                 match error {
-                    DatafileError::TornWrite => df.truncate(df.offset)?,
-                    DatafileError::UndersizedDatafileHeader(_) => df.truncate(df.offset)?,
-                    DatafileError::IO(e) => {
-                        if e.kind() == ErrorKind::UnexpectedEof {
-                            df.truncate(df.offset)?
+                    DatafileError::TornWrite
+                    | DatafileError::UndersizedDatafileHeader(_)
+                    | DatafileError::CrcMismatch => {
+                        df.truncate(df.offset)
+                            .map_err(OpenError::FatalDatafileReplay)?;
+                    }
+                    DatafileError::Read { source, .. } => {
+                        if source.kind() == ErrorKind::UnexpectedEof {
+                            df.truncate(df.offset)
+                                .map_err(OpenError::FatalDatafileReplay)?;
                         } else {
-                            return Err(BitcaskError::FatalDatafileReplayFailure(
-                                DatafileError::IO(e),
-                            ));
+                            return Err(OpenError::FatalDatafileReplay(DatafileError::Read {
+                                offset: df.offset,
+                                source,
+                            }));
                         }
                     }
-                    DatafileError::CrcMismatch => df.truncate(df.offset)?,
-                    e => return Err(BitcaskError::FatalDatafileReplayFailure(e)),
+                    e => return Err(OpenError::FatalDatafileReplay(e)),
                 }
                 Ok(df)
             }
             RecoveryMode::AbsoluteConsistency => {
-                Err(BitcaskError::FatalDatafileReplayFailure(error))
+                Err(OpenError::FatalDatafileReplay(error))
             }
         }
     }
@@ -147,9 +156,9 @@ impl BitcaskRecoveryHandler {
     pub fn recover_post_hf_replay_failure(
         e: HintfileError,
         options: &BitcaskOptions,
-    ) -> Result<(), BitcaskError> {
+    ) -> Result<(), OpenError> {
         match options.recovery_mode {
-            RecoveryMode::AbsoluteConsistency => Err(BitcaskError::FatalHintfileReplayFailure(e)),
+            RecoveryMode::AbsoluteConsistency => Err(OpenError::FatalHintfileReplay(e)),
             RecoveryMode::TolerateCorruptedTailRecords => Ok(()),
         }
     }
@@ -173,21 +182,22 @@ impl BitcaskStartupHandler {
     pub fn parse_db_datafile_ids_at_path(
         dir: &Path,
         datafile_extension: &str,
-    ) -> Result<Vec<u32>, BitcaskError> {
+    ) -> Result<Vec<u32>, OpenError> {
         if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
+            std::fs::create_dir_all(dir).map_err(OpenError::InvalidDBPath)?;
         }
 
         if !dir.is_dir() {
-            return Err(BitcaskError::PathIsFile);
+            return Err(OpenError::PathIsFile);
         }
 
         let mut ids: Vec<u32> = Vec::new();
-        for file in read_dir(dir)? {
-            let filename = file?
+        for file in read_dir(dir).map_err(OpenError::InvalidDBPath)? {
+            let file = file.map_err(OpenError::InvalidDBPath)?;
+            let filename = file
                 .file_name()
                 .into_string()
-                .map_err(|_| BitcaskError::FilenameConversion)?;
+                .map_err(|_| OpenError::FilenameConversion)?;
 
             if let Some((name, ext)) = filename.rsplit_once('.') {
                 if ext == datafile_extension {
@@ -211,16 +221,19 @@ impl BitcaskStartupHandler {
         options: &BitcaskOptions,
         keydir: &mut KeyDir,
         readers: &mut LruCache<u32, Datafile>,
-    ) -> Result<(Option<Datafile>, u64), BitcaskError> {
+    ) -> Result<(Option<Datafile>, u64), OpenError> {
         let df_ids = Self::parse_db_datafile_ids_at_path(dir, &options.datafile_extension)?;
         let last = df_ids.last().cloned();
         let mut total_df_size = 0u64;
 
         for id in df_ids {
             let is_last = Some(id) == last;
-            let mut df = Datafile::open_reader(dir, id, &options.datafile_extension)?;
+            let mut df = Datafile::open_reader(dir, id, &options.datafile_extension)
+                .map_err(OpenError::FatalDatafileReplay)?;
 
-            let hint_count = match Hintfile::open_if_exists(dir, id, &options.hintfile_extension)? {
+            let hint_count = match Hintfile::open_if_exists(dir, id, &options.hintfile_extension)
+                .map_err(OpenError::FatalHintfileReplay)?
+            {
                 Some(hf) => match hf.replay(keydir) {
                     Ok(n) => n,
                     Err(e) => {
@@ -239,7 +252,7 @@ impl BitcaskStartupHandler {
                 )?;
             }
 
-            total_df_size += df.file_size()?;
+            total_df_size += df.file_size().map_err(OpenError::FatalDatafileReplay)?;
 
             if is_last {
                 return Ok((Some(df), total_df_size));
@@ -256,23 +269,28 @@ impl BitcaskStartupHandler {
         options: &BitcaskOptions,
         latest_datafile: Option<Datafile>,
         readers: &mut LruCache<u32, Datafile>,
-    ) -> Result<Datafile, BitcaskError> {
+    ) -> Result<Datafile, OpenError> {
         if let Some(df) = latest_datafile {
-            if options.reuse_old_writer_on_startup || df.file_size()? == 0 {
-                return Ok(Self::reopen_datafile_as_writer(dir, options, df)?);
+            if options.reuse_old_writer_on_startup
+                || df.file_size().map_err(OpenError::WriterInit)? == 0
+            {
+                return Self::reopen_datafile_as_writer(dir, options, df)
+                    .map_err(OpenError::WriterInit);
             }
 
             let id = df.id;
             readers.put(id, df);
 
-            return Ok(Datafile::new_writer(
+            return Datafile::new_writer(
                 dir,
                 id + 1,
                 &options.datafile_extension,
-            )?);
+            )
+            .map_err(OpenError::WriterInit);
         }
 
-        Ok(Datafile::new_writer(dir, 1, &options.datafile_extension)?)
+        Datafile::new_writer(dir, 1, &options.datafile_extension)
+            .map_err(OpenError::WriterInit)
     }
 }
 
@@ -314,7 +332,8 @@ impl BitcaskInstance {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
-        let _ = self.write_datafile_record(&DatafileRecord::new(key, value)?)?;
+        let record = DatafileRecord::new(key, value).map_err(PutError::Datafile)?;
+        self.write_datafile_record(&record)?;
 
         Ok(())
     }
@@ -331,37 +350,45 @@ impl BitcaskInstance {
         if let Some(keydir_entry) = self.keydir.get(key) {
             // If the current writer contains the entry
             let reader = if self.writer.id == keydir_entry.file_id {
-                self.writer.flush()?;
+                self.writer.flush().map_err(GetError::Datafile)?;
                 &self.writer
                 // If the LRU cache houses the reader containing the entry
             } else if let Some(reader) = self.readers.get(&keydir_entry.file_id) {
                 reader
-            } else if let Ok(reader) = Datafile::open_reader(
-                &self.dir,
-                keydir_entry.file_id,
-                &self.options.datafile_extension,
-            ) {
-                let reader_id = reader.id;
-                self.readers.put(reader_id, reader);
-                self.readers
-                    .get(&reader_id)
-                    .ok_or(BitcaskError::DatafileMissing(reader_id as usize))?
             } else {
-                return Err(BitcaskError::DatafileMissing(keydir_entry.file_id as usize));
+                match Datafile::open_reader(
+                    &self.dir,
+                    keydir_entry.file_id,
+                    &self.options.datafile_extension,
+                ) {
+                    Ok(reader) => {
+                        let reader_id = reader.id;
+                        self.readers.put(reader_id, reader);
+                        self.readers
+                            .get(&reader_id)
+                            .ok_or(GetError::DatafileMissing(reader_id))?
+                    }
+                    Err(DatafileError::DatafileNotFound(_)) => {
+                        return Err(GetError::DatafileMissing(keydir_entry.file_id).into());
+                    }
+                    Err(e) => {
+                        return Err(GetError::Datafile(e).into());
+                    }
+                }
             };
 
-            Ok(Some(
-                reader
-                    .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
-                    .map_err(BitcaskError::DatafileError)?,
-            ))
+            let bytes = reader
+                .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+                .map_err(GetError::Datafile)?;
+
+            Ok(Some(bytes))
         } else {
             Ok(None)
         }
     }
 
-    fn write_datafile_record(&mut self, record: &DatafileRecord) -> Result<u64, BitcaskError> {
-        let rsz = record.size()?;
+    fn write_datafile_record(&mut self, record: &DatafileRecord) -> Result<u64, PutError> {
+        let rsz = record.size().map_err(PutError::Datafile)?;
 
         // If our record is larger than the writer max size, we either throw an
         // error or let it happen and continue
@@ -371,36 +398,43 @@ impl BitcaskInstance {
                 DatafileMaxSize::HardCappedBytes(_)
             )
         {
-            return Err(BitcaskError::RecordLargerThanMaxDatafileSize(rsz));
+            return Err(PutError::RecordLargerThanMaxDatafileSize(rsz));
         }
 
         if self
             .writer
-            .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)?
+            .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)
+            .map_err(PutError::Datafile)?
         {
             self.switch_writer_datafile()?;
         }
 
-        let offset = self.commit_datafile_write(record)?; // Write record first, so that it can be
+        let offset = self.commit_datafile_write(record).map_err(PutError::Datafile)?; // Write record first, so that it can be
         // replayed in case of a crash.
         self.write_count += 1;
 
-        self.sync_writer()?; // Sync IO according to user's options
+        self.sync_writer().map_err(PutError::Datafile)?; // Sync IO according to user's options
 
-        self.commit_keydir_write(record, offset)?; // Append entry to the keydir
+        self.commit_keydir_write(record, offset).map_err(PutError::Datafile)?; // Append entry to the keydir
 
         Ok(offset)
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
         if self.keydir.contains(key) {
-            self.write_datafile_record(&DatafileRecord::new_tombstone(key)?)?;
+            let record = DatafileRecord::new_tombstone(key).map_err(RemoveError::Datafile)?;
+            self.write_datafile_record(&record)
+                .map_err(|e| match e {
+                    PutError::Datafile(d) => RemoveError::Datafile(d),
+                    PutError::AutoMerge(m) => RemoveError::AutoMerge(m),
+                    PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
+                })?;
         }
 
         Ok(())
     }
 
-    fn sync_writer(&mut self) -> Result<(), BitcaskError> {
+    fn sync_writer(&mut self) -> Result<(), DatafileError> {
         match self.options.sync_frequency {
             SyncFrequency::EveryWrite => self.writer.sync(&self.options.sync_mode)?,
             SyncFrequency::EveryNthWrite(n) => {
@@ -418,7 +452,7 @@ impl BitcaskInstance {
         &mut self,
         record: &DatafileRecord,
         offset: u64,
-    ) -> Result<(), BitcaskError> {
+    ) -> Result<(), DatafileError> {
         let ksz = record.header.key_size;
         let header_and_key_size = DATAFILE_HEADER_SIZE_BYTES as u32 + ksz;
 
@@ -453,26 +487,18 @@ impl BitcaskInstance {
                     // value dead
                 }
             }
-            _ => return Err(DatafileError::UnexpectedDatafileRecordType)?,
+            _ => return Err(DatafileError::UnexpectedDatafileRecordType),
         }
 
         Ok(())
     }
 
-    fn commit_datafile_write(&mut self, record: &DatafileRecord) -> Result<u64, BitcaskError> {
-        self.writer
-            .append_record(record)
-            .map_err(BitcaskError::DatafileError)
+    fn commit_datafile_write(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {
+        self.writer.append_record(record)
     }
 
-    fn switch_writer_datafile(&mut self) -> Result<(), BitcaskError> {
+    fn rotate_writer(&mut self) -> Result<(), DatafileError> {
         self.writer.flush()?;
-
-        if self.merge_tracker.should_merge(&self.options) {
-            self.merge()?; // Will also provide a fresh new writer
-            return Ok(());
-        }
-
         self.writer.demote_to_reader();
 
         let old_writer = &mut self.writer;
@@ -491,6 +517,21 @@ impl BitcaskInstance {
         Ok(())
     }
 
+    fn switch_writer_datafile(&mut self) -> Result<(), PutError> {
+        self.writer.flush()?;
+
+        if self.merge_tracker.should_merge(&self.options) {
+            self.merge_inner()?; // Will also provide a fresh new writer
+            self.merge_tracker.reset();
+            self.merge_tracker.write(self.keydir.get_live_log_size());
+            return Ok(());
+        }
+
+        self.rotate_writer()?;
+
+        Ok(())
+    }
+
     pub fn merge(&mut self) -> Result<(), BitcaskError> {
         self.merge_tracker.active = false;
 
@@ -503,17 +544,22 @@ impl BitcaskInstance {
             self.merge_tracker.write(self.keydir.get_live_log_size());
         }
 
-        merge
+        merge?;
+        Ok(())
     }
 
     // TODO: Bufferize reads during merge
-    fn merge_inner(&mut self) -> Result<(), BitcaskError> {
-        self.switch_writer_datafile()?; // Lock the latest writer
+    fn merge_inner(&mut self) -> Result<(), MergeError> {
+        self.rotate_writer()?; // Lock the latest writer
 
         let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
             &self.dir,
             &self.options.datafile_extension,
-        )?
+        )
+        .map_err(|e| match e {
+            OpenError::InvalidDBPath(io) => MergeError::DirectoryScan(io),
+            other => MergeError::DirectoryScan(std::io::Error::other(other.to_string())),
+        })?
         .into_iter()
         .filter(|&id| id < self.writer.id)
         .collect();
@@ -543,7 +589,7 @@ impl BitcaskInstance {
                     hasher.update(&value);
 
                     if hasher.finalize() != df_entry.header.crc {
-                        return Err(BitcaskError::DatafileError(DatafileError::CrcMismatch));
+                        return Err(MergeError::Datafile(DatafileError::CrcMismatch));
                     }
 
                     let record = DatafileRecord::with_timestamp(
@@ -552,7 +598,11 @@ impl BitcaskInstance {
                         df_entry.header.timestamp,
                     )?;
 
-                    let record_start_offset = self.write_datafile_record(&record)?; // We want to keep original timestamp
+                    let record_start_offset = self.write_datafile_record(&record).map_err(|e| match e {
+                        PutError::Datafile(df_err) => MergeError::Datafile(df_err),
+                        PutError::AutoMerge(merge_err) => merge_err,
+                        PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
+                    })?; // We want to keep original timestamp
                     self.write_hintfile_record(&mut hf, &record, record_start_offset)?;
                 }
                 // Otherwise we ignore the value as it is either dead or the tombstone itself
@@ -562,7 +612,7 @@ impl BitcaskInstance {
         hf.flush()?; // Flush the buffer
         hf.sync()?; // Sync the final hintfile
         self.remove_old_readers_post_merge(candidate_ids)?;
-        self.switch_writer_datafile()?; // Seal the last writer to avoid inconsistencies between
+        self.rotate_writer()?; // Seal the last writer to avoid inconsistencies between
         // hintfile and datafile
         Ok(())
     }
@@ -572,7 +622,7 @@ impl BitcaskInstance {
         hf: &mut Hintfile,
         record: &DatafileRecord,
         record_start_offset: u64,
-    ) -> Result<(), BitcaskError> {
+    ) -> Result<(), MergeError> {
         // When a writer switchover has occured
         if hf.id != self.writer.id {
             let new =
@@ -592,7 +642,7 @@ impl BitcaskInstance {
         Ok(())
     }
 
-    fn remove_old_readers_post_merge(&mut self, ids: Vec<u32>) -> Result<(), BitcaskError> {
+    fn remove_old_readers_post_merge(&mut self, ids: Vec<u32>) -> Result<(), MergeError> {
         for id in ids {
             self.readers.pop(&id); // Evict the file from LRU
 
@@ -601,7 +651,8 @@ impl BitcaskInstance {
                 &self.dir,
                 id,
                 &self.options.datafile_extension,
-            ))?;
+            ))
+            .map_err(MergeError::FileCleanup)?;
 
             // Remove the reader's hintfile from filesystem
             let hf = Datafile::generate_filename(
@@ -611,7 +662,7 @@ impl BitcaskInstance {
                 &self.options.hintfile_extension,
             );
             if hf.exists() {
-                fs::remove_file(hf)?;
+                fs::remove_file(hf).map_err(MergeError::FileCleanup)?;
             }
         }
 
@@ -636,7 +687,7 @@ mod tests {
     use crate::{
         datafile::Datafile,
         engine::{BitcaskInstance, BitcaskStartupHandler},
-        error::{BitcaskError, DatafileError},
+        error::{BitcaskError, DatafileError, GetError, OpenError, PutError},
         hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile},
         keydir::{KeyDir, KeyDirEntry},
         options::{BitcaskOptions, DatafileMaxSize},
@@ -885,7 +936,9 @@ mod tests {
 
             assert!(matches!(
                 db.put(&0u128.to_be_bytes(), &0u128.to_be_bytes()),
-                Err(BitcaskError::RecordLargerThanMaxDatafileSize(53usize))
+                Err(BitcaskError::PutFailure(
+                    PutError::RecordLargerThanMaxDatafileSize(53usize)
+                ))
             ));
             assert_eq!(db.keydir.len(), 0);
             assert_eq!(db.writer.id, 1); // No writer switchover should occur
@@ -966,6 +1019,17 @@ mod tests {
             );
             // Verify the missed reader has been discovered
             assert_eq!(db.readers.len(), 1);
+        }
+
+        #[test]
+        fn get_missing_datafile_returns_error() {
+            let (_, _, mut db) = init_test();
+            db.keydir.put(Box::from(b"missing_key" as &[u8]), 999, 10, 0, 12345);
+            let res = db.get(b"missing_key");
+            assert!(matches!(
+                res,
+                Err(BitcaskError::GetFailure(GetError::DatafileMissing(999)))
+            ));
         }
     }
 
@@ -1142,7 +1206,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(BitcaskError::DatafileError(
+                Err(OpenError::FatalDatafileReplay(
                     DatafileError::DatafileNotFound(_)
                 ))
             ));
@@ -1299,7 +1363,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(BitcaskError::FatalDatafileReplayFailure(
+                Err(OpenError::FatalDatafileReplay(
                     DatafileError::UnexpectedDatafileRecordType
                 ))
             ));
