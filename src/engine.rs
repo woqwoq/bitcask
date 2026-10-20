@@ -258,7 +258,7 @@ impl BitcaskStartupHandler {
         readers: &mut LruCache<u32, Datafile>,
     ) -> Result<Datafile, BitcaskError> {
         if let Some(df) = latest_datafile {
-            if options.reuse_old_writer_on_startup {
+            if options.reuse_old_writer_on_startup || df.file_size()? == 0 {
                 return Ok(Self::reopen_datafile_as_writer(dir, options, df)?);
             }
 
@@ -329,9 +329,11 @@ impl BitcaskInstance {
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
         if let Some(keydir_entry) = self.keydir.get(key) {
+            // If the current writer contains the entry
             let reader = if self.writer.id == keydir_entry.file_id {
                 self.writer.flush()?;
                 &self.writer
+                // If the LRU cache houses the reader containing the entry
             } else if let Some(reader) = self.readers.get(&keydir_entry.file_id) {
                 reader
             } else if let Ok(reader) = Datafile::open_reader(
@@ -1140,7 +1142,9 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(BitcaskError::DatafileError(DatafileError::IO(_)))
+                Err(BitcaskError::DatafileError(
+                    DatafileError::DatafileNotFound(_)
+                ))
             ));
         }
 
@@ -1351,7 +1355,7 @@ mod tests {
             // Reopen database and verify all records were loaded from hintfile (fake one should be
             // present)
             let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
-            assert_eq!(db.writer.id, 5);
+            assert_eq!(db.writer.id, 4);
             assert_eq!(db.len(), 3);
         }
 

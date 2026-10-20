@@ -59,19 +59,27 @@ impl Datafile {
     ) -> Result<Datafile, DatafileError> {
         let filename = Self::generate_filename(dir, id, datafile_extension);
 
-        let file = OpenOptions::new()
+        match OpenOptions::new()
             .read(true)
             .write(writeable)
             .append(is_writer)
             .create(false)
-            .open(filename)?;
+            .open(filename)
+        {
+            Ok(f) => Ok(Datafile {
+                file: BufWriter::new(f),
+                id,
+                offset,
+                is_writer,
+            }),
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Err(DatafileError::DatafileNotFound(e));
+                }
 
-        Ok(Datafile {
-            file: BufWriter::new(file),
-            id,
-            offset,
-            is_writer,
-        })
+                Err(DatafileError::IO(e))
+            }
+        }
     }
 
     pub fn open_datafile_as_writer(
@@ -229,7 +237,7 @@ impl Datafile {
             .offset
             .checked_add(record_size)
             .unwrap_or(datafile_max_size.get_size() as u64)
-            >= datafile_max_size.get_size() as u64;
+            > datafile_max_size.get_size() as u64;
 
         let is_writer_overcapped = match datafile_max_size {
             DatafileMaxSize::SoftCappedBytes(_) => self.offset > 0, // Soft cap will allow one
@@ -482,10 +490,7 @@ mod tests {
                 &options.datafile_extension,
             );
 
-            assert!(matches!(
-                result,
-                Err(DatafileError::IO(e)) if e.kind() == std::io::ErrorKind::NotFound
-            ));
+            assert!(matches!(result, Err(DatafileError::DatafileNotFound(_))));
             assert!(!path.exists());
         }
 

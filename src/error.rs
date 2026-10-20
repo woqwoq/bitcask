@@ -99,6 +99,7 @@ pub enum DatafileError {
     TornWrite,
     TruncateFailure(Error),
     UnexpectedEOFDuringWrite(Error),
+    DatafileNotFound(Error),
 }
 
 impl From<Error> for DatafileError {
@@ -170,6 +171,9 @@ impl fmt::Display for DatafileError {
             }
             DatafileError::UnexpectedEOFDuringWrite(e) => {
                 write!(f, "unexpected EOF during a write: {e}")
+            }
+            DatafileError::DatafileNotFound(e) => {
+                write!(f, "datafile not found: {e}")
             }
         }
     }
