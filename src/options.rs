@@ -2,6 +2,8 @@ pub const KB: usize = 1024;
 pub const MB: usize = KB * KB;
 pub const GB: usize = KB * MB;
 
+pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
+
 pub const DEFAULT_DATAFILE_EXTENSION: &str = "db";
 pub const DEFAULT_HINTFILE_EXTENSION: &str = "hint";
 
@@ -10,8 +12,6 @@ pub const DEFAULT_DATAFILE_SIZE_BYTES: usize = 10 * KB;
 
 pub const DEFAULT_MERGE_DEAD_SPACE_PERCENT_THRESHOLD: u8 = 80;
 pub const DEFAULT_MERGE_DEAD_SPACE_BYTE_THRESHOLD: u64 = (8 * KB) as u64;
-
-pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
 
 pub const EXPECTED_KEYDIR_MAX_SIZE: usize = 0;
 
