@@ -1,5 +1,6 @@
 use std::{
     fs::{self, read_dir},
+    hash::Hash,
     io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -15,7 +16,7 @@ use crate::{
         RemoveError,
     },
     hint::Hintfile,
-    keydir::{KeyDir, KeyDirEntry},
+    keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
     record::{
         DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
@@ -86,11 +87,17 @@ impl MergeTracker {
 pub struct BitcaskInstance {
     dir: PathBuf,                                     // For opening files through LRU
     pub(crate) keydir: KeyDir,                        // In-memory keydir map
-    pub writer: Datafile,                             // Writer file handle
+    pub writer: Mutex<Datafile>,                      // Writer file handle
     pub readers: Mutex<LruCache<u32, Arc<Datafile>>>, // Use LRU cache to track recently used files
     pub merge_tracker: MergeTracker, // For tracking dead space and trigger compaction
     write_count: usize,              // Write count tracker for sync
     options: BitcaskOptions,         // User-customisable options
+}
+
+impl Hash for BitcaskInstance {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.dir.hash(state);
+    }
 }
 
 pub struct BitcaskRecoveryHandler;
@@ -126,7 +133,7 @@ impl BitcaskRecoveryHandler {
                 df = Self::reopen_reader_for_recovery(dir, options, df)
                     .map_err(OpenError::FatalDatafileReplay)?;
                 match error {
-                    DatafileError::TornWrite
+                    DatafileError::TornRecord
                     | DatafileError::UndersizedDatafileHeader(_)
                     | DatafileError::CrcMismatch => {
                         df.truncate(df.offset)
@@ -307,12 +314,12 @@ impl BitcaskInstance {
         merge_tracker.write(total_df_size);
         merge_tracker.remove(total_df_size.saturating_sub(keydir.get_live_log_size()));
 
-        let writer = BitcaskStartupHandler::create_writer_with_options(
+        let writer = Mutex::new(BitcaskStartupHandler::create_writer_with_options(
             &dir,
             &options,
             latest_datafile,
             &mut readers,
-        )?;
+        )?);
 
         Ok(BitcaskInstance {
             keydir,
@@ -340,29 +347,21 @@ impl BitcaskInstance {
         self.keydir.is_empty()
     }
 
-    fn read_from_writer(&self, keydir_entry: &KeyDirEntry) -> Result<Box<[u8]>, BitcaskError> {
-        Ok(self
-            .writer
-            .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
-            .map_err(GetError::Datafile)?)
-    }
-
-    fn read_from_reader(
-        &self,
-        keydir_entry: &KeyDirEntry,
-        reader: &Datafile,
-    ) -> Result<Box<[u8]>, BitcaskError> {
-        Ok(reader
-            .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
-            .map_err(GetError::Datafile)?)
-    }
-
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
         if let Some(keydir_entry) = self.keydir.get(key) {
             // If the current writer contains the entry
-            if keydir_entry.file_id == self.writer.id {
-                self.writer.flush().map_err(GetError::Datafile)?;
-                return Ok(Some(self.read_from_writer(keydir_entry)?));
+            {
+                let mut writer = self.writer.lock().unwrap();
+
+                if keydir_entry.file_id == writer.id {
+                    writer.flush().map_err(GetError::Datafile)?;
+
+                    return Ok(Some(
+                        writer
+                            .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+                            .map_err(GetError::Datafile)?,
+                    ));
+                }
             }
 
             // If the LRU cache houses the reader containing the entry
@@ -393,7 +392,11 @@ impl BitcaskInstance {
                     }
                 };
 
-            return Ok(Some(self.read_from_reader(keydir_entry, &reader)?));
+            return Ok(Some(
+                reader
+                    .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+                    .map_err(GetError::Datafile)?,
+            ));
         }
         Ok(None)
     }
@@ -414,6 +417,8 @@ impl BitcaskInstance {
 
         if self
             .writer
+            .lock()
+            .unwrap()
             .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)
             .map_err(PutError::Datafile)?
         {
@@ -449,10 +454,12 @@ impl BitcaskInstance {
 
     fn sync_writer(&mut self) -> Result<(), DatafileError> {
         match self.options.sync_frequency {
-            SyncFrequency::EveryWrite => self.writer.sync(&self.options.sync_mode)?,
+            SyncFrequency::EveryWrite => {
+                self.writer.lock().unwrap().sync(&self.options.sync_mode)?
+            }
             SyncFrequency::EveryNthWrite(n) => {
                 if self.write_count.is_multiple_of(n) {
-                    self.writer.sync(&self.options.sync_mode)?
+                    self.writer.lock().unwrap().sync(&self.options.sync_mode)?
                 }
             }
             SyncFrequency::Never => {}
@@ -473,7 +480,7 @@ impl BitcaskInstance {
             DATAFILE_RECORD_TYPE_NORMAL => {
                 let old = self.keydir.put(
                     record.key.clone(),
-                    self.writer.id,
+                    self.writer.lock().unwrap().id,
                     record.header.value_size,
                     offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
                     record.header.timestamp,
@@ -507,14 +514,13 @@ impl BitcaskInstance {
     }
 
     fn commit_datafile_write(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {
-        self.writer.append_record(record)
+        self.writer.lock().unwrap().append_record(record)
     }
 
     fn rotate_writer(&mut self) -> Result<(), DatafileError> {
-        self.writer.flush()?;
-        self.writer.demote_to_reader();
-
-        let old_writer = &mut self.writer;
+        let mut old_writer = self.writer.lock().unwrap();
+        old_writer.flush()?;
+        old_writer.demote_to_reader();
         old_writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
 
         let new_writer = Datafile::new_writer(
@@ -523,7 +529,7 @@ impl BitcaskInstance {
             &self.options.datafile_extension,
         )?;
 
-        let old_writer = std::mem::replace(old_writer, new_writer);
+        let old_writer = std::mem::replace(&mut *old_writer, new_writer);
 
         self.readers
             .lock()
@@ -534,12 +540,10 @@ impl BitcaskInstance {
     }
 
     fn switch_writer_datafile(&mut self) -> Result<(), PutError> {
-        self.writer.flush()?;
+        self.writer.lock().unwrap().flush()?;
 
         if self.merge_tracker.should_merge(&self.options) {
             self.merge()?; // Will also provide a fresh new writer
-            self.merge_tracker.reset();
-            self.merge_tracker.write(self.keydir.get_live_log_size());
             return Ok(());
         }
 
@@ -567,6 +571,7 @@ impl BitcaskInstance {
     fn merge_inner(&mut self) -> Result<(), MergeError> {
         self.rotate_writer()?; // Lock the latest writer
 
+        let writer_id = self.writer.lock().unwrap().id;
         let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
             &self.dir,
             &self.options.datafile_extension,
@@ -576,11 +581,10 @@ impl BitcaskInstance {
             other => MergeError::DirectoryScan(std::io::Error::other(other.to_string())),
         })?
         .into_iter()
-        .filter(|&id| id < self.writer.id)
+        .filter(|&id| id < writer_id)
         .collect();
 
-        let mut hf =
-            Hintfile::new_writer(&self.dir, self.writer.id, &self.options.hintfile_extension)?;
+        let mut hf = Hintfile::new_writer(&self.dir, writer_id, &self.options.hintfile_extension)?;
 
         for id in candidate_ids.clone() {
             let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
@@ -599,8 +603,10 @@ impl BitcaskInstance {
                     // TODO: Possibly stream-write the value for hasher and write
                     // No need to stream the value in chunks as we need it allocated to perform the
                     // new write anyway
-                    let value =
-                        df.read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)?;
+                    let value = iter
+                        .next_value(keydir_entry.value_size as usize)?
+                        .ok_or(MergeError::Datafile(DatafileError::TornRecord))?;
+
                     hasher.update(&value);
 
                     if hasher.finalize() != df_entry.header.crc {
@@ -620,8 +626,10 @@ impl BitcaskInstance {
                             PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
                         })?; // We want to keep original timestamp
                     self.write_hintfile_record(&mut hf, &record, record_start_offset)?;
+                } else {
+                    // Otherwise we skip the value as it is either dead or the tombstone itself
+                    iter.skip_next(df_entry.header.value_size as usize)?;
                 }
-                // Otherwise we ignore the value as it is either dead or the tombstone itself
             }
         }
 
@@ -640,9 +648,9 @@ impl BitcaskInstance {
         record_start_offset: u64,
     ) -> Result<(), MergeError> {
         // When a writer switchover has occured
-        if hf.id != self.writer.id {
-            let new =
-                Hintfile::new_writer(&self.dir, self.writer.id, &self.options.hintfile_extension)?;
+        let writer_id = self.writer.lock().unwrap().id;
+        if hf.id != writer_id {
+            let new = Hintfile::new_writer(&self.dir, writer_id, &self.options.hintfile_extension)?;
 
             let mut old = std::mem::replace(hf, new);
             old.flush()?; // Flush the buffer
@@ -786,9 +794,13 @@ mod tests {
         fn creates_new_instance_on_empty_dir() {
             let (_, _, db) = init_test();
 
-            assert_eq!(db.writer.id, 1);
-            assert_eq!(db.writer.offset, 0);
-            assert!(db.writer.is_writer);
+            {
+                let writer = db.writer.lock().unwrap();
+
+                assert_eq!(writer.id, 1);
+                assert_eq!(writer.offset, 0);
+                assert!(writer.is_writer);
+            }
 
             assert!(db.readers.lock().unwrap().is_empty());
             assert!(db.keydir.is_empty());
@@ -816,25 +828,32 @@ mod tests {
                     db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
                 }
 
-                assert_eq!(db.writer.id, fratio.ceil() as u32);
+                {
+                    let writer = db.writer.lock().unwrap();
 
-                assert!(if fratio.round() == fratio {
-                    db.writer.offset == 0
-                } else {
-                    db.writer.offset != 0
-                });
+                    assert_eq!(writer.id, fratio.ceil() as u32);
+
+                    assert!(if fratio.round() == fratio {
+                        writer.offset == 0
+                    } else {
+                        writer.offset != 0
+                    });
+                }
 
                 assert_eq!(db.readers.lock().unwrap().len(), fratio.floor() as usize);
                 assert_eq!(db.keydir.len(), RECORD_COUNT);
             } // File handles should be released at this point
 
             {
-                let mut db =
+                let db =
                     BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
                         .unwrap();
 
-                assert_eq!(db.writer.id, fratio.ceil() as u32 + 1); // New writer should be created
-                assert_eq!(db.writer.offset, 0);
+                {
+                    let writer = db.writer.lock().unwrap();
+                    assert_eq!(writer.id, fratio.ceil() as u32 + 1); // New writer should be created
+                    assert_eq!(writer.offset, 0);
+                }
 
                 assert_eq!(db.readers.lock().unwrap().len(), fratio.ceil() as usize);
                 assert_eq!(db.keydir.len(), RECORD_COUNT);
@@ -861,15 +880,17 @@ mod tests {
             let value: u32 = 2;
 
             let datafile_record = datafile_record_for_string_u32(key, value);
-            let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
+            let expected = keydir_entry_for(&datafile_record, db.writer.lock().unwrap().id, 0);
 
             assert!(db.put(key.as_bytes(), &value.to_be_bytes()).is_ok());
-            db.writer.flush().unwrap();
+            db.writer.lock().unwrap().flush().unwrap();
 
             let mut expected_bytes = Vec::new();
             Datafile::write_record_to(&mut expected_bytes, &datafile_record).unwrap();
             let read_bytes = db
                 .writer
+                .lock()
+                .unwrap()
                 .read_bytes(0, datafile_record.size().unwrap())
                 .unwrap();
             assert_eq!(&read_bytes[0..1], &expected_bytes[0..1]);
@@ -881,7 +902,10 @@ mod tests {
             assert_eq!(keydir_written.value_size, expected.value_size);
             assert_eq!(keydir_written.value_offset, expected.value_offset);
 
-            assert_eq!(db.writer.offset, datafile_record.size().unwrap() as u64);
+            assert_eq!(
+                db.writer.lock().unwrap().offset,
+                datafile_record.size().unwrap() as u64
+            );
         }
 
         #[test]
@@ -889,14 +913,15 @@ mod tests {
             #[allow(unused_variables)]
             let (temp_dir, options, mut db) = init_test();
 
-            db.writer.offset = options.datafile_max_size.get_size() as u64;
+            {
+                let mut writer = db.writer.lock().unwrap();
 
-            assert_eq!(db.writer.id, 1);
-            assert!(db.writer.is_writer);
-            assert_eq!(
-                db.writer.offset,
-                options.datafile_max_size.get_size() as u64
-            );
+                writer.offset = options.datafile_max_size.get_size() as u64;
+
+                assert_eq!(writer.id, 1);
+                assert!(writer.is_writer);
+                assert_eq!(writer.offset, options.datafile_max_size.get_size() as u64);
+            }
 
             let key = "hello world";
             let value: u32 = 2;
@@ -904,12 +929,15 @@ mod tests {
             assert!(db.put(key.as_bytes(), &value.to_be_bytes()).is_ok());
 
             // Make sure new writer is created with proper id, role and offset
-            assert_eq!(db.writer.id, 2);
-            assert!(db.writer.is_writer);
-            assert_eq!(
-                db.writer.offset,
-                datafile_record_for_string_u32(key, value).size().unwrap() as u64
-            );
+            {
+                let writer = db.writer.lock().unwrap();
+                assert_eq!(writer.id, 2);
+                assert!(writer.is_writer);
+                assert_eq!(
+                    writer.offset,
+                    datafile_record_for_string_u32(key, value).size().unwrap() as u64
+                );
+            }
 
             // Verify the new writer is properly handled on get syncpath
             assert_eq!(
@@ -930,14 +958,20 @@ mod tests {
             .unwrap();
 
             assert!(db.put(&0u128.to_be_bytes(), &0u128.to_be_bytes()).is_ok());
-            assert_eq!(db.writer.id, 1); // Due to current writer being empty, we expect it to have at
-            // least one entry
-            assert_eq!(db.writer.offset, 53);
+            {
+                let writer = db.writer.lock().unwrap();
+                assert_eq!(writer.id, 1); // Due to current writer being empty, we expect it to have at
+                // least one entry
+                assert_eq!(writer.offset, 53);
+            }
 
             assert!(db.put(&1u128.to_be_bytes(), &1u128.to_be_bytes()).is_ok());
-            assert_eq!(db.writer.id, 2); // First writer is now oversized, so we switchover and commit
-            // on the new writer
-            assert_eq!(db.writer.offset, 53);
+            {
+                let writer = db.writer.lock().unwrap();
+                assert_eq!(writer.id, 2); // First writer is now oversized, so we switchover and commit
+                // on the new writer
+                assert_eq!(writer.offset, 53);
+            }
         }
 
         #[test]
@@ -958,19 +992,25 @@ mod tests {
                 ))
             ));
             assert_eq!(db.keydir.len(), 0);
-            assert_eq!(db.writer.id, 1); // No writer switchover should occur
+            assert_eq!(db.writer.lock().unwrap().id, 1); // No writer switchover should occur
 
             // First write should go through normally
             assert!(db.put(&0u32.to_be_bytes(), &0u32.to_be_bytes()).is_ok());
             assert_eq!(db.keydir.len(), 1);
-            assert_eq!(db.writer.id, 1);
-            assert_eq!(db.writer.offset, 29);
+            {
+                let writer = db.writer.lock().unwrap();
+                assert_eq!(writer.id, 1);
+                assert_eq!(writer.offset, 29);
+            }
 
             // The writer overflows, so we should switchover and write
             assert!(db.put(&1u32.to_be_bytes(), &1u32.to_be_bytes()).is_ok());
             assert_eq!(db.keydir.len(), 2);
-            assert_eq!(db.writer.id, 2);
-            assert_eq!(db.writer.offset, 29);
+            {
+                let writer = db.writer.lock().unwrap();
+                assert_eq!(writer.id, 2);
+                assert_eq!(writer.offset, 29);
+            }
         }
     }
 
@@ -1066,7 +1106,11 @@ mod tests {
             for i in 0..ENTRY_COUNT as u32 {
                 db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
             }
-            assert_eq!(db.writer.offset, (ENTRY_SIZE * ENTRY_COUNT) as u64);
+
+            assert_eq!(
+                db.writer.lock().unwrap().offset,
+                (ENTRY_SIZE * ENTRY_COUNT) as u64
+            );
 
             let delete_count = ENTRY_COUNT.div_ceil(2);
             for i in 0..delete_count as u32 {
@@ -1089,7 +1133,7 @@ mod tests {
             // We must have a writer offset incremented by delete_count * DATAFILE_TOMBSTONE_SIZE bytes
             // to make sure all of the tombstones are present
             assert_eq!(
-                db.writer.offset,
+                db.writer.lock().unwrap().offset,
                 (ENTRY_SIZE * ENTRY_COUNT + delete_count * DATAFILE_TOMBSTONE_SIZE) as u64
             );
         }
@@ -1405,8 +1449,12 @@ mod tests {
                 db.put(b"1", b"1").unwrap();
                 db.put(b"2", b"2").unwrap();
 
-                Hintfile::new_writer(temp_dir.path(), db.writer.id, &options.hintfile_extension)
-                    .unwrap();
+                Hintfile::new_writer(
+                    temp_dir.path(),
+                    db.writer.lock().unwrap().id,
+                    &options.hintfile_extension,
+                )
+                .unwrap();
 
                 assert_eq!(db.merge_tracker.bytes_written, (23 * 2));
             }
@@ -1418,14 +1466,14 @@ mod tests {
                     BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
 
                 assert_eq!(db.merge_tracker.bytes_written, (23 * 2));
-                assert_eq!(db.writer.id, 2);
+                assert_eq!(db.writer.lock().unwrap().id, 2);
                 assert_eq!(db.len(), 2);
 
                 db.merge().unwrap(); // Writes the values to the hintfile
 
                 let mut hf = Hintfile::new_writer(
                     temp_dir.path(),
-                    db.writer.id,
+                    db.writer.lock().unwrap().id,
                     &options.hintfile_extension,
                 )
                 .unwrap();
@@ -1437,7 +1485,7 @@ mod tests {
             // Reopen database and verify all records were loaded from hintfile (fake one should be
             // present)
             let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
-            assert_eq!(db.writer.id, 4);
+            assert_eq!(db.writer.lock().unwrap().id, 4);
             assert_eq!(db.len(), 3);
         }
 
@@ -1542,21 +1590,21 @@ mod tests {
         let (_, _, mut db) = init_test();
 
         let datafile_record = datafile_record_for_string_u32("hello world", 2);
-        let expected = keydir_entry_for(&datafile_record, db.writer.id, 0);
+        let expected = keydir_entry_for(&datafile_record, db.writer.lock().unwrap().id, 0);
 
         assert!(db.commit_keydir_write(&datafile_record.clone(), 0).is_ok());
         assert_eq!(db.keydir.len(), 1);
         assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
 
         let datafile_record = datafile_record_for_string_u32("byeworld", 2);
-        let expected = keydir_entry_for(&datafile_record, db.writer.id, 35);
+        let expected = keydir_entry_for(&datafile_record, db.writer.lock().unwrap().id, 35);
 
         assert!(db.commit_keydir_write(&datafile_record.clone(), 35).is_ok());
         assert_eq!(db.keydir.len(), 2);
         assert_eq!(db.keydir.get(&datafile_record.key).unwrap(), &expected);
 
         let datafile_record = datafile_record_for_string_u32("byeworld", 3);
-        let expected = keydir_entry_for(&datafile_record, db.writer.id, 70);
+        let expected = keydir_entry_for(&datafile_record, db.writer.lock().unwrap().id, 70);
 
         assert!(db.commit_keydir_write(&datafile_record.clone(), 70).is_ok());
         assert_ne!(db.keydir.len(), 3);
@@ -1568,11 +1616,14 @@ mod tests {
         #[allow(unused_variables)]
         let (temp_dir, _, mut db) = init_test();
 
-        assert_eq!(db.writer.id, 1);
-        assert!(db.writer.is_writer);
-        assert_eq!(db.writer.offset, 0);
-        assert_eq!(db.readers.lock().unwrap().len(), 0);
+        {
+            let writer = db.writer.lock().unwrap();
+            assert_eq!(writer.id, 1);
+            assert!(writer.is_writer);
+            assert_eq!(writer.offset, 0);
+        }
 
+        assert_eq!(db.readers.lock().unwrap().len(), 0);
         assert!(db.switch_writer_datafile().is_ok());
 
         // Make sure old writer is demoted and added to LRU cache of readers
@@ -1586,17 +1637,18 @@ mod tests {
         }
 
         // Make sure new writer is created with proper id, role and offset
-        assert_eq!(db.writer.id, 2);
-        assert!(db.writer.is_writer);
-        assert_eq!(db.writer.offset, 0);
+        let mut writer = db.writer.lock().unwrap();
+        assert_eq!(writer.id, 2);
+        assert!(writer.is_writer);
+        assert_eq!(writer.offset, 0);
 
         // Make sure the new datafile accepts writes
         let key = "hello world";
         let value: u32 = 2;
 
         let datafile_record = datafile_record_for_string_u32(key, value);
-        assert!(db.writer.append_record(&datafile_record).is_ok());
-        assert_eq!(db.writer.offset, datafile_record.size().unwrap() as u64);
+        assert!(writer.append_record(&datafile_record).is_ok());
+        assert_eq!(writer.offset, datafile_record.size().unwrap() as u64);
     }
 
     #[test]
@@ -1623,7 +1675,7 @@ mod tests {
             assert_eq!(db.keydir.len(), ENTRY_COUNT);
 
             assert_eq!(
-                db.writer.id,
+                db.writer.lock().unwrap().id,
                 entry_total_size.div_ceil(options.datafile_max_size.get_size()) as u32
             );
 
@@ -1640,21 +1692,24 @@ mod tests {
             assert_eq!(db.keydir.len(), ENTRY_COUNT);
 
             // Same writer ID should be used
-            assert_eq!(
-                db.writer.id,
-                entry_total_size.div_ceil(options.datafile_max_size.get_size()) as u32
-            );
+            {
+                let writer = db.writer.lock().unwrap();
+                assert_eq!(
+                    writer.id,
+                    entry_total_size.div_ceil(options.datafile_max_size.get_size()) as u32
+                );
 
-            assert_eq!(
-                db.writer.offset
-                    + db.readers
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .map(|(_, reader)| reader.offset)
-                        .sum::<u64>(),
-                entry_total_size as u64
-            );
+                assert_eq!(
+                    writer.offset
+                        + db.readers
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(_, reader)| reader.offset)
+                            .sum::<u64>(),
+                    entry_total_size as u64
+                );
+            }
 
             assert_eq!(
                 db.readers.lock().unwrap().len(),
@@ -1670,7 +1725,7 @@ mod tests {
             );
 
             assert_eq!(
-                db.writer.offset
+                db.writer.lock().unwrap().offset
                     + db.readers
                         .lock()
                         .unwrap()
@@ -1686,9 +1741,12 @@ mod tests {
     fn write_hintfile_record() {
         let (temp_dir, options, mut db) = init_test();
 
-        let mut hf =
-            Hintfile::new_writer(temp_dir.path(), db.writer.id, &options.hintfile_extension)
-                .unwrap();
+        let mut hf = Hintfile::new_writer(
+            temp_dir.path(),
+            db.writer.lock().unwrap().id,
+            &options.hintfile_extension,
+        )
+        .unwrap();
 
         const HINT_ENTRY_SIZE: usize = HINTFILE_RECORD_HEADER_SIZE_BYTES + 1;
 
@@ -1736,19 +1794,25 @@ mod tests {
             let datafiles_to_house_dead_payload: usize =
                 (2 * ENTRY_COUNT).div_ceil(entries_to_fit_on_single_df);
 
-            assert_eq!(db.writer.id, datafiles_to_house_payload as u32);
+            assert_eq!(
+                db.writer.lock().unwrap().id,
+                datafiles_to_house_payload as u32
+            );
             assert_eq!(db.len(), ENTRY_COUNT);
 
             for i in 0..ENTRY_COUNT as u32 {
                 db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
             }
-            assert_eq!(db.writer.id, datafiles_to_house_dead_payload as u32);
+            assert_eq!(
+                db.writer.lock().unwrap().id,
+                datafiles_to_house_dead_payload as u32
+            );
             assert_eq!(db.len(), ENTRY_COUNT);
 
             assert!(db.merge().is_ok());
 
             assert_eq!(
-                db.writer.id,
+                db.writer.lock().unwrap().id,
                 datafiles_to_house_dead_payload as u32 // All sealed during merge
                     + datafiles_to_house_payload as u32 // New files to house the data
                 + 1 // Last sealed writer
@@ -1779,7 +1843,7 @@ mod tests {
             }
 
             // Hints should be written to the new datafiles including writer
-            let last = db.writer.id - 1;
+            let last = db.writer.lock().unwrap().id - 1;
             {
                 let readers = db.readers.lock().unwrap();
 
@@ -1805,7 +1869,7 @@ mod tests {
 
             // Old writer used during merge has been sealed, so current one should be empty
             assert_eq!(
-                Hintfile::new_writer(temp_dir.path(), db.writer.id, "hint")
+                Hintfile::new_writer(temp_dir.path(), db.writer.lock().unwrap().id, "hint")
                     .unwrap()
                     .file_size()
                     .unwrap(),

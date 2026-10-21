@@ -94,10 +94,16 @@ impl fmt::Display for OpenError {
                 write!(f, "encountered a datafile filename that is not valid UTF-8")
             }
             OpenError::FatalDatafileReplay(e) => {
-                write!(f, "fatal error while replaying datafiles during startup: {e}")
+                write!(
+                    f,
+                    "fatal error while replaying datafiles during startup: {e}"
+                )
             }
             OpenError::FatalHintfileReplay(e) => {
-                write!(f, "fatal error while replaying hintfiles during startup: {e}")
+                write!(
+                    f,
+                    "fatal error while replaying hintfiles during startup: {e}"
+                )
             }
             OpenError::WriterInit(e) => {
                 write!(f, "failed to initialize active writer datafile: {e}")
@@ -266,7 +272,10 @@ impl fmt::Display for MergeError {
                 write!(f, "failed to clean up old file after merge: {e}")
             }
             MergeError::DirectoryScan(e) => {
-                write!(f, "failed to scan directory for datafiles during merge: {e}")
+                write!(
+                    f,
+                    "failed to scan directory for datafiles during merge: {e}"
+                )
             }
         }
     }
@@ -316,7 +325,7 @@ pub enum DatafileError {
     WriterFileOffsetOverflow,
     WriteAttemptToReaderDatafile,
     UnexpectedDatafileRecordType,
-    TornWrite,
+    TornRecord,
 }
 
 impl fmt::Display for DatafileError {
@@ -368,7 +377,7 @@ impl fmt::Display for DatafileError {
                 f,
                 "unexpected record type: expected 0 (normal) or 1 (tombstone)"
             ),
-            DatafileError::TornWrite => write!(
+            DatafileError::TornRecord => write!(
                 f,
                 "torn write detected: the datafile ends in the middle of a record"
             ),
@@ -490,7 +499,7 @@ mod tests {
         assert!(format!("{read_err}").contains("offset 42"));
         assert!(read_err.source().is_some());
 
-        let torn = DatafileError::TornWrite;
+        let torn = DatafileError::TornRecord;
         assert!(format!("{torn}").contains("torn write"));
         assert!(torn.source().is_none());
     }
@@ -534,7 +543,7 @@ mod tests {
         assert!(matches!(bitcask_err, BitcaskError::PutFailure(_)));
 
         // RemoveError
-        let remove_err: RemoveError = DatafileError::TornWrite.into();
+        let remove_err: RemoveError = DatafileError::TornRecord.into();
         let bitcask_err: BitcaskError = remove_err.into();
         assert!(matches!(bitcask_err, BitcaskError::RemoveFailure(_)));
 

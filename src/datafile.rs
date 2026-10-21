@@ -154,15 +154,16 @@ impl Datafile {
                 let to_read = DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES
                     .min(header.value_size as usize - value_bytes_read);
 
-                let bytes = reader.read(&mut value_buffer[..to_read]).map_err(|e| {
-                    DatafileError::Read {
-                        offset: start_offset
-                            + DATAFILE_HEADER_SIZE_BYTES as u64
-                            + header.key_size as u64
-                            + value_bytes_read as u64,
-                        source: e,
-                    }
-                })?;
+                let bytes =
+                    reader
+                        .read(&mut value_buffer[..to_read])
+                        .map_err(|e| DatafileError::Read {
+                            offset: start_offset
+                                + DATAFILE_HEADER_SIZE_BYTES as u64
+                                + header.key_size as u64
+                                + value_bytes_read as u64,
+                            source: e,
+                        })?;
 
                 if bytes == 0 {
                     break;
@@ -173,7 +174,7 @@ impl Datafile {
             }
 
             if header.value_size > (value_bytes_read) as u32 {
-                return Err(DatafileError::TornWrite);
+                return Err(DatafileError::TornRecord);
             }
 
             if hasher.finalize() != header.crc {
@@ -381,10 +382,12 @@ pub struct DatafileRecordIterator<'a> {
 impl<'a> DatafileRecordIterator<'a> {
     pub fn new(datafile: &'a Datafile) -> Result<Self, DatafileError> {
         let mut reader = BufReader::new(datafile.file.get_ref());
-        reader.seek(SeekFrom::Start(0)).map_err(|e| DatafileError::Read {
-            offset: 0,
-            source: e,
-        })?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| DatafileError::Read {
+                offset: 0,
+                source: e,
+            })?;
 
         Ok(Self { reader, offset: 0 })
     }
@@ -434,12 +437,6 @@ impl<'a> DatafileRecordIterator<'a> {
                     self.offset + DATAFILE_HEADER_SIZE_BYTES as u64 + header.key_size as u64;
 
                 self.offset += header.payload_size()? as u64;
-                self.reader
-                    .seek_relative(header.value_size as i64)
-                    .map_err(|e| DatafileError::Read {
-                        offset: value_offset,
-                        source: e,
-                    })?;
 
                 return Ok(Some(DatafileRecordIteratorEntry::new(
                     header,
@@ -451,6 +448,17 @@ impl<'a> DatafileRecordIterator<'a> {
         }
 
         Ok(None)
+    }
+
+    pub fn next_value(&mut self, size: usize) -> Result<Option<Box<[u8]>>, DatafileError> {
+        self.read_exact_bytes(size)
+    }
+
+    pub fn skip_next(&mut self, size: usize) -> Result<(), DatafileError> {
+        self.reader
+            .seek_relative(size as i64)
+            .map_err(|_| DatafileError::TornRecord)?;
+        Ok(())
     }
 }
 
@@ -764,6 +772,13 @@ mod tests {
 
                 assert_eq!(iter_record.header, record.header);
                 assert_eq!(iter_record.key, record.key);
+
+                assert_eq!(
+                    iter.next_value(iter_record.header.value_size as usize)
+                        .unwrap()
+                        .unwrap(),
+                    record.value
+                );
             }
         }
     }
