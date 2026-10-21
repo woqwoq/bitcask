@@ -17,11 +17,11 @@ use crate::{
     },
     hint::Hintfile,
     keydir::KeyDir,
-    options::{BitcaskOptions, DatafileMaxSize, RecoveryMode, SyncFrequency, SyncMode},
-    record::{
-        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
-        DatafileRecord,
+    options::{
+        BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, RecoveryMode, SyncFrequency,
+        SyncMode,
     },
+    record::{DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE, DatafileRecord},
 };
 
 pub struct MergeTracker {
@@ -729,8 +729,8 @@ mod tests {
         error::{BitcaskError, DatafileError, GetError, OpenError, PutError},
         hint::{HINTFILE_RECORD_HEADER_SIZE_BYTES, Hintfile},
         keydir::{KeyDir, KeyDirEntry},
-        options::{BitcaskOptions, DatafileMaxSize},
-        record::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
+        options::{BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize},
+        record::DatafileRecord,
     };
 
     pub fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {

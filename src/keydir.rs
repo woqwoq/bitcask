@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ahash::AHashMap;
 
-use crate::record::DATAFILE_HEADER_SIZE_BYTES;
+use crate::options::DATAFILE_HEADER_SIZE_BYTES;
 
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
 #[derive(Debug, PartialEq, Clone)]
@@ -119,7 +119,8 @@ impl Display for KeyDir {
 mod tests {
     use crate::{
         keydir::{KeyDir, KeyDirEntry},
-        record::{DATAFILE_HEADER_SIZE_BYTES, DatafileRecord},
+        options::DATAFILE_HEADER_SIZE_BYTES,
+        record::DatafileRecord,
     };
 
     #[test]

@@ -9,10 +9,10 @@ use std::{
 use crate::{
     error::DatafileError,
     keydir::KeyDir,
-    options::{DatafileMaxSize, KB, SyncMode},
+    options::{DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, KB, SyncMode},
     record::{
-        DATAFILE_HEADER_SIZE_BYTES, DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE,
-        DatafileRecord, DatafileRecordHeader,
+        DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE, DatafileRecord,
+        DatafileRecordHeader,
     },
 };
 

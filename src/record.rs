@@ -5,9 +5,8 @@ use std::{
 
 use crc32fast::Hasher;
 
-use crate::error::DatafileError;
+use crate::{error::DatafileError, options::DATAFILE_HEADER_SIZE_BYTES};
 
-pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
 pub const DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES: usize = 1;
 pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
 pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;

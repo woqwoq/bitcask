@@ -189,7 +189,9 @@ impl Hintfile {
         let mut count: usize = 0;
 
         let mut reader = BufReader::with_capacity(8 * KB, self.file.get_ref());
-        reader.seek(SeekFrom::Start(0)).map_err(HintfileError::Read)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(HintfileError::Read)?;
 
         while start_offset < fsz {
             let header = HintfileRecordHeader::decode(&Self::read_exact_bytes(
