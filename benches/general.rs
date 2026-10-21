@@ -1,4 +1,5 @@
 use bitcask::{
+    db::KeyValueDatabase,
     engine::BitcaskInstance,
     keydir::KeyDir,
     options::{BitcaskOptions, DatafileMaxSize, SyncFrequency},
@@ -20,7 +21,7 @@ fn provision_db_in_temp(options: BitcaskOptions) -> (TempDir, BitcaskInstance) {
     let temp_dir = tempdir().unwrap();
     let path = temp_dir.path().to_path_buf();
 
-    (temp_dir, BitcaskInstance::open(path, options).unwrap())
+    (temp_dir, BitcaskInstance::open(&path, options).unwrap())
 }
 
 type DatabaseKVPairs = Vec<(Box<[u8]>, Box<[u8]>)>;

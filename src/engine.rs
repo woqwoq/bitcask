@@ -100,6 +100,419 @@ impl Hash for BitcaskInstance {
     }
 }
 
+#[hotpath::measure_all]
+impl BitcaskInstance {
+    pub(crate) fn open(dir: &Path, options: BitcaskOptions) -> Result<Self, BitcaskError> {
+        let mut merge_tracker = MergeTracker::new();
+        let mut keydir = KeyDir::with_capacity(options.expected_keydir_max_size);
+        let mut readers: LruCache<u32, Arc<Datafile>> =
+            LruCache::new(NonZeroUsize::new(options.reader_lru_cache_size).unwrap());
+
+        let (latest_datafile, total_df_size) = BitcaskStartupHandler::replay_and_init_readers(
+            dir,
+            &options,
+            &mut keydir,
+            &mut readers,
+        )?;
+
+        // Restore merge tracker state
+        merge_tracker.write(total_df_size);
+        merge_tracker.remove(total_df_size.saturating_sub(keydir.get_live_log_size()));
+
+        let writer = Mutex::new(BitcaskStartupHandler::create_writer_with_options(
+            dir,
+            &options,
+            latest_datafile,
+            &mut readers,
+        )?);
+
+        Ok(BitcaskInstance {
+            keydir,
+            writer,
+            dir: dir.to_path_buf(),
+            readers: Mutex::new(readers),
+            merge_tracker,
+            write_count: 0,
+            options,
+        })
+    }
+
+    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
+        let record = DatafileRecord::new(key, value).map_err(PutError::Datafile)?;
+        self.write_datafile_record(&record)?;
+
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.keydir.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keydir.is_empty()
+    }
+
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
+        if let Some(keydir_entry) = self.keydir.get(key) {
+            // If the current writer contains the entry
+            {
+                let mut writer = self.writer.lock().unwrap();
+
+                if keydir_entry.file_id == writer.id {
+                    writer.flush().map_err(GetError::Datafile)?;
+
+                    return Ok(Some(
+                        writer
+                            .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+                            .map_err(GetError::Datafile)?,
+                    ));
+                }
+            }
+
+            // If the LRU cache houses the reader containing the entry
+            let reader =
+                if let Some(reader) = self.readers.lock().unwrap().get(&keydir_entry.file_id) {
+                    Arc::clone(reader)
+                } else {
+                    match Datafile::open_reader(
+                        &self.dir,
+                        keydir_entry.file_id,
+                        &self.options.datafile_extension,
+                    ) {
+                        Ok(reader) => {
+                            let reader_id = reader.id;
+                            let reader = Arc::new(reader);
+                            self.readers
+                                .lock()
+                                .unwrap()
+                                .put(reader_id, Arc::clone(&reader));
+                            reader
+                        }
+                        Err(DatafileError::DatafileNotFound(_)) => {
+                            return Err(GetError::DatafileMissing(keydir_entry.file_id).into());
+                        }
+                        Err(e) => {
+                            return Err(GetError::Datafile(e).into());
+                        }
+                    }
+                };
+
+            return Ok(Some(
+                reader
+                    .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
+                    .map_err(GetError::Datafile)?,
+            ));
+        }
+        Ok(None)
+    }
+
+    fn write_datafile_record(&mut self, record: &DatafileRecord) -> Result<u64, PutError> {
+        let rsz = record.size().map_err(PutError::Datafile)?;
+
+        // If our record is larger than the writer max size, we either throw an
+        // error or let it happen and continue
+        if rsz > self.options.datafile_max_size.get_size()
+            && matches!(
+                self.options.datafile_max_size,
+                DatafileMaxSize::HardCappedBytes(_)
+            )
+        {
+            return Err(PutError::RecordLargerThanMaxDatafileSize(rsz));
+        }
+
+        if self
+            .writer
+            .lock()
+            .unwrap()
+            .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)
+            .map_err(PutError::Datafile)?
+        {
+            self.switch_writer_datafile()?;
+        }
+
+        let offset = self
+            .commit_datafile_write(record)
+            .map_err(PutError::Datafile)?; // Write record first, so that it can be
+        // replayed in case of a crash.
+        self.write_count += 1;
+
+        self.sync_writer().map_err(PutError::Datafile)?; // Sync IO according to user's options
+
+        self.commit_keydir_write(record, offset)
+            .map_err(PutError::Datafile)?; // Append entry to the keydir
+
+        Ok(offset)
+    }
+
+    pub(crate) fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
+        if self.keydir.contains(key) {
+            let record = DatafileRecord::new_tombstone(key).map_err(RemoveError::Datafile)?;
+            self.write_datafile_record(&record).map_err(|e| match e {
+                PutError::Datafile(d) => RemoveError::Datafile(d),
+                PutError::AutoMerge(m) => RemoveError::AutoMerge(m),
+                PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
+            })?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn sync(&mut self) -> Result<(), BitcaskError> {
+        self.sync_internal().map_err(BitcaskError::SyncFailure)
+    }
+
+    fn sync_internal(&mut self) -> Result<(), DatafileError> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.flush()?;
+        writer.sync(&self.options.sync_mode)?;
+        Ok(())
+    }
+
+    fn sync_writer(&mut self) -> Result<(), DatafileError> {
+        match self.options.sync_frequency {
+            SyncFrequency::EveryWrite => self.sync_internal()?,
+            SyncFrequency::EveryNthWrite(n) => {
+                if self.write_count.is_multiple_of(n) {
+                    self.sync_internal()?;
+                }
+            }
+            SyncFrequency::Never => {}
+        }
+
+        Ok(())
+    }
+
+    fn commit_keydir_write(
+        &mut self,
+        record: &DatafileRecord,
+        offset: u64,
+    ) -> Result<(), DatafileError> {
+        let ksz = record.header.key_size;
+        let header_and_key_size = DATAFILE_HEADER_SIZE_BYTES as u32 + ksz;
+
+        match record.header.record_type {
+            DATAFILE_RECORD_TYPE_NORMAL => {
+                let old = self.keydir.put(
+                    record.key.clone(),
+                    self.writer.lock().unwrap().id,
+                    record.header.value_size,
+                    offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
+                    record.header.timestamp,
+                );
+
+                if let Some(old_val) = old {
+                    self.merge_tracker
+                        .remove(header_and_key_size as u64 + old_val.value_size as u64); // mark old
+                    // value dead
+                }
+                self.merge_tracker
+                    .write(header_and_key_size as u64 + record.header.value_size as u64); // mark
+                // the new value as active
+            }
+            DATAFILE_RECORD_TYPE_TOMBSTONE => {
+                let old = self.keydir.remove(&record.key);
+
+                self.merge_tracker.write(header_and_key_size as u64); // mark the tombstone written
+                self.merge_tracker.remove(header_and_key_size as u64); // mark the tombstone dead
+                // on arrival
+                if let Some(old_val) = old {
+                    self.merge_tracker
+                        .remove(header_and_key_size as u64 + old_val.value_size as u64); // mark old
+                    // value dead
+                }
+            }
+            _ => return Err(DatafileError::UnexpectedDatafileRecordType),
+        }
+
+        Ok(())
+    }
+
+    fn commit_datafile_write(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {
+        self.writer.lock().unwrap().append_record(record)
+    }
+
+    fn rotate_writer(&mut self) -> Result<(), DatafileError> {
+        let mut old_writer = self.writer.lock().unwrap();
+        old_writer.flush()?;
+        old_writer.demote_to_reader();
+        old_writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
+
+        let new_writer = Datafile::new_writer(
+            &self.dir,
+            old_writer.id + 1,
+            &self.options.datafile_extension,
+        )?;
+
+        let old_writer = std::mem::replace(&mut *old_writer, new_writer);
+
+        self.readers
+            .lock()
+            .unwrap()
+            .put(old_writer.id, Arc::new(old_writer));
+
+        Ok(())
+    }
+
+    fn switch_writer_datafile(&mut self) -> Result<(), PutError> {
+        self.writer.lock().unwrap().flush()?;
+
+        if self.merge_tracker.should_merge(&self.options) {
+            self.merge_guarded()?; // Will also provide a fresh new writer
+            return Ok(());
+        }
+
+        self.rotate_writer()?;
+
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self) -> Result<(), BitcaskError> {
+        self.merge_guarded()
+            .map_err(BitcaskError::FatalMergeFailure)
+    }
+
+    fn merge_guarded(&mut self) -> Result<(), MergeError> {
+        self.merge_tracker.active = false;
+
+        let merge = self.merge_inner();
+
+        self.merge_tracker.active = true;
+
+        if merge.is_ok() {
+            self.merge_tracker.reset();
+            self.merge_tracker.write(self.keydir.get_live_log_size());
+        }
+
+        merge
+    }
+
+    // TODO: Bufferize reads during merge
+    fn merge_inner(&mut self) -> Result<(), MergeError> {
+        self.rotate_writer()?; // Lock the latest writer
+
+        let writer_id = self.writer.lock().unwrap().id;
+        let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
+            &self.dir,
+            &self.options.datafile_extension,
+        )
+        .map_err(|e| match e {
+            OpenError::InvalidDBPath(io) => MergeError::DirectoryScan(io),
+            other => MergeError::DirectoryScan(std::io::Error::other(other.to_string())),
+        })?
+        .into_iter()
+        .filter(|&id| id < writer_id)
+        .collect();
+
+        let mut hf = Hintfile::new_writer(&self.dir, writer_id, &self.options.hintfile_extension)?;
+
+        for id in candidate_ids.clone() {
+            let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
+            let mut iter = DatafileRecordIterator::new(&df)?;
+
+            while let Some(df_entry) = iter.next_record()? {
+                if df_entry.header.record_type == DATAFILE_RECORD_TYPE_NORMAL
+                    && let Some(keydir_entry) = self.keydir.get(&df_entry.key)
+                    && keydir_entry.file_id == id
+                    && keydir_entry.value_offset == df_entry.value_offset
+                {
+                    // Positive outcome - extract value
+                    let mut hasher = df_entry.header.crc();
+                    hasher.update(&df_entry.key);
+
+                    // TODO: Possibly stream-write the value for hasher and write
+                    // No need to stream the value in chunks as we need it allocated to perform the
+                    // new write anyway
+                    let value = iter
+                        .next_value(keydir_entry.value_size as usize)?
+                        .ok_or(MergeError::Datafile(DatafileError::TornRecord))?;
+
+                    hasher.update(&value);
+
+                    if hasher.finalize() != df_entry.header.crc {
+                        return Err(MergeError::Datafile(DatafileError::CrcMismatch));
+                    }
+
+                    let record = DatafileRecord::with_timestamp(
+                        &df_entry.key,
+                        &value,
+                        df_entry.header.timestamp,
+                    )?;
+
+                    let record_start_offset =
+                        self.write_datafile_record(&record).map_err(|e| match e {
+                            PutError::Datafile(df_err) => MergeError::Datafile(df_err),
+                            PutError::AutoMerge(merge_err) => merge_err,
+                            PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
+                        })?; // We want to keep original timestamp
+                    self.write_hintfile_record(&mut hf, &record, record_start_offset)?;
+                } else {
+                    // Otherwise we skip the value as it is either dead or the tombstone itself
+                    iter.skip_next(df_entry.header.value_size as usize)?;
+                }
+            }
+        }
+
+        hf.flush()?; // Flush the buffer
+        hf.sync()?; // Sync the final hintfile
+        self.remove_old_readers_post_merge(candidate_ids)?;
+        self.rotate_writer()?; // Seal the last writer to avoid inconsistencies between
+        // hintfile and datafile
+        Ok(())
+    }
+
+    fn write_hintfile_record(
+        &mut self,
+        hf: &mut Hintfile,
+        record: &DatafileRecord,
+        record_start_offset: u64,
+    ) -> Result<(), MergeError> {
+        // When a writer switchover has occured
+        let writer_id = self.writer.lock().unwrap().id;
+        if hf.id != writer_id {
+            let new = Hintfile::new_writer(&self.dir, writer_id, &self.options.hintfile_extension)?;
+
+            let mut old = std::mem::replace(hf, new);
+            old.flush()?; // Flush the buffer
+            old.sync()?; // Sync before releasing the handle
+            drop(old); // Seal old hintfile
+        }
+
+        let value_offset =
+            record_start_offset + DATAFILE_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
+
+        hf.append_hint_record(record, value_offset)?;
+
+        Ok(())
+    }
+
+    fn remove_old_readers_post_merge(&mut self, ids: Vec<u32>) -> Result<(), MergeError> {
+        for id in ids {
+            self.readers.lock().unwrap().pop(&id); // Evict the file from LRU
+
+            // Remove the reader datafile from filesystem
+            fs::remove_file(Datafile::generate_filename(
+                &self.dir,
+                id,
+                &self.options.datafile_extension,
+            ))
+            .map_err(MergeError::FileCleanup)?;
+
+            // Remove the reader's hintfile from filesystem
+            let hf = Datafile::generate_filename(
+                // Remove the file from file system
+                &self.dir,
+                id,
+                &self.options.hintfile_extension,
+            );
+            if hf.exists() {
+                fs::remove_file(hf).map_err(MergeError::FileCleanup)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 pub struct BitcaskRecoveryHandler;
 
 #[hotpath::measure_all]
@@ -295,405 +708,6 @@ impl BitcaskStartupHandler {
     }
 }
 
-#[hotpath::measure_all]
-impl BitcaskInstance {
-    pub fn open(dir: PathBuf, options: BitcaskOptions) -> Result<Self, BitcaskError> {
-        let mut merge_tracker = MergeTracker::new();
-        let mut keydir = KeyDir::with_capacity(options.expected_keydir_max_size);
-        let mut readers: LruCache<u32, Arc<Datafile>> =
-            LruCache::new(NonZeroUsize::new(options.reader_lru_cache_size).unwrap());
-
-        let (latest_datafile, total_df_size) = BitcaskStartupHandler::replay_and_init_readers(
-            &dir,
-            &options,
-            &mut keydir,
-            &mut readers,
-        )?;
-
-        // Restore merge tracker state
-        merge_tracker.write(total_df_size);
-        merge_tracker.remove(total_df_size.saturating_sub(keydir.get_live_log_size()));
-
-        let writer = Mutex::new(BitcaskStartupHandler::create_writer_with_options(
-            &dir,
-            &options,
-            latest_datafile,
-            &mut readers,
-        )?);
-
-        Ok(BitcaskInstance {
-            keydir,
-            writer,
-            dir,
-            readers: Mutex::new(readers),
-            merge_tracker,
-            write_count: 0,
-            options,
-        })
-    }
-
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
-        let record = DatafileRecord::new(key, value).map_err(PutError::Datafile)?;
-        self.write_datafile_record(&record)?;
-
-        Ok(())
-    }
-
-    pub fn len(&self) -> usize {
-        self.keydir.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.keydir.is_empty()
-    }
-
-    pub fn get(&self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
-        if let Some(keydir_entry) = self.keydir.get(key) {
-            // If the current writer contains the entry
-            {
-                let mut writer = self.writer.lock().unwrap();
-
-                if keydir_entry.file_id == writer.id {
-                    writer.flush().map_err(GetError::Datafile)?;
-
-                    return Ok(Some(
-                        writer
-                            .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
-                            .map_err(GetError::Datafile)?,
-                    ));
-                }
-            }
-
-            // If the LRU cache houses the reader containing the entry
-            let reader =
-                if let Some(reader) = self.readers.lock().unwrap().get(&keydir_entry.file_id) {
-                    Arc::clone(reader)
-                } else {
-                    match Datafile::open_reader(
-                        &self.dir,
-                        keydir_entry.file_id,
-                        &self.options.datafile_extension,
-                    ) {
-                        Ok(reader) => {
-                            let reader_id = reader.id;
-                            let reader = Arc::new(reader);
-                            self.readers
-                                .lock()
-                                .unwrap()
-                                .put(reader_id, Arc::clone(&reader));
-                            reader
-                        }
-                        Err(DatafileError::DatafileNotFound(_)) => {
-                            return Err(GetError::DatafileMissing(keydir_entry.file_id).into());
-                        }
-                        Err(e) => {
-                            return Err(GetError::Datafile(e).into());
-                        }
-                    }
-                };
-
-            return Ok(Some(
-                reader
-                    .read_bytes(keydir_entry.value_offset, keydir_entry.value_size as usize)
-                    .map_err(GetError::Datafile)?,
-            ));
-        }
-        Ok(None)
-    }
-
-    fn write_datafile_record(&mut self, record: &DatafileRecord) -> Result<u64, PutError> {
-        let rsz = record.size().map_err(PutError::Datafile)?;
-
-        // If our record is larger than the writer max size, we either throw an
-        // error or let it happen and continue
-        if rsz > self.options.datafile_max_size.get_size()
-            && matches!(
-                self.options.datafile_max_size,
-                DatafileMaxSize::HardCappedBytes(_)
-            )
-        {
-            return Err(PutError::RecordLargerThanMaxDatafileSize(rsz));
-        }
-
-        if self
-            .writer
-            .lock()
-            .unwrap()
-            .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)
-            .map_err(PutError::Datafile)?
-        {
-            self.switch_writer_datafile()?;
-        }
-
-        let offset = self
-            .commit_datafile_write(record)
-            .map_err(PutError::Datafile)?; // Write record first, so that it can be
-        // replayed in case of a crash.
-        self.write_count += 1;
-
-        self.sync_writer().map_err(PutError::Datafile)?; // Sync IO according to user's options
-
-        self.commit_keydir_write(record, offset)
-            .map_err(PutError::Datafile)?; // Append entry to the keydir
-
-        Ok(offset)
-    }
-
-    pub fn remove(&mut self, key: &[u8]) -> Result<(), BitcaskError> {
-        if self.keydir.contains(key) {
-            let record = DatafileRecord::new_tombstone(key).map_err(RemoveError::Datafile)?;
-            self.write_datafile_record(&record).map_err(|e| match e {
-                PutError::Datafile(d) => RemoveError::Datafile(d),
-                PutError::AutoMerge(m) => RemoveError::AutoMerge(m),
-                PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
-            })?;
-        }
-
-        Ok(())
-    }
-
-    fn sync_writer(&mut self) -> Result<(), DatafileError> {
-        match self.options.sync_frequency {
-            SyncFrequency::EveryWrite => {
-                self.writer.lock().unwrap().sync(&self.options.sync_mode)?
-            }
-            SyncFrequency::EveryNthWrite(n) => {
-                if self.write_count.is_multiple_of(n) {
-                    self.writer.lock().unwrap().sync(&self.options.sync_mode)?
-                }
-            }
-            SyncFrequency::Never => {}
-        }
-
-        Ok(())
-    }
-
-    fn commit_keydir_write(
-        &mut self,
-        record: &DatafileRecord,
-        offset: u64,
-    ) -> Result<(), DatafileError> {
-        let ksz = record.header.key_size;
-        let header_and_key_size = DATAFILE_HEADER_SIZE_BYTES as u32 + ksz;
-
-        match record.header.record_type {
-            DATAFILE_RECORD_TYPE_NORMAL => {
-                let old = self.keydir.put(
-                    record.key.clone(),
-                    self.writer.lock().unwrap().id,
-                    record.header.value_size,
-                    offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
-                    record.header.timestamp,
-                );
-
-                if let Some(old_val) = old {
-                    self.merge_tracker
-                        .remove(header_and_key_size as u64 + old_val.value_size as u64); // mark old
-                    // value dead
-                }
-                self.merge_tracker
-                    .write(header_and_key_size as u64 + record.header.value_size as u64); // mark
-                // the new value as active
-            }
-            DATAFILE_RECORD_TYPE_TOMBSTONE => {
-                let old = self.keydir.remove(&record.key);
-
-                self.merge_tracker.write(header_and_key_size as u64); // mark the tombstone written
-                self.merge_tracker.remove(header_and_key_size as u64); // mark the tombstone dead
-                // on arrival
-                if let Some(old_val) = old {
-                    self.merge_tracker
-                        .remove(header_and_key_size as u64 + old_val.value_size as u64); // mark old
-                    // value dead
-                }
-            }
-            _ => return Err(DatafileError::UnexpectedDatafileRecordType),
-        }
-
-        Ok(())
-    }
-
-    fn commit_datafile_write(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {
-        self.writer.lock().unwrap().append_record(record)
-    }
-
-    fn rotate_writer(&mut self) -> Result<(), DatafileError> {
-        let mut old_writer = self.writer.lock().unwrap();
-        old_writer.flush()?;
-        old_writer.demote_to_reader();
-        old_writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
-
-        let new_writer = Datafile::new_writer(
-            &self.dir,
-            old_writer.id + 1,
-            &self.options.datafile_extension,
-        )?;
-
-        let old_writer = std::mem::replace(&mut *old_writer, new_writer);
-
-        self.readers
-            .lock()
-            .unwrap()
-            .put(old_writer.id, Arc::new(old_writer));
-
-        Ok(())
-    }
-
-    fn switch_writer_datafile(&mut self) -> Result<(), PutError> {
-        self.writer.lock().unwrap().flush()?;
-
-        if self.merge_tracker.should_merge(&self.options) {
-            self.merge()?; // Will also provide a fresh new writer
-            return Ok(());
-        }
-
-        self.rotate_writer()?;
-
-        Ok(())
-    }
-
-    pub fn merge(&mut self) -> Result<(), MergeError> {
-        self.merge_tracker.active = false;
-
-        let merge = self.merge_inner();
-
-        self.merge_tracker.active = true;
-
-        if merge.is_ok() {
-            self.merge_tracker.reset();
-            self.merge_tracker.write(self.keydir.get_live_log_size());
-        }
-
-        merge
-    }
-
-    // TODO: Bufferize reads during merge
-    fn merge_inner(&mut self) -> Result<(), MergeError> {
-        self.rotate_writer()?; // Lock the latest writer
-
-        let writer_id = self.writer.lock().unwrap().id;
-        let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
-            &self.dir,
-            &self.options.datafile_extension,
-        )
-        .map_err(|e| match e {
-            OpenError::InvalidDBPath(io) => MergeError::DirectoryScan(io),
-            other => MergeError::DirectoryScan(std::io::Error::other(other.to_string())),
-        })?
-        .into_iter()
-        .filter(|&id| id < writer_id)
-        .collect();
-
-        let mut hf = Hintfile::new_writer(&self.dir, writer_id, &self.options.hintfile_extension)?;
-
-        for id in candidate_ids.clone() {
-            let df = Datafile::open_reader(&self.dir, id, &self.options.datafile_extension)?;
-            let mut iter = DatafileRecordIterator::new(&df)?;
-
-            while let Some(df_entry) = iter.next_record()? {
-                if df_entry.header.record_type == DATAFILE_RECORD_TYPE_NORMAL
-                    && let Some(keydir_entry) = self.keydir.get(&df_entry.key)
-                    && keydir_entry.file_id == id
-                    && keydir_entry.value_offset == df_entry.value_offset
-                {
-                    // Positive outcome - extract value
-                    let mut hasher = df_entry.header.crc();
-                    hasher.update(&df_entry.key);
-
-                    // TODO: Possibly stream-write the value for hasher and write
-                    // No need to stream the value in chunks as we need it allocated to perform the
-                    // new write anyway
-                    let value = iter
-                        .next_value(keydir_entry.value_size as usize)?
-                        .ok_or(MergeError::Datafile(DatafileError::TornRecord))?;
-
-                    hasher.update(&value);
-
-                    if hasher.finalize() != df_entry.header.crc {
-                        return Err(MergeError::Datafile(DatafileError::CrcMismatch));
-                    }
-
-                    let record = DatafileRecord::with_timestamp(
-                        &df_entry.key,
-                        &value,
-                        df_entry.header.timestamp,
-                    )?;
-
-                    let record_start_offset =
-                        self.write_datafile_record(&record).map_err(|e| match e {
-                            PutError::Datafile(df_err) => MergeError::Datafile(df_err),
-                            PutError::AutoMerge(merge_err) => merge_err,
-                            PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
-                        })?; // We want to keep original timestamp
-                    self.write_hintfile_record(&mut hf, &record, record_start_offset)?;
-                } else {
-                    // Otherwise we skip the value as it is either dead or the tombstone itself
-                    iter.skip_next(df_entry.header.value_size as usize)?;
-                }
-            }
-        }
-
-        hf.flush()?; // Flush the buffer
-        hf.sync()?; // Sync the final hintfile
-        self.remove_old_readers_post_merge(candidate_ids)?;
-        self.rotate_writer()?; // Seal the last writer to avoid inconsistencies between
-        // hintfile and datafile
-        Ok(())
-    }
-
-    fn write_hintfile_record(
-        &mut self,
-        hf: &mut Hintfile,
-        record: &DatafileRecord,
-        record_start_offset: u64,
-    ) -> Result<(), MergeError> {
-        // When a writer switchover has occured
-        let writer_id = self.writer.lock().unwrap().id;
-        if hf.id != writer_id {
-            let new = Hintfile::new_writer(&self.dir, writer_id, &self.options.hintfile_extension)?;
-
-            let mut old = std::mem::replace(hf, new);
-            old.flush()?; // Flush the buffer
-            old.sync()?; // Sync before releasing the handle
-            drop(old); // Seal old hintfile
-        }
-
-        let value_offset =
-            record_start_offset + DATAFILE_HEADER_SIZE_BYTES as u64 + record.header.key_size as u64;
-
-        hf.append_hint_record(record, value_offset)?;
-
-        Ok(())
-    }
-
-    fn remove_old_readers_post_merge(&mut self, ids: Vec<u32>) -> Result<(), MergeError> {
-        for id in ids {
-            self.readers.lock().unwrap().pop(&id); // Evict the file from LRU
-
-            // Remove the reader datafile from filesystem
-            fs::remove_file(Datafile::generate_filename(
-                &self.dir,
-                id,
-                &self.options.datafile_extension,
-            ))
-            .map_err(MergeError::FileCleanup)?;
-
-            // Remove the reader's hintfile from filesystem
-            let hf = Datafile::generate_filename(
-                // Remove the file from file system
-                &self.dir,
-                id,
-                &self.options.hintfile_extension,
-            );
-            if hf.exists() {
-                fs::remove_file(hf).map_err(MergeError::FileCleanup)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -722,11 +736,7 @@ mod tests {
     pub fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {
         let temp_dir = tempfile::tempdir().unwrap();
         let options = BitcaskOptions::default();
-        let db = BitcaskInstance::open(
-            temp_dir.path().to_path_buf(),
-            BitcaskOptions::default().clone(),
-        )
-        .unwrap();
+        let db = BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default().clone()).unwrap();
 
         (temp_dir, options, db)
     }
@@ -820,8 +830,7 @@ mod tests {
             // Temporary scope to fill the data
             {
                 let mut db =
-                    BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
-                        .unwrap();
+                    BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default()).unwrap();
 
                 // 28B per entry - 2 readers and 1 writer to fit 1000 entries with 10K Datafile max length
                 for i in 0..RECORD_COUNT as u32 {
@@ -845,9 +854,7 @@ mod tests {
             } // File handles should be released at this point
 
             {
-                let db =
-                    BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
-                        .unwrap();
+                let db = BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default()).unwrap();
 
                 {
                     let writer = db.writer.lock().unwrap();
@@ -951,7 +958,7 @@ mod tests {
             let temp_dir = tempfile::tempdir().unwrap();
 
             let mut db = BitcaskInstance::open(
-                temp_dir.path().to_path_buf(),
+                temp_dir.path(),
                 BitcaskOptions::default()
                     .datafile_max_size(crate::options::DatafileMaxSize::SoftCappedBytes(40)),
             )
@@ -979,7 +986,7 @@ mod tests {
             let temp_dir = tempfile::tempdir().unwrap();
 
             let mut db = BitcaskInstance::open(
-                temp_dir.path().to_path_buf(),
+                temp_dir.path(),
                 BitcaskOptions::default()
                     .datafile_max_size(crate::options::DatafileMaxSize::HardCappedBytes(40)),
             )
@@ -1148,8 +1155,7 @@ mod tests {
             // Temporary scope to fill the data
             {
                 let mut db =
-                    BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
-                        .unwrap();
+                    BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default()).unwrap();
 
                 for i in 0..RECORD_COUNT as u32 {
                     db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
@@ -1163,9 +1169,7 @@ mod tests {
             } // File handles should be released at this point
 
             {
-                let db =
-                    BitcaskInstance::open(temp_dir.path().to_path_buf(), BitcaskOptions::default())
-                        .unwrap();
+                let db = BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default()).unwrap();
 
                 assert_eq!(db.keydir.len(), RECORD_COUNT - DELETES_COUNT);
             }
@@ -1443,8 +1447,7 @@ mod tests {
 
             // Create database with 2 entries, create a hintfile for the writer
             {
-                let mut db =
-                    BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+                let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
                 db.put(b"1", b"1").unwrap();
                 db.put(b"2", b"2").unwrap();
@@ -1462,8 +1465,7 @@ mod tests {
             // Verify the database has the 2 entries even though the hintfile was empty
             // Perform merge (append 2 records from above to hintfile), reopen hintfile and add a fake record
             {
-                let mut db =
-                    BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+                let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
                 assert_eq!(db.merge_tracker.bytes_written, (23 * 2));
                 assert_eq!(db.writer.lock().unwrap().id, 2);
@@ -1484,7 +1486,7 @@ mod tests {
 
             // Reopen database and verify all records were loaded from hintfile (fake one should be
             // present)
-            let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+            let db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
             assert_eq!(db.writer.lock().unwrap().id, 4);
             assert_eq!(db.len(), 3);
         }
@@ -1523,8 +1525,7 @@ mod tests {
             const ENTRY_SIZE: usize = 29;
 
             {
-                let mut db =
-                    BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+                let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
                 for i in 0..ENTRY_COUNT as u32 {
                     db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
@@ -1569,7 +1570,7 @@ mod tests {
             }
 
             {
-                let db = BitcaskInstance::open(temp_dir.path().to_path_buf(), options).unwrap();
+                let db = BitcaskInstance::open(temp_dir.path(), options).unwrap();
                 assert_eq!(
                     db.merge_tracker.bytes_written,
                     (DEAD_ENTRY_COUNT * ENTRY_SIZE + ENTRY_COUNT * ENTRY_SIZE) as u64
@@ -1664,8 +1665,7 @@ mod tests {
         let entry_total_size = ENTRY_COUNT * ENTRY_SIZE;
 
         {
-            let mut db =
-                BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+            let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
             // 29B Entries
             for i in 0..ENTRY_COUNT as u32 {
@@ -1686,8 +1686,7 @@ mod tests {
         }
 
         {
-            let mut db =
-                BitcaskInstance::open(temp_dir.path().to_path_buf(), options.clone()).unwrap();
+            let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
             assert_eq!(db.keydir.len(), ENTRY_COUNT);
 
@@ -1888,11 +1887,8 @@ mod tests {
                 .merge_dead_space_threshold_percent(40)
                 .merge_dead_space_min_bytes((ENTRY_COUNT * ENTRY_SIZE) as u64 - 1u64);
 
-            let mut db = BitcaskInstance::open(
-                temp_dir.path().to_path_buf(),
-                BitcaskOptions::default().clone(),
-            )
-            .unwrap();
+            let mut db =
+                BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default().clone()).unwrap();
 
             for i in 0..ENTRY_COUNT as u32 {
                 db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();

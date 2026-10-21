@@ -9,6 +9,7 @@ pub enum BitcaskError {
     PutFailure(PutError),
     RemoveFailure(RemoveError),
     FatalMergeFailure(MergeError),
+    SyncFailure(DatafileError),
 }
 
 impl fmt::Display for BitcaskError {
@@ -19,6 +20,7 @@ impl fmt::Display for BitcaskError {
             BitcaskError::PutFailure(e) => write!(f, "bitcask put failure: {e}"),
             BitcaskError::RemoveFailure(e) => write!(f, "bitcask remove failure: {e}"),
             BitcaskError::FatalMergeFailure(e) => write!(f, "bitcask merge failure: {e}"),
+            BitcaskError::SyncFailure(e) => write!(f, "bitcask file sync failure: {e}"),
         }
     }
 }
@@ -31,6 +33,7 @@ impl std::error::Error for BitcaskError {
             BitcaskError::PutFailure(e) => Some(e),
             BitcaskError::RemoveFailure(e) => Some(e),
             BitcaskError::FatalMergeFailure(e) => Some(e),
+            BitcaskError::SyncFailure(e) => Some(e),
         }
     }
 }

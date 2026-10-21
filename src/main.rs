@@ -1,6 +1,7 @@
 use std::{env, path::PathBuf, process};
 
 use bitcask::{
+    db::KeyValueDatabase,
     engine::BitcaskInstance,
     options::{BitcaskOptions, DatafileMaxSize, MB},
 };
@@ -26,7 +27,7 @@ fn main() {
         entry_count = n;
     }
 
-    match BitcaskInstance::open(PathBuf::from("db"), options) {
+    match BitcaskInstance::open(&PathBuf::from("db"), options) {
         Ok(mut db) => {
             for i in 0..entry_count as u128 {
                 db.put(&i.to_be_bytes(), format!("{i}").as_bytes()).unwrap();
