@@ -6,7 +6,6 @@ use bitcask::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{
-    RngExt,
     distr::{Alphanumeric, SampleString},
     seq::SliceRandom,
 };
@@ -15,16 +14,34 @@ use tempfile::{TempDir, tempdir};
 const DATA_TO_READS_RATIO: usize = 1;
 
 const RANDOM_READ_WRITE_PREFILL_RATIO: usize = 2;
-const RANDOM_READ_WRITE_RATIO: usize = 1; // 50% Each
+const RANDOM_READ_PERCENTAGE: usize = 50; // 50% Each
 
 enum ReadType {
     Sequential,
     Random,
 }
 
+#[derive(Clone)]
 enum OperationType {
     Read,
     Write,
+}
+
+#[derive(Clone)]
+struct Operation {
+    op_type: OperationType,
+    key: Box<[u8]>,
+    value: Box<[u8]>,
+}
+
+impl Operation {
+    pub fn new(key: &[u8], value: &[u8], op_type: OperationType) -> Self {
+        Self {
+            op_type,
+            key: Box::from(key),
+            value: Box::from(value),
+        }
+    }
 }
 
 fn generate_sized_string(n: usize) -> String {
@@ -38,59 +55,56 @@ fn provision_db_in_temp(options: BitcaskOptions) -> (TempDir, BitcaskInstance) {
     (temp_dir, BitcaskInstance::open(&path, options).unwrap())
 }
 
-type DatabaseKVPairs = Vec<(Box<[u8]>, Box<[u8]>)>;
-fn provision_db_data(n: usize, ksz: usize, vsz: usize) -> DatabaseKVPairs {
+fn fill_db(db: &mut BitcaskInstance, ops: &DatabaseOperations) {
+    for op in ops {
+        db.put(&op.key, &op.value).unwrap();
+    }
+}
+
+type DatabaseOperations = Vec<Operation>;
+fn provision_db_data(
+    n: usize,
+    ksz: usize,
+    vsz: usize,
+    op_type: OperationType,
+) -> DatabaseOperations {
     let mut store = Vec::new();
 
     for _ in 0..n {
-        store.push((
-            Box::from(generate_sized_string(ksz).as_bytes()),
-            Box::from(generate_sized_string(vsz).as_bytes()),
+        store.push(Operation::new(
+            generate_sized_string(ksz).as_bytes(),
+            generate_sized_string(vsz).as_bytes(),
+            op_type.clone(),
         ));
     }
 
     store
 }
 
-fn provision_db_data_sized(n: usize, size_bytes: usize, kkv_ratio: f32) -> DatabaseKVPairs {
-    let ksz = (size_bytes as f32 * kkv_ratio) as usize;
-    let vsz = size_bytes - ksz;
-
-    provision_db_data(n, ksz, vsz)
-}
-
-fn provision_mixed_rw_data(
-    read_kv: &mut DatabaseKVPairs,
-    write_kv: &DatabaseKVPairs,
-    n: usize,
-    rw_bias: f64,
-) -> Vec<(OperationType, Box<[u8]>, Box<[u8]>)> {
-    let mut data: Vec<(OperationType, Box<[u8]>, Box<[u8]>)> = Vec::new();
+fn merge_and_shuffle(
+    read_ops: DatabaseOperations,
+    write_ops: DatabaseOperations,
+) -> DatabaseOperations {
     let mut rng = rand::rng();
+    let mut data = DatabaseOperations::new();
 
-    read_kv.shuffle(&mut rng);
+    data.extend(read_ops);
+    data.extend(write_ops);
+
+    data.shuffle(&mut rng);
 
     data
 }
 
-fn fill_database_from_vec(db: &mut BitcaskInstance, kv: &DatabaseKVPairs) {
-    for (k, v) in kv {
-        db.put(k, v).unwrap()
+fn perform_operations(db: &mut BitcaskInstance, ops: &DatabaseOperations, n: usize) {
+    for op in ops.iter().take(n) {
+        match op.op_type {
+            OperationType::Read => {
+                db.get(&op.key).unwrap().unwrap();
+            }
+            OperationType::Write => db.put(&op.key, &op.value).unwrap(),
+        };
     }
-}
-
-fn read_database_sequential(db: &BitcaskInstance, kv: &DatabaseKVPairs, n: usize) {
-    for (k, _) in kv.iter().take(n) {
-        db.get(k).unwrap().unwrap();
-    }
-}
-
-fn read_write_database_random(
-    db: &mut BitcaskInstance,
-    read_kv: &DatabaseKVPairs,
-    write_kv: &DatabaseKVPairs,
-    n: usize,
-) {
 }
 
 fn db_put_delegate(
@@ -117,10 +131,13 @@ fn db_put_delegate(
                     || {
                         (
                             provision_db_in_temp(options.clone()),
-                            provision_db_data(s, ksz, vsz),
+                            provision_db_data(s, ksz, vsz, OperationType::Write),
                         )
                     },
-                    |((_, mut db), kv)| fill_database_from_vec(&mut db, &kv),
+                    |((dir, mut db), kv)| {
+                        perform_operations(&mut db, &kv, s);
+                        (dir, db)
+                    },
                     BatchSize::SmallInput,
                 );
             },
@@ -138,13 +155,11 @@ fn db_get_delegate(
     vsz: usize,
     c: &mut Criterion,
 ) {
-    let record_size = DATAFILE_HEADER_SIZE_BYTES + ksz + vsz;
-
     let mut group = c.benchmark_group("db_get");
 
     for size in operation_counts {
         group.sample_size(sample_size);
-        group.throughput(Throughput::Bytes((record_size * size) as u64));
+        group.throughput(Throughput::Bytes((vsz * size) as u64));
         group.bench_with_input(
             BenchmarkId::new(format!("{name}_k{ksz}B_v{vsz}B"), size),
             &size,
@@ -152,17 +167,25 @@ fn db_get_delegate(
                 b.iter_batched(
                     || {
                         let (dir, mut db) = provision_db_in_temp(options.clone());
-                        let mut kv = provision_db_data(s * DATA_TO_READS_RATIO, ksz, vsz);
+                        let mut read_ops = provision_db_data(
+                            s * DATA_TO_READS_RATIO,
+                            ksz,
+                            vsz,
+                            OperationType::Read,
+                        );
 
-                        fill_database_from_vec(&mut db, &kv);
+                        fill_db(&mut db, &read_ops);
 
                         if matches!(read_type, ReadType::Random) {
                             let mut rng = rand::rng();
-                            kv.shuffle(&mut rng);
+                            read_ops.shuffle(&mut rng);
                         }
-                        (dir, db, kv)
+                        (dir, db, read_ops)
                     },
-                    |(_, db, kv)| read_database_sequential(&db, &kv, s),
+                    |(dir, mut db, kv)| {
+                        perform_operations(&mut db, &kv, s);
+                        (dir, db)
+                    },
                     BatchSize::SmallInput,
                 );
             },
@@ -181,11 +204,15 @@ fn db_get_put_delegate(
 ) {
     let record_size = DATAFILE_HEADER_SIZE_BYTES + ksz + vsz;
 
-    let mut group = c.benchmark_group("db_get");
+    let mut group = c.benchmark_group("db_get_put");
 
     for size in operation_counts {
         group.sample_size(sample_size);
-        group.throughput(Throughput::Bytes((record_size * size) as u64));
+        let read_count = (size * RANDOM_READ_PERCENTAGE) / 100;
+        let write_count = size - read_count;
+        group.throughput(Throughput::Bytes(
+            (read_count * vsz + write_count * record_size) as u64,
+        ));
         group.bench_with_input(
             BenchmarkId::new(format!("{name}_k{ksz}B_v{vsz}B"), size),
             &size,
@@ -193,21 +220,24 @@ fn db_get_put_delegate(
                 b.iter_batched(
                     || {
                         let (dir, mut db) = provision_db_in_temp(options.clone());
-                        let mut read_kv =
-                            provision_db_data(s * RANDOM_READ_WRITE_PREFILL_RATIO, ksz, vsz);
-                        let write_kv = provision_db_data(s, ksz, vsz);
-
-                        fill_database_from_vec(&mut db, &read_kv);
-                        let ops = provision_mixed_rw_data(
-                            &mut read_kv,
-                            &write_kv,
-                            RANDOM_READ_WRITE_WRITE_PROB,
+                        let read_kv = provision_db_data(
+                            read_count * RANDOM_READ_WRITE_PREFILL_RATIO,
+                            ksz,
+                            vsz,
+                            OperationType::Read,
                         );
+                        let write_kv =
+                            provision_db_data(write_count, ksz, vsz, OperationType::Write);
 
-                        (dir, db, read_kv, write_kv)
+                        fill_db(&mut db, &read_kv);
+
+                        let ops = merge_and_shuffle(read_kv, write_kv);
+
+                        (dir, db, ops)
                     },
-                    |(_, mut db, read_kv, write_kv)| {
-                        read_write_database_random(&mut db, &read_kv, &write_kv, s)
+                    |(dir, mut db, ops)| {
+                        perform_operations(&mut db, &ops, s);
+                        (dir, db)
                     },
                     BatchSize::SmallInput,
                 );
