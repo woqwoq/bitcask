@@ -5,10 +5,18 @@ use bitcask::{
 };
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::distr::{Alphanumeric, SampleString};
+use rand::{
+    distr::{Alphanumeric, SampleString},
+    seq::SliceRandom,
+};
 use tempfile::{TempDir, tempdir};
 
 const DATA_TO_READS_RATIO: usize = 1;
+
+enum ReadType {
+    Sequential,
+    Random,
+}
 
 fn generate_sized_string(n: usize) -> String {
     Alphanumeric.sample_string(&mut rand::rng(), n)
@@ -44,7 +52,7 @@ fn provision_db_data_sized(n: usize, size_bytes: usize, kkv_ratio: f32) -> Datab
 
 fn fill_database_from_vec(db: &mut BitcaskInstance, kv: &DatabaseKVPairs) {
     for (k, v) in kv {
-        db.put(&k, &v).unwrap()
+        db.put(k, v).unwrap()
     }
 }
 
@@ -90,10 +98,11 @@ fn db_put_delegate(
 }
 
 fn db_get_delegate(
-    options: BitcaskOptions,
+    options: &BitcaskOptions,
+    read_type: ReadType,
     name: &str,
     sample_size: usize,
-    operation_counts: Vec<usize>,
+    operation_counts: &Vec<usize>,
     ksz: usize,
     vsz: usize,
     c: &mut Criterion,
@@ -108,13 +117,18 @@ fn db_get_delegate(
         group.bench_with_input(
             BenchmarkId::new(format!("{name}_k{ksz}B_v{vsz}B"), size),
             &size,
-            |b, &s| {
+            |b, &&s| {
                 b.iter_batched(
                     || {
                         let (dir, mut db) = provision_db_in_temp(options.clone());
-                        let kv = provision_db_data(s * DATA_TO_READS_RATIO, ksz, vsz);
+                        let mut kv = provision_db_data(s * DATA_TO_READS_RATIO, ksz, vsz);
 
                         fill_database_from_vec(&mut db, &kv);
+
+                        if matches!(read_type, ReadType::Random) {
+                            let mut rng = rand::rng();
+                            kv.shuffle(&mut rng);
+                        }
                         (dir, db, kv)
                     },
                     |(_, db, kv)| read_database_sequential(&db, &kv, s),
@@ -149,10 +163,21 @@ fn db_get(c: &mut Criterion) {
         .sync_frequency(SyncFrequency::Never);
 
     db_get_delegate(
-        options,
+        &options,
+        ReadType::Sequential,
         "db_get_sequential",
         10,
-        operation_counts,
+        &operation_counts,
+        ksz,
+        vsz,
+        c,
+    );
+    db_get_delegate(
+        &options,
+        ReadType::Random,
+        "db_get_random",
+        10,
+        &operation_counts,
         ksz,
         vsz,
         c,
