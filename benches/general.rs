@@ -13,13 +13,7 @@ use tempfile::{TempDir, tempdir};
 
 const DATA_TO_READS_RATIO: usize = 1;
 
-const RANDOM_READ_WRITE_PREFILL_RATIO: usize = 2;
 const RANDOM_READ_PERCENTAGE: usize = 50; // 50% Each
-
-enum ReadType {
-    Sequential,
-    Random,
-}
 
 #[derive(Clone)]
 enum OperationType {
@@ -166,108 +160,7 @@ fn perform_operations(db: &mut BitcaskInstance, ops: &DatabaseOperations, n: usi
     }
 }
 
-fn db_get_delegate(
-    options: &BitcaskOptions,
-    read_type: ReadType,
-    name: &str,
-    sample_size: usize,
-    operation_counts: &Vec<usize>,
-    ksz: usize,
-    vsz: usize,
-    c: &mut Criterion,
-) {
-    let mut group = c.benchmark_group("db_get");
-
-    for size in operation_counts {
-        group.sample_size(sample_size);
-        group.throughput(Throughput::Bytes((vsz * size) as u64));
-        group.bench_with_input(
-            BenchmarkId::new(format!("{name}_k{ksz}B_v{vsz}B"), size),
-            &size,
-            |b, &&s| {
-                b.iter_batched(
-                    || {
-                        let (dir, mut db) = provision_db_in_temp(options.clone());
-                        let mut read_ops = provision_db_data(
-                            s * DATA_TO_READS_RATIO,
-                            ksz,
-                            vsz,
-                            OperationType::Read,
-                        );
-
-                        fill_db(&mut db, &read_ops);
-
-                        if matches!(read_type, ReadType::Random) {
-                            let mut rng = rand::rng();
-                            read_ops.shuffle(&mut rng);
-                        }
-                        (dir, db, read_ops)
-                    },
-                    |(dir, mut db, kv)| {
-                        perform_operations(&mut db, &kv, s);
-                        (dir, db)
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
-    }
-}
-
-fn db_get_put_delegate(
-    options: &BitcaskOptions,
-    name: &str,
-    sample_size: usize,
-    operation_counts: &Vec<usize>,
-    ksz: usize,
-    vsz: usize,
-    c: &mut Criterion,
-) {
-    let record_size = DATAFILE_HEADER_SIZE_BYTES + ksz + vsz;
-
-    let mut group = c.benchmark_group("db_get_put");
-
-    for size in operation_counts {
-        group.sample_size(sample_size);
-        let read_count = (size * RANDOM_READ_PERCENTAGE) / 100;
-        let write_count = size - read_count;
-        group.throughput(Throughput::Bytes(
-            (read_count * vsz + write_count * record_size) as u64,
-        ));
-        group.bench_with_input(
-            BenchmarkId::new(format!("{name}_k{ksz}B_v{vsz}B"), size),
-            &size,
-            |b, &&s| {
-                b.iter_batched(
-                    || {
-                        let (dir, mut db) = provision_db_in_temp(options.clone());
-                        let read_kv = provision_db_data(
-                            read_count * RANDOM_READ_WRITE_PREFILL_RATIO,
-                            ksz,
-                            vsz,
-                            OperationType::Read,
-                        );
-                        let write_kv =
-                            provision_db_data(write_count, ksz, vsz, OperationType::Write);
-
-                        fill_db(&mut db, &read_kv);
-
-                        let ops = merge_and_shuffle(read_kv, write_kv);
-
-                        (dir, db, ops)
-                    },
-                    |(dir, mut db, ops)| {
-                        perform_operations(&mut db, &ops, s);
-                        (dir, db)
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
-    }
-}
-
-fn db_put(c: &mut Criterion) {
+fn write_bench(c: &mut Criterion) {
     let operation_counts = vec![10_000usize, 50_000, 100_000, 1_000_000];
     let ksz = 4usize;
     let vsz = KB;
@@ -278,7 +171,7 @@ fn db_put(c: &mut Criterion) {
         .sync_frequency(SyncFrequency::Never);
 
     let rsz = DATAFILE_HEADER_SIZE_BYTES + ksz + vsz;
-    let mut bench = DatabaseBenchmarkRunner::new("db_put", ksz, vsz, 10, &operation_counts, c);
+    let mut bench = DatabaseBenchmarkRunner::new("write", ksz, vsz, 10, &operation_counts, c);
 
     let throughput = |size| Throughput::Bytes((size * rsz) as u64);
     let prep = |s| {
@@ -294,7 +187,7 @@ fn db_put(c: &mut Criterion) {
     bench.run("write", throughput, prep, run);
 }
 
-fn db_get(c: &mut Criterion) {
+fn read_bench(c: &mut Criterion) {
     let operation_counts = vec![10_000usize, 50_000, 100_000, 500_000];
     let ksz = 4usize;
     let vsz = KB;
@@ -304,7 +197,7 @@ fn db_get(c: &mut Criterion) {
         .merge_dead_space_min_bytes(GB as u64)
         .sync_frequency(SyncFrequency::Never);
 
-    let mut bench = DatabaseBenchmarkRunner::new("db_get", ksz, vsz, 10, &operation_counts, c);
+    let mut bench = DatabaseBenchmarkRunner::new("read", ksz, vsz, 10, &operation_counts, c);
 
     let throughput = |size| Throughput::Bytes((size * vsz) as u64);
     let prep = |s| {
@@ -328,23 +221,53 @@ fn db_get(c: &mut Criterion) {
         (dir, db, ops)
     };
 
-    bench.run("db_get_sequential", throughput, prep, run);
-    bench.run("db_get_random", throughput, prep_random, run);
+    bench.run("sequential", throughput, prep, run);
+    bench.run("random", throughput, prep_random, run);
 }
 
 // Try with small datafile size to avoid flushing the writer
-fn db_random_get_put(c: &mut Criterion) {
+fn read_write_bench(c: &mut Criterion) {
     let operation_counts = vec![10_000usize, 50_000, 100_000, 500_000];
     let ksz = 4usize;
     let vsz = KB;
+    let rsz = DATAFILE_HEADER_SIZE_BYTES + ksz + vsz;
 
     let options = BitcaskOptions::default()
         .datafile_max_size(DatafileMaxSize::SoftCappedBytes(GB))
         .merge_dead_space_min_bytes(GB as u64)
         .sync_frequency(SyncFrequency::Never);
 
-    db_get_put_delegate(&options, "db_get_put", 10, &operation_counts, ksz, vsz, c);
+    let mut bench = DatabaseBenchmarkRunner::new("read_write", ksz, vsz, 10, &operation_counts, c);
+
+    let throughput = |size| {
+        let read_count = (size * RANDOM_READ_PERCENTAGE) / 100;
+        let write_count = size - read_count;
+
+        Throughput::Bytes((read_count * vsz + write_count * rsz) as u64)
+    };
+
+    let prep = |size| {
+        let read_count = (size * RANDOM_READ_PERCENTAGE) / 100;
+        let write_count = size - read_count;
+
+        let (dir, mut db) = provision_db_in_temp(options.clone());
+        let read_kv = provision_db_data(read_count, ksz, vsz, OperationType::Read);
+        let write_kv = provision_db_data(write_count, ksz, vsz, OperationType::Write);
+
+        fill_db(&mut db, &read_kv);
+
+        let ops = merge_and_shuffle(read_kv, write_kv);
+
+        (dir, db, ops)
+    };
+
+    let run = |s, dir, mut db, ops| {
+        perform_operations(&mut db, &ops, s);
+        (dir, db, ops)
+    };
+
+    bench.run("random", throughput, prep, run);
 }
 
-criterion_group!(benches, db_put, db_get, db_random_get_put);
+criterion_group!(benches, write_bench, read_bench, read_write_bench);
 criterion_main!(benches);
