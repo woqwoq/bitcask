@@ -16,18 +16,18 @@ use crate::{
     },
 };
 
-pub const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 4 * KB;
+pub(crate) const DATAFILE_VALUE_STREAM_CHUNK_SIZE_BYTES: usize = 4 * KB;
 
-pub struct Datafile {
+pub(crate) struct Datafile {
     file: BufWriter<File>,
-    pub id: u32,
-    pub offset: u64,
-    pub is_writer: bool,
+    pub(crate) id: u32,
+    pub(crate) offset: u64,
+    pub(crate) is_writer: bool,
 }
 
 #[hotpath::measure_all]
 impl Datafile {
-    pub fn new_writer(
+    pub(crate) fn new_writer(
         dir: &Path,
         id: u32,
         datafile_extension: &str,
@@ -89,7 +89,7 @@ impl Datafile {
         }
     }
 
-    pub fn open_datafile_as_writer(
+    pub(crate) fn open_datafile_as_writer(
         dir: &Path,
         id: u32,
         offset: u64,
@@ -98,7 +98,7 @@ impl Datafile {
         Self::open_datafile(dir, id, datafile_extension, offset, true, true)
     }
 
-    pub fn open_reader(
+    pub(crate) fn open_reader(
         dir: &Path,
         id: u32,
         datafile_extension: &str,
@@ -106,7 +106,7 @@ impl Datafile {
         Self::open_datafile(dir, id, datafile_extension, 0, false, false)
     }
 
-    pub fn open_reader_for_recovery(
+    pub(crate) fn open_reader_for_recovery(
         dir: &Path,
         id: u32,
         offset: u64,
@@ -115,7 +115,7 @@ impl Datafile {
         Self::open_datafile(dir, id, datafile_extension, offset, true, false)
     }
 
-    pub fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
+    pub(crate) fn replay(&mut self, keydir: &mut KeyDir) -> Result<(), DatafileError> {
         let file_size = self.file_size()?;
         let mut start_offset = 0;
 
@@ -204,7 +204,7 @@ impl Datafile {
         Ok(())
     }
 
-    pub fn truncate(&mut self, new_size: u64) -> Result<(), DatafileError> {
+    pub(crate) fn truncate(&mut self, new_size: u64) -> Result<(), DatafileError> {
         self.file
             .get_ref()
             .set_len(new_size)
@@ -212,7 +212,7 @@ impl Datafile {
         self.sync(&SyncMode::SyncAll)
     }
 
-    pub fn append_record(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {
+    pub(crate) fn append_record(&mut self, record: &DatafileRecord) -> Result<u64, DatafileError> {
         if !self.is_writer {
             return Err(DatafileError::WriteAttemptToReaderDatafile);
         }
@@ -233,12 +233,12 @@ impl Datafile {
         Self::write_record_to(&mut self.file, record)
     }
 
-    pub fn flush(&mut self) -> Result<(), DatafileError> {
+    pub(crate) fn flush(&mut self) -> Result<(), DatafileError> {
         self.file.flush().map_err(DatafileError::Flush)?;
         Ok(())
     }
 
-    pub fn write_record_to<W: Write>(
+    pub(crate) fn write_record_to<W: Write>(
         writer: &mut W,
         record: &DatafileRecord,
     ) -> Result<(), DatafileError> {
@@ -254,7 +254,7 @@ impl Datafile {
         Ok(())
     }
 
-    pub fn should_switch_writer_before_write_commit(
+    pub(crate) fn should_switch_writer_before_write_commit(
         &self,
         record_size: u64,
         datafile_max_size: &DatafileMaxSize,
@@ -275,7 +275,7 @@ impl Datafile {
         Ok(is_writer_oversized && is_writer_overcapped)
     }
 
-    pub fn sync(&mut self, mode: &SyncMode) -> Result<(), DatafileError> {
+    pub(crate) fn sync(&mut self, mode: &SyncMode) -> Result<(), DatafileError> {
         self.file.flush().map_err(DatafileError::Flush)?;
 
         match mode {
@@ -296,7 +296,7 @@ impl Datafile {
         Ok(())
     }
 
-    pub fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, DatafileError> {
+    pub(crate) fn read_bytes(&self, offset: u64, count: usize) -> Result<Box<[u8]>, DatafileError> {
         let mut buf = vec![0u8; count];
 
         self.file
@@ -321,15 +321,15 @@ impl Datafile {
         Ok(Box::from(buf))
     }
 
-    pub fn demote_to_reader(&mut self) {
+    pub(crate) fn demote_to_reader(&mut self) {
         self.is_writer = false;
     }
 
-    pub fn generate_filename(dir: &Path, file_id: u32, datafile_extension: &str) -> PathBuf {
+    pub(crate) fn generate_filename(dir: &Path, file_id: u32, datafile_extension: &str) -> PathBuf {
         dir.join(format!("{:08}.{}", file_id, datafile_extension))
     }
 
-    pub fn file_size(&self) -> Result<u64, DatafileError> {
+    pub(crate) fn file_size(&self) -> Result<u64, DatafileError> {
         self.file
             .get_ref()
             .metadata()
@@ -357,14 +357,14 @@ impl Display for Datafile {
     }
 }
 
-pub struct DatafileRecordIteratorEntry {
-    pub header: DatafileRecordHeader,
-    pub key: Box<[u8]>,
-    pub value_offset: u64,
+pub(crate) struct DatafileRecordIteratorEntry {
+    pub(crate) header: DatafileRecordHeader,
+    pub(crate) key: Box<[u8]>,
+    pub(crate) value_offset: u64,
 }
 
 impl DatafileRecordIteratorEntry {
-    pub fn new(header: DatafileRecordHeader, key: Box<[u8]>, value_offset: u64) -> Self {
+    pub(crate) fn new(header: DatafileRecordHeader, key: Box<[u8]>, value_offset: u64) -> Self {
         Self {
             header,
             key,
@@ -373,14 +373,14 @@ impl DatafileRecordIteratorEntry {
     }
 }
 
-pub struct DatafileRecordIterator<'a> {
+pub(crate) struct DatafileRecordIterator<'a> {
     reader: BufReader<&'a File>,
     offset: u64,
 }
 
 #[hotpath::measure_all]
 impl<'a> DatafileRecordIterator<'a> {
-    pub fn new(datafile: &'a Datafile) -> Result<Self, DatafileError> {
+    pub(crate) fn new(datafile: &'a Datafile) -> Result<Self, DatafileError> {
         let mut reader = BufReader::new(datafile.file.get_ref());
         reader
             .seek(SeekFrom::Start(0))
@@ -428,7 +428,7 @@ impl<'a> DatafileRecordIterator<'a> {
         }
     }
 
-    pub fn next_record(&mut self) -> Result<Option<DatafileRecordIteratorEntry>, DatafileError> {
+    pub(crate) fn next_record(&mut self) -> Result<Option<DatafileRecordIteratorEntry>, DatafileError> {
         if let Some(header) = self.read_header()? {
             let header = DatafileRecordHeader::decode(&header)?;
 
@@ -450,11 +450,11 @@ impl<'a> DatafileRecordIterator<'a> {
         Ok(None)
     }
 
-    pub fn next_value(&mut self, size: usize) -> Result<Option<Box<[u8]>>, DatafileError> {
+    pub(crate) fn next_value(&mut self, size: usize) -> Result<Option<Box<[u8]>>, DatafileError> {
         self.read_exact_bytes(size)
     }
 
-    pub fn skip_next(&mut self, size: usize) -> Result<(), DatafileError> {
+    pub(crate) fn skip_next(&mut self, size: usize) -> Result<(), DatafileError> {
         self.reader
             .seek_relative(size as i64)
             .map_err(|_| DatafileError::TornRecord)?;

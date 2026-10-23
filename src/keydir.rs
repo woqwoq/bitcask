@@ -6,15 +6,15 @@ use crate::options::DATAFILE_HEADER_SIZE_BYTES;
 
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
 #[derive(Debug, PartialEq, Clone)]
-pub struct KeyDirEntry {
-    pub file_id: u32, // ID (e.g. 00000001.data) of the file that contains the given value
-    pub value_size: u32, // Size of the value in bytes
-    pub value_offset: u64, // Absolute byyte offset to the location of the value in the  datafile
-    pub timestamp: u64, // UNIX Timestamp when the entry was created
+pub(crate) struct KeyDirEntry {
+    pub(crate) file_id: u32, // ID (e.g. 00000001.data) of the file that contains the given value
+    pub(crate) value_size: u32, // Size of the value in bytes
+    pub(crate) value_offset: u64, // Absolute byyte offset to the location of the value in the  datafile
+    pub(crate) timestamp: u64, // UNIX Timestamp when the entry was created
 }
 
 impl KeyDirEntry {
-    pub fn new(file_id: u32, value_size: u32, value_offset: u64, timestamp: u64) -> Self {
+    pub(crate) fn new(file_id: u32, value_size: u32, value_offset: u64, timestamp: u64) -> Self {
         Self {
             file_id,
             value_size,
@@ -24,7 +24,7 @@ impl KeyDirEntry {
     }
 }
 
-pub struct KeyDir {
+pub(crate) struct KeyDir {
     dir: AHashMap<Box<[u8]>, KeyDirEntry>, // We are using Box<[u8]> instead of a vector to save 8
                                            // bytes per key on the `capacity` field that vector would store
 }
@@ -36,23 +36,23 @@ impl Default for KeyDir {
 }
 
 impl KeyDir {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         KeyDir {
             dir: AHashMap::new(),
         }
     }
 
-    pub fn with_capacity(n: usize) -> Self {
+    pub(crate) fn with_capacity(n: usize) -> Self {
         KeyDir {
             dir: AHashMap::with_capacity(n),
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<&KeyDirEntry> {
+    pub(crate) fn get(&self, key: &[u8]) -> Option<&KeyDirEntry> {
         self.dir.get(key)
     }
 
-    pub fn put(
+    pub(crate) fn put(
         &mut self,
         key: Box<[u8]>,
         file_id: u32,
@@ -66,26 +66,26 @@ impl KeyDir {
         )
     }
 
-    pub fn get_live_log_size(&self) -> u64 {
+    pub(crate) fn get_live_log_size(&self) -> u64 {
         self.dir
             .iter()
             .map(|(k, v)| DATAFILE_HEADER_SIZE_BYTES as u64 + k.len() as u64 + v.value_size as u64)
             .sum()
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> Option<KeyDirEntry> {
+    pub(crate) fn remove(&mut self, key: &[u8]) -> Option<KeyDirEntry> {
         self.dir.remove(key)
     }
 
-    pub fn contains(&self, key: &[u8]) -> bool {
+    pub(crate) fn contains(&self, key: &[u8]) -> bool {
         self.dir.contains_key(key)
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.dir.is_empty()
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.dir.len()
     }
 }

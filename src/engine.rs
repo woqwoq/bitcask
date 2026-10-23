@@ -24,10 +24,10 @@ use crate::{
     record::{DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE, DatafileRecord},
 };
 
-pub struct MergeTracker {
-    pub active: bool,
-    pub bytes_written: u64,
-    pub dead_bytes_written: u64,
+pub(crate) struct MergeTracker {
+    active: bool,
+    bytes_written: u64,
+    dead_bytes_written: u64,
 }
 
 impl Default for MergeTracker {
@@ -37,7 +37,7 @@ impl Default for MergeTracker {
 }
 
 impl MergeTracker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             active: true,
             bytes_written: 0,
@@ -45,24 +45,24 @@ impl MergeTracker {
         }
     }
 
-    pub fn write(&mut self, size: u64) {
+    pub(crate) fn write(&mut self, size: u64) {
         if self.active {
             self.bytes_written += size;
         }
     }
 
-    pub fn remove(&mut self, size: u64) {
+    pub(crate) fn remove(&mut self, size: u64) {
         if self.active {
             self.dead_bytes_written += size;
         }
     }
 
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.bytes_written = 0;
         self.dead_bytes_written = 0;
     }
 
-    pub fn should_merge(&self, options: &BitcaskOptions) -> bool {
+    pub(crate) fn should_merge(&self, options: &BitcaskOptions) -> bool {
         let dead = self.dead_bytes_written as u128;
         let total = self.bytes_written as u128;
         let threshold = options.merge_dead_space_threshold_percent as u128;
@@ -85,13 +85,13 @@ impl MergeTracker {
 }
 
 pub struct BitcaskInstance {
-    dir: PathBuf,                                     // For opening files through LRU
-    pub(crate) keydir: KeyDir,                        // In-memory keydir map
-    pub writer: Mutex<Datafile>,                      // Writer file handle
-    pub readers: Mutex<LruCache<u32, Arc<Datafile>>>, // Use LRU cache to track recently used files
-    pub merge_tracker: MergeTracker, // For tracking dead space and trigger compaction
-    write_count: usize,              // Write count tracker for sync
-    options: BitcaskOptions,         // User-customisable options
+    dir: PathBuf,                                 // For opening files through LRU
+    keydir: KeyDir,                               // In-memory keydir map
+    writer: Mutex<Datafile>,                      // Writer file handle
+    readers: Mutex<LruCache<u32, Arc<Datafile>>>, // Use LRU cache to track recently used files
+    merge_tracker: MergeTracker,                  // For tracking dead space and trigger compaction
+    write_count: usize,                           // Write count tracker for sync
+    options: BitcaskOptions,                      // User-customisable options
 }
 
 impl Hash for BitcaskInstance {
@@ -513,11 +513,11 @@ impl BitcaskInstance {
     }
 }
 
-pub struct BitcaskRecoveryHandler;
+pub(crate) struct BitcaskRecoveryHandler;
 
 #[hotpath::measure_all]
 impl BitcaskRecoveryHandler {
-    pub fn reopen_reader_for_recovery(
+    pub(crate) fn reopen_reader_for_recovery(
         dir: &Path,
         options: &BitcaskOptions,
         df: Datafile,
@@ -528,7 +528,7 @@ impl BitcaskRecoveryHandler {
         Datafile::open_reader_for_recovery(dir, id, offset, &options.datafile_extension)
     }
 
-    pub fn recover_post_df_replay_failure(
+    pub(crate) fn recover_post_df_replay_failure(
         dir: &Path,
         options: &BitcaskOptions,
         mut df: Datafile,
@@ -572,7 +572,7 @@ impl BitcaskRecoveryHandler {
     }
 
     // TODO: Implement handling for TolerateCorruptedTailRecords
-    pub fn recover_post_hf_replay_failure(
+    pub(crate) fn recover_post_hf_replay_failure(
         e: HintfileError,
         options: &BitcaskOptions,
     ) -> Result<(), OpenError> {
@@ -583,11 +583,11 @@ impl BitcaskRecoveryHandler {
     }
 }
 
-pub struct BitcaskStartupHandler;
+pub(crate) struct BitcaskStartupHandler;
 
 #[hotpath::measure_all]
 impl BitcaskStartupHandler {
-    pub fn reopen_datafile_as_writer(
+    pub(crate) fn reopen_datafile_as_writer(
         dir: &Path,
         options: &BitcaskOptions,
         df: Datafile,
@@ -598,7 +598,7 @@ impl BitcaskStartupHandler {
         Datafile::open_datafile_as_writer(dir, id, offset, &options.datafile_extension)
     }
 
-    pub fn parse_db_datafile_ids_at_path(
+    pub(crate) fn parse_db_datafile_ids_at_path(
         dir: &Path,
         datafile_extension: &str,
     ) -> Result<Vec<u32>, OpenError> {
@@ -635,7 +635,7 @@ impl BitcaskStartupHandler {
     }
 
     // TODO: Increment merge tracker inside replay
-    pub fn replay_and_init_readers(
+    pub(crate) fn replay_and_init_readers(
         dir: &Path,
         options: &BitcaskOptions,
         keydir: &mut KeyDir,
@@ -683,7 +683,7 @@ impl BitcaskStartupHandler {
         Ok((None, total_df_size))
     }
 
-    pub fn create_writer_with_options(
+    pub(crate) fn create_writer_with_options(
         dir: &Path,
         options: &BitcaskOptions,
         latest_datafile: Option<Datafile>,
@@ -733,7 +733,7 @@ mod tests {
         record::DatafileRecord,
     };
 
-    pub fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {
+    pub(crate) fn init_test() -> (TempDir, BitcaskOptions, BitcaskInstance) {
         let temp_dir = tempfile::tempdir().unwrap();
         let options = BitcaskOptions::default();
         let db = BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default().clone()).unwrap();
@@ -741,7 +741,7 @@ mod tests {
         (temp_dir, options, db)
     }
 
-    pub fn keydir_entry_for(
+    pub(crate) fn keydir_entry_for(
         datafile_record: &DatafileRecord,
         file_id: u32,
         offset: u64,
@@ -754,7 +754,7 @@ mod tests {
         )
     }
 
-    pub fn datafile_record_for_string_u32(key: &str, value: u32) -> DatafileRecord {
+    pub(crate) fn datafile_record_for_string_u32(key: &str, value: u32) -> DatafileRecord {
         DatafileRecord::new(key.as_bytes(), &value.to_be_bytes()).unwrap()
     }
 

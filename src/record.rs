@@ -7,26 +7,26 @@ use crc32fast::Hasher;
 
 use crate::{error::DatafileError, options::DATAFILE_HEADER_SIZE_BYTES};
 
-pub const DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES: usize = 1;
-pub const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
-pub const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
-pub const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
-pub const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
+pub(crate) const DATAFILE_HEADER_RECORD_TYPE_SIZE_BYTES: usize = 1;
+pub(crate) const DATAFILE_HEADER_CRC_SIZE_BYTES: usize = 4;
+pub(crate) const DATAFILE_HEADER_TIMESTAMP_SIZE_BYTES: usize = 8;
+pub(crate) const DATAFILE_HEADER_KSZ_SIZE_BYTES: usize = 4;
+pub(crate) const DATAFILE_HEADER_VSZ_SIZE_BYTES: usize = 4;
 
-pub const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
-pub const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
+pub(crate) const DATAFILE_RECORD_TYPE_NORMAL: u8 = 0;
+pub(crate) const DATAFILE_RECORD_TYPE_TOMBSTONE: u8 = 1;
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct DatafileRecordHeader {
-    pub crc: u32,        // CRC32 of all fields below
-    pub record_type: u8, // 0 - Normal, 1 - Tombstone
-    pub timestamp: u64,  // UNIX Timestamp when the entry was created
-    pub key_size: u32,   // Size of the key in bytes
-    pub value_size: u32, // Size of the value in bytes
+pub(crate) struct DatafileRecordHeader {
+    pub(crate) crc: u32,        // CRC32 of all fields below
+    pub(crate) record_type: u8, // 0 - Normal, 1 - Tombstone
+    pub(crate) timestamp: u64,  // UNIX Timestamp when the entry was created
+    pub(crate) key_size: u32,   // Size of the key in bytes
+    pub(crate) value_size: u32, // Size of the value in bytes
 }
 
 impl DatafileRecordHeader {
-    pub fn new(key: &[u8], value: &[u8], record_type: u8) -> Result<Self, DatafileError> {
+    pub(crate) fn new(key: &[u8], value: &[u8], record_type: u8) -> Result<Self, DatafileError> {
         Self::with_timestamp(
             key,
             value,
@@ -55,7 +55,7 @@ impl DatafileRecordHeader {
         })
     }
 
-    pub fn crc(&self) -> Hasher {
+    pub(crate) fn crc(&self) -> Hasher {
         let mut hasher = Hasher::new();
 
         hasher.update(&self.record_type.to_be_bytes());
@@ -87,7 +87,7 @@ impl DatafileRecordHeader {
         hasher.finalize()
     }
 
-    pub fn encode(&self) -> [u8; DATAFILE_HEADER_SIZE_BYTES] {
+    pub(crate) fn encode(&self) -> [u8; DATAFILE_HEADER_SIZE_BYTES] {
         let mut arr: [u8; DATAFILE_HEADER_SIZE_BYTES] = [0; DATAFILE_HEADER_SIZE_BYTES];
 
         arr[0..1].copy_from_slice(&self.record_type.to_be_bytes());
@@ -99,7 +99,7 @@ impl DatafileRecordHeader {
         arr
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
         if DATAFILE_HEADER_SIZE_BYTES > bytes.len() {
             return Err(DatafileError::UndersizedDatafileHeader(bytes.len()));
         }
@@ -120,7 +120,7 @@ impl DatafileRecordHeader {
         })
     }
 
-    pub fn payload_size(&self) -> Result<usize, DatafileError> {
+    pub(crate) fn payload_size(&self) -> Result<usize, DatafileError> {
         let size = u64::from(self.key_size)
             .checked_add(u64::from(self.value_size))
             .and_then(|kv| kv.checked_add(DATAFILE_HEADER_SIZE_BYTES as u64))
@@ -131,14 +131,14 @@ impl DatafileRecordHeader {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct DatafileRecord {
-    pub header: DatafileRecordHeader,
-    pub key: Box<[u8]>,
-    pub value: Box<[u8]>,
+pub(crate) struct DatafileRecord {
+    pub(crate) header: DatafileRecordHeader,
+    pub(crate) key: Box<[u8]>,
+    pub(crate) value: Box<[u8]>,
 }
 
 impl DatafileRecord {
-    pub fn new(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
+    pub(crate) fn new(key: &[u8], value: &[u8]) -> Result<Self, DatafileError> {
         Ok(Self {
             header: DatafileRecordHeader::new(key, value, DATAFILE_RECORD_TYPE_NORMAL)?,
             key: Box::from(key),
@@ -146,7 +146,7 @@ impl DatafileRecord {
         })
     }
 
-    pub fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+    pub(crate) fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
         Ok(Self {
             header: DatafileRecordHeader::with_timestamp(
                 key,
@@ -159,7 +159,7 @@ impl DatafileRecord {
         })
     }
 
-    pub fn new_tombstone(key: &[u8]) -> Result<Self, DatafileError> {
+    pub(crate) fn new_tombstone(key: &[u8]) -> Result<Self, DatafileError> {
         Ok(Self {
             header: DatafileRecordHeader::new(key, &[], DATAFILE_RECORD_TYPE_TOMBSTONE)?,
             key: Box::from(key),
@@ -167,11 +167,11 @@ impl DatafileRecord {
         })
     }
 
-    pub fn size(&self) -> Result<usize, DatafileError> {
+    pub(crate) fn size(&self) -> Result<usize, DatafileError> {
         self.header.payload_size()
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DatafileError> {
         let datafile_size = bytes.len() as u64;
         let header = DatafileRecordHeader::decode(bytes)?;
 
@@ -258,7 +258,7 @@ mod tests {
         record::{DATAFILE_RECORD_TYPE_NORMAL, DatafileRecord, DatafileRecordHeader},
     };
 
-    pub fn with_timestamp(
+    pub(crate) fn with_timestamp(
         key: &[u8],
         value: &[u8],
         timestamp: u64,
@@ -275,7 +275,7 @@ mod tests {
         })
     }
 
-    pub fn crc_of(
+    pub(crate) fn crc_of(
         record_type: u8,
         timestamp: u64,
         key_size: u32,

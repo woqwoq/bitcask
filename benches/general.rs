@@ -1,7 +1,7 @@
 use bitcask::{
     db::KeyValueDatabase,
-    engine::BitcaskInstance,
     options::{BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, GB, KB, SyncFrequency},
+    BitcaskInstance,
 };
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};

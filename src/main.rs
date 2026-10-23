@@ -2,8 +2,8 @@ use std::{env, path::PathBuf, process};
 
 use bitcask::{
     db::KeyValueDatabase,
-    engine::BitcaskInstance,
     options::{BitcaskOptions, DatafileMaxSize, MB},
+    BitcaskInstance,
 };
 
 #[hotpath::main]

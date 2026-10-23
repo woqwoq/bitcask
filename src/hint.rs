@@ -310,7 +310,7 @@ impl Hintfile {
         self.file.get_mut().sync_data().map_err(HintfileError::Sync)
     }
 
-    pub fn flush(&mut self) -> Result<()> {
+    pub(crate) fn flush(&mut self) -> Result<()> {
         self.file.flush().map_err(HintfileError::Flush)?;
         Ok(())
     }
