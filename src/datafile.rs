@@ -428,7 +428,9 @@ impl<'a> DatafileRecordIterator<'a> {
         }
     }
 
-    pub(crate) fn next_record(&mut self) -> Result<Option<DatafileRecordIteratorEntry>, DatafileError> {
+    pub(crate) fn next_record(
+        &mut self,
+    ) -> Result<Option<DatafileRecordIteratorEntry>, DatafileError> {
         if let Some(header) = self.read_header()? {
             let header = DatafileRecordHeader::decode(&header)?;
 

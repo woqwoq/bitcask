@@ -1,7 +1,9 @@
 use bitcask::{
-    db::KeyValueDatabase,
-    options::{BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, GB, KB, SyncFrequency},
     BitcaskInstance,
+    db::KeyValueDatabase,
+    options::{
+        BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, GB, KB, MB, SyncFrequency,
+    },
 };
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -269,5 +271,41 @@ fn read_write_bench(c: &mut Criterion) {
     bench.run("random", throughput, prep, run);
 }
 
-criterion_group!(benches, write_bench, read_bench, read_write_bench);
+fn merge_bench(c: &mut Criterion) {
+    let operation_counts = vec![10_000usize, 50_000, 100_000, 500_000];
+    let ksz = 4usize;
+    let vsz = KB;
+    let rsz = DATAFILE_HEADER_SIZE_BYTES + ksz + vsz;
+
+    let options =
+        BitcaskOptions::default().datafile_max_size(DatafileMaxSize::SoftCappedBytes(64 * MB));
+
+    let mut bench = DatabaseBenchmarkRunner::new("merge", ksz, vsz, 10, &operation_counts, c);
+
+    let throughput = |size| Throughput::Bytes((size * rsz) as u64);
+
+    let prep = |size| {
+        let (dir, mut db) = provision_db_in_temp(options.clone());
+        let ops = provision_db_data(size, ksz, vsz, OperationType::Write);
+
+        fill_db(&mut db, &ops);
+
+        (dir, db, ops)
+    };
+
+    let run = |_, dir, mut db: BitcaskInstance, ops| {
+        db.merge().unwrap();
+        (dir, db, ops)
+    };
+
+    bench.run("synthetic", throughput, prep, run);
+}
+
+criterion_group!(
+    benches,
+    write_bench,
+    read_bench,
+    read_write_bench,
+    merge_bench
+);
 criterion_main!(benches);

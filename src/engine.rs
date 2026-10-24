@@ -1,6 +1,5 @@
 use std::{
     fs::{self, read_dir},
-    hash::Hash,
     io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -92,12 +91,6 @@ pub struct BitcaskInstance {
     merge_tracker: MergeTracker,                  // For tracking dead space and trigger compaction
     write_count: usize,                           // Write count tracker for sync
     options: BitcaskOptions,                      // User-customisable options
-}
-
-impl Hash for BitcaskInstance {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.dir.hash(state);
-    }
 }
 
 #[hotpath::measure_all]
