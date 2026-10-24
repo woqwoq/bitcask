@@ -11,11 +11,11 @@ pub trait KeyValueDatabase {
         Self: Sized;
 
     fn get(&self, key: &[u8]) -> Result<Option<Box<[u8]>>, Self::Error>;
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error>;
-    fn remove(&mut self, key: &[u8]) -> Result<(), Self::Error>;
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error>;
+    fn remove(&self, key: &[u8]) -> Result<(), Self::Error>;
 
-    fn merge(&mut self) -> Result<(), Self::Error>;
-    fn sync(&mut self) -> Result<(), Self::Error>;
+    fn merge(&self) -> Result<(), Self::Error>;
+    fn sync(&self) -> Result<(), Self::Error>;
 
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
@@ -37,19 +37,19 @@ impl KeyValueDatabase for BitcaskInstance {
         self.get(key)
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
         self.put(key, value)
     }
 
-    fn remove(&mut self, key: &[u8]) -> Result<(), Self::Error> {
+    fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
         self.remove(key)
     }
 
-    fn merge(&mut self) -> Result<(), Self::Error> {
+    fn merge(&self) -> Result<(), Self::Error> {
         self.merge()
     }
 
-    fn sync(&mut self) -> Result<(), Self::Error> {
+    fn sync(&self) -> Result<(), Self::Error> {
         self.sync()
     }
 

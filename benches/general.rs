@@ -293,7 +293,7 @@ fn merge_bench(c: &mut Criterion) {
         (dir, db, ops)
     };
 
-    let run = |_, dir, mut db: BitcaskInstance, ops| {
+    let run = |_, dir, db: BitcaskInstance, ops| {
         db.merge().unwrap();
         (dir, db, ops)
     };

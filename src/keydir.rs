@@ -5,12 +5,12 @@ use ahash::AHashMap;
 use crate::options::DATAFILE_HEADER_SIZE_BYTES;
 
 // We are using explicit types to have platform-agnostic behaviors on both 32 and 64 bit CPUs
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) struct KeyDirEntry {
     pub(crate) file_id: u32, // ID (e.g. 00000001.data) of the file that contains the given value
     pub(crate) value_size: u32, // Size of the value in bytes
     pub(crate) value_offset: u64, // Absolute byyte offset to the location of the value in the  datafile
-    pub(crate) timestamp: u64, // UNIX Timestamp when the entry was created
+    pub(crate) timestamp: u64,    // UNIX Timestamp when the entry was created
 }
 
 impl KeyDirEntry {
