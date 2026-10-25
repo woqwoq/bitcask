@@ -491,6 +491,7 @@ impl From<TryFromSliceError> for HintfileError {
 pub enum InvalidOptionError {
     NonZeroField(String),
     NonEmptyField(String),
+    GreaterThanField(String, String),
 }
 
 impl fmt::Display for InvalidOptionError {
@@ -501,6 +502,9 @@ impl fmt::Display for InvalidOptionError {
             }
             InvalidOptionError::NonEmptyField(field) => {
                 write!(f, "field {field} can't be empty.")
+            }
+            InvalidOptionError::GreaterThanField(f1, f2) => {
+                write!(f, "field {f1} has to be greater than {f2}.")
             }
         }
     }

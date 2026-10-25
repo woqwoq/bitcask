@@ -83,10 +83,11 @@ impl BitcaskOptions {
             )));
         }
 
-        if self.datafile_max_size.get_size() == 0 {
-            return Err(InvalidOptionError::NonZeroField(String::from(
-                "datafile_max_size",
-            )));
+        if self.datafile_max_size.get_size() <= DATAFILE_HEADER_SIZE_BYTES {
+            return Err(InvalidOptionError::GreaterThanField(
+                String::from("datafile_max_size"),
+                format!("{}", DATAFILE_HEADER_SIZE_BYTES),
+            ));
         }
 
         if self.merge_dead_space_threshold_percent == 0 {

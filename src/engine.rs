@@ -3,7 +3,7 @@ use std::{
     io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use lru::LruCache;
@@ -85,11 +85,6 @@ impl StorageTracker {
             && (dead * 100) > (threshold * total)
             && self.dead_bytes_written > options.merge_dead_space_threshold_bytes
         {
-            println!(
-                "Merging...\nDead: {dead}/{perc}%, Total:{total}, Threshold: {threshold}",
-                perc = (dead * 100) / total
-            );
-
             return true;
         }
 
@@ -145,7 +140,11 @@ impl BitcaskInstance {
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> Result<(), BitcaskError> {
         let record = DatafileRecord::new(key, value).map_err(PutError::Datafile)?;
-        self.write_datafile_record(&record)?;
+
+        // Hold a single write lock across whole operation
+        let mut writer = self.writer.lock().unwrap();
+
+        self.write_datafile_record(&record, &mut writer)?;
 
         Ok(())
     }
@@ -213,8 +212,11 @@ impl BitcaskInstance {
         Ok(None)
     }
 
-    fn write_datafile_record(&self, record: &DatafileRecord) -> Result<u64, PutError> {
-        let mut writer = self.writer.lock().unwrap();
+    fn write_datafile_record(
+        &self,
+        record: &DatafileRecord,
+        writer: &mut Datafile,
+    ) -> Result<u64, PutError> {
         let rsz = record.size().map_err(PutError::Datafile)?;
 
         // If our record is larger than the writer max size, we either throw an
@@ -232,15 +234,14 @@ impl BitcaskInstance {
             .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)
             .map_err(PutError::Datafile)?
         {
-            self.switch_writer_datafile(writer)?; // Consumes the guard
-            writer = self.writer.lock().unwrap();
+            self.switch_writer_datafile(writer)?;
         }
 
         let offset = writer.append_record(record).map_err(PutError::Datafile)?; // Write record first, so that it can be
         // replayed in case of a crash.
         self.storage_tracker.lock().unwrap().increment_write();
 
-        self.sync_writer(&mut writer).map_err(PutError::Datafile)?; // Sync IO according to user's options
+        self.sync_writer(writer).map_err(PutError::Datafile)?; // Sync IO according to user's options
 
         self.commit_keydir_write(record, writer.id, offset)
             .map_err(PutError::Datafile)?; // Append entry to the keydir
@@ -249,13 +250,17 @@ impl BitcaskInstance {
     }
 
     pub(crate) fn remove(&self, key: &[u8]) -> Result<(), BitcaskError> {
-        if self.keydir.write().unwrap().contains(key) {
+        // Hold a single write lock across whole operation
+        let mut writer = self.writer.lock().unwrap();
+
+        if self.keydir.read().unwrap().contains(key) {
             let record = DatafileRecord::new_tombstone(key).map_err(RemoveError::Datafile)?;
-            self.write_datafile_record(&record).map_err(|e| match e {
-                PutError::Datafile(d) => RemoveError::Datafile(d),
-                PutError::AutoMerge(m) => RemoveError::AutoMerge(m),
-                PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
-            })?;
+            self.write_datafile_record(&record, &mut writer)
+                .map_err(|e| match e {
+                    PutError::Datafile(d) => RemoveError::Datafile(d),
+                    PutError::AutoMerge(m) => RemoveError::AutoMerge(m),
+                    PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
+                })?;
         }
 
         Ok(())
@@ -263,6 +268,7 @@ impl BitcaskInstance {
 
     pub(crate) fn sync(&self) -> Result<(), BitcaskError> {
         let mut writer = self.writer.lock().unwrap();
+
         self.sync_internal(&mut writer)
             .map_err(BitcaskError::SyncFailure)
     }
@@ -341,15 +347,14 @@ impl BitcaskInstance {
     }
 
     // High level writer switchover orchestrator, handles merge triggers
-    fn switch_writer_datafile(&self, writer: MutexGuard<'_, Datafile>) -> Result<(), MergeError> {
+    fn switch_writer_datafile(&self, writer: &mut Datafile) -> Result<(), MergeError> {
         if self
             .storage_tracker
             .lock()
             .unwrap()
             .should_merge(&self.options)
         {
-            drop(writer);
-            self.merge_guarded()?; // Will also provide a fresh new writer
+            self.merge_guarded(writer)?; // Will also provide a fresh new writer
             return Ok(());
         }
 
@@ -358,10 +363,7 @@ impl BitcaskInstance {
     }
 
     // Actual implementation of writer switchover
-    fn switchover_writer(
-        &self,
-        mut old_writer: MutexGuard<'_, Datafile>,
-    ) -> Result<(), MergeError> {
+    fn switchover_writer(&self, old_writer: &mut Datafile) -> Result<(), MergeError> {
         old_writer.flush()?;
         old_writer.demote_to_reader();
         old_writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
@@ -383,17 +385,19 @@ impl BitcaskInstance {
     }
 
     pub(crate) fn merge(&self) -> Result<(), BitcaskError> {
-        self.merge_guarded()
+        let mut writer = self.writer.lock().unwrap();
+
+        self.merge_guarded(&mut writer)
             .map_err(BitcaskError::FatalMergeFailure)
     }
 
-    fn merge_guarded(&self) -> Result<(), MergeError> {
-        {
-            let mut storage_tracker = self.storage_tracker.lock().unwrap();
-            storage_tracker.disable_tracking_io_traffic();
-        }
+    fn merge_guarded(&self, writer: &mut Datafile) -> Result<(), MergeError> {
+        self.storage_tracker
+            .lock()
+            .unwrap()
+            .disable_tracking_io_traffic();
 
-        let merge = self.merge_inner();
+        let merge = self.merge_inner(writer);
 
         let mut storage_tracker = self.storage_tracker.lock().unwrap();
         storage_tracker.enable_tracking_io_traffic();
@@ -406,11 +410,10 @@ impl BitcaskInstance {
         merge
     }
 
-    // TODO: Bufferize reads during merge
-    fn merge_inner(&self) -> Result<(), MergeError> {
-        self.switchover_writer(self.writer.lock().unwrap())?; // Seal the latest writer
+    fn merge_inner(&self, writer: &mut Datafile) -> Result<(), MergeError> {
+        self.switchover_writer(writer)?; // Seal the latest writer
 
-        let writer_id = { self.writer.lock().unwrap().id };
+        let writer_id = writer.id;
         let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
             &self.dir,
             &self.options.datafile_extension,
@@ -459,13 +462,19 @@ impl BitcaskInstance {
                             df_entry.header.timestamp,
                         )?;
 
-                        let record_start_offset =
-                            self.write_datafile_record(&record).map_err(|e| match e {
+                        let record_start_offset = self
+                            .write_datafile_record(&record, writer)
+                            .map_err(|e| match e {
                                 PutError::Datafile(df_err) => MergeError::Datafile(df_err),
                                 PutError::AutoMerge(merge_err) => merge_err,
                                 PutError::RecordLargerThanMaxDatafileSize(_) => unreachable!(),
                             })?; // We want to keep original timestamp
-                        self.write_hintfile_record(&mut hf, &record, record_start_offset)?;
+                        self.write_hintfile_record(
+                            &mut hf,
+                            writer.id,
+                            &record,
+                            record_start_offset,
+                        )?;
                     } else {
                         // Otherwise we skip the value as it is either dead or the tombstone itself
                         iter.skip_next(df_entry.header.value_size as usize)?;
@@ -478,7 +487,7 @@ impl BitcaskInstance {
         hf.sync()?; // Sync the final hintfile
         self.remove_old_readers_post_merge(candidate_ids)?;
         {
-            self.switchover_writer(self.writer.lock().unwrap())?; // Seal the last writer to avoid inconsistencies between
+            self.switchover_writer(writer)?; // Seal the last writer to avoid inconsistencies between
             // hintfile and datafile
         }
         Ok(())
@@ -487,11 +496,11 @@ impl BitcaskInstance {
     fn write_hintfile_record(
         &self,
         hf: &mut Hintfile,
+        writer_id: u32,
         record: &DatafileRecord,
         record_start_offset: u64,
     ) -> Result<(), MergeError> {
         // When a writer switchover has occured
-        let writer_id = self.writer.lock().unwrap().id;
         if hf.id != writer_id {
             let new = Hintfile::new_writer(&self.dir, writer_id, &self.options.hintfile_extension)?;
 
@@ -983,7 +992,7 @@ mod tests {
         fn commits_oversized_entry_on_empty_writer_with_soft_cap() {
             let temp_dir = tempfile::tempdir().unwrap();
 
-            let mut db = BitcaskInstance::open(
+            let db = BitcaskInstance::open(
                 temp_dir.path(),
                 BitcaskOptions::default()
                     .datafile_max_size(crate::options::DatafileMaxSize::SoftCappedBytes(40)),
@@ -1011,7 +1020,7 @@ mod tests {
         fn rejects_oversized_entry_on_empty_writer_with_hard_cap() {
             let temp_dir = tempfile::tempdir().unwrap();
 
-            let mut db = BitcaskInstance::open(
+            let db = BitcaskInstance::open(
                 temp_dir.path(),
                 BitcaskOptions::default()
                     .datafile_max_size(crate::options::DatafileMaxSize::HardCappedBytes(40)),
@@ -1131,7 +1140,7 @@ mod tests {
 
         #[test]
         fn writes_tombstones() {
-            let (_, _, mut db) = init_test();
+            let (_, _, db) = init_test();
 
             const ENTRY_COUNT: usize = 20;
             const ENTRY_SIZE: usize = 29;
@@ -1182,8 +1191,7 @@ mod tests {
 
             // Temporary scope to fill the data
             {
-                let mut db =
-                    BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default()).unwrap();
+                let db = BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default()).unwrap();
 
                 for i in 0..RECORD_COUNT as u32 {
                     db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
@@ -1559,7 +1567,7 @@ mod tests {
             const ENTRY_SIZE: usize = 29;
 
             {
-                let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
+                let db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
                 for i in 0..ENTRY_COUNT as u32 {
                     db.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
@@ -1685,7 +1693,10 @@ mod tests {
 
         assert_eq!(db.readers.lock().unwrap().len(), 0);
         {
-            assert!(db.switch_writer_datafile(db.writer.lock().unwrap()).is_ok());
+            assert!(
+                db.switch_writer_datafile(&mut db.writer.lock().unwrap())
+                    .is_ok()
+            );
         }
 
         // Make sure old writer is demoted and added to LRU cache of readers
@@ -1726,7 +1737,7 @@ mod tests {
         let entry_total_size = ENTRY_COUNT * ENTRY_SIZE;
 
         {
-            let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
+            let db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
             // 29B Entries
             for i in 0..ENTRY_COUNT as u32 {
@@ -1747,7 +1758,7 @@ mod tests {
         }
 
         {
-            let mut db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
+            let db = BitcaskInstance::open(temp_dir.path(), options.clone()).unwrap();
 
             assert_eq!(db.keydir.read().unwrap().len(), ENTRY_COUNT);
 
@@ -1799,7 +1810,7 @@ mod tests {
 
     #[test]
     fn write_hintfile_record() {
-        let (temp_dir, options, mut db) = init_test();
+        let (temp_dir, options, db) = init_test();
 
         let mut hf = Hintfile::new_writer(
             temp_dir.path(),
@@ -1812,17 +1823,23 @@ mod tests {
 
         assert_eq!(hf.id, 1);
         let record = DatafileRecord::new(b"1", b"1").unwrap();
-        assert!(db.write_hintfile_record(&mut hf, &record, 0).is_ok());
+        assert!(
+            db.write_hintfile_record(&mut hf, db.writer.lock().unwrap().id, &record, 0)
+                .is_ok()
+        );
         hf.flush().unwrap();
         assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
 
         {
-            db.switch_writer_datafile(db.writer.lock().unwrap())
+            db.switch_writer_datafile(&mut db.writer.lock().unwrap())
                 .unwrap();
         }
         assert_eq!(hf.id, 1);
         let record = DatafileRecord::new(b"2", b"2").unwrap();
-        assert!(db.write_hintfile_record(&mut hf, &record, 0).is_ok());
+        assert!(
+            db.write_hintfile_record(&mut hf, db.writer.lock().unwrap().id, &record, 0)
+                .is_ok()
+        );
         hf.flush().unwrap();
         assert_eq!(hf.id, 2);
         assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
@@ -1835,7 +1852,7 @@ mod tests {
 
         #[test]
         fn merge() {
-            let (temp_dir, options, mut db) = init_test();
+            let (temp_dir, options, db) = init_test();
 
             const ENTRY_COUNT: usize = 500;
             const ENTRY_SIZE: usize = DATAFILE_HEADER_SIZE_BYTES + 4 + 4;
@@ -1951,7 +1968,7 @@ mod tests {
                 .merge_dead_space_threshold_percent(40)
                 .merge_dead_space_min_bytes((ENTRY_COUNT * ENTRY_SIZE) as u64 - 1u64);
 
-            let mut db =
+            let db =
                 BitcaskInstance::open(temp_dir.path(), BitcaskOptions::default().clone()).unwrap();
 
             for i in 0..ENTRY_COUNT as u32 {
