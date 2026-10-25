@@ -3,7 +3,7 @@ use std::{
     io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, MutexGuard, RwLock},
 };
 
 use lru::LruCache;
@@ -158,7 +158,8 @@ impl BitcaskInstance {
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
-        if let Some(keydir_entry) = self.keydir.read().unwrap().get(key).copied() {
+        let keydir_entry = self.keydir.read().unwrap().get(key).copied();
+        if let Some(keydir_entry) = keydir_entry {
             // If the current writer contains the entry
             {
                 let mut writer = self.writer.lock().unwrap();
@@ -230,16 +231,19 @@ impl BitcaskInstance {
             .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)
             .map_err(PutError::Datafile)?
         {
-            self.switch_writer_datafile()?;
+            self.switch_writer_datafile(writer)?;
+            writer = self.writer.lock().unwrap();
         }
 
         let offset = writer.append_record(record).map_err(PutError::Datafile)?; // Write record first, so that it can be
         // replayed in case of a crash.
-        self.storage_tracker.lock().unwrap().increment_write();
+        {
+            self.storage_tracker.lock().unwrap().increment_write();
+        }
 
         self.sync_writer(&mut writer).map_err(PutError::Datafile)?; // Sync IO according to user's options
 
-        self.commit_keydir_write(record, offset)
+        self.commit_keydir_write(record, writer.id, offset)
             .map_err(PutError::Datafile)?; // Append entry to the keydir
 
         Ok(offset)
@@ -293,6 +297,7 @@ impl BitcaskInstance {
     fn commit_keydir_write(
         &self,
         record: &DatafileRecord,
+        writer_id: u32,
         offset: u64,
     ) -> Result<(), DatafileError> {
         let ksz = record.header.key_size;
@@ -303,7 +308,7 @@ impl BitcaskInstance {
             DATAFILE_RECORD_TYPE_NORMAL => {
                 let old = self.keydir.write().unwrap().put(
                     record.key.clone(),
-                    self.writer.lock().unwrap().id,
+                    writer_id,
                     record.header.value_size,
                     offset + DATAFILE_HEADER_SIZE_BYTES as u64 + ksz as u64,
                     record.header.timestamp,
@@ -336,20 +341,28 @@ impl BitcaskInstance {
         Ok(())
     }
 
-    fn switch_writer_datafile(&self) -> Result<(), MergeError> {
-        self.writer.lock().unwrap().flush()?;
-
+    // High level writer switchover orchestrator, handles merge triggers
+    fn switch_writer_datafile(&self, writer: MutexGuard<'_, Datafile>) -> Result<(), MergeError> {
         if self
             .storage_tracker
             .lock()
             .unwrap()
             .should_merge(&self.options)
         {
+            drop(writer);
             self.merge_guarded()?; // Will also provide a fresh new writer
             return Ok(());
         }
 
-        let mut old_writer = self.writer.lock().unwrap();
+        self.switchover_writer(writer)?;
+        Ok(())
+    }
+
+    // Actual implementation of writer switchover
+    fn switchover_writer(
+        &self,
+        mut old_writer: MutexGuard<'_, Datafile>,
+    ) -> Result<(), MergeError> {
         old_writer.flush()?;
         old_writer.demote_to_reader();
         old_writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
@@ -396,9 +409,9 @@ impl BitcaskInstance {
 
     // TODO: Bufferize reads during merge
     fn merge_inner(&self) -> Result<(), MergeError> {
-        self.switch_writer_datafile()?; // Lock the latest writer
+        self.switchover_writer(self.writer.lock().unwrap())?; // Seal the latest writer
 
-        let writer_id = self.writer.lock().unwrap().id;
+        let writer_id = { self.writer.lock().unwrap().id };
         let candidate_ids: Vec<u32> = BitcaskStartupHandler::parse_db_datafile_ids_at_path(
             &self.dir,
             &self.options.datafile_extension,
@@ -419,8 +432,8 @@ impl BitcaskInstance {
 
             while let Some(df_entry) = iter.next_record()? {
                 if df_entry.header.record_type == DATAFILE_RECORD_TYPE_NORMAL {
-                    if let Some(keydir_entry) =
-                        self.keydir.read().unwrap().get(&df_entry.key).copied()
+                    let keydir_entry = self.keydir.read().unwrap().get(&df_entry.key).copied();
+                    if let Some(keydir_entry) = keydir_entry
                         && keydir_entry.file_id == id
                         && keydir_entry.value_offset == df_entry.value_offset
                     {
@@ -465,8 +478,10 @@ impl BitcaskInstance {
         hf.flush()?; // Flush the buffer
         hf.sync()?; // Sync the final hintfile
         self.remove_old_readers_post_merge(candidate_ids)?;
-        self.switch_writer_datafile()?; // Seal the last writer to avoid inconsistencies between
-        // hintfile and datafile
+        {
+            self.switchover_writer(self.writer.lock().unwrap())?; // Seal the last writer to avoid inconsistencies between
+            // hintfile and datafile
+        }
         Ok(())
     }
 
@@ -1038,7 +1053,7 @@ mod tests {
 
         #[test]
         fn returns_written_value() {
-            let (_, _, mut db) = init_test();
+            let (_, _, db) = init_test();
 
             let key = "hello world";
             let value: u32 = 2;
@@ -1620,7 +1635,10 @@ mod tests {
         let datafile_record = datafile_record_for_string_u32("hello world", 2);
         let expected = keydir_entry_for(&datafile_record, db.writer.lock().unwrap().id, 0);
 
-        assert!(db.commit_keydir_write(&datafile_record.clone(), 0).is_ok());
+        assert!(
+            db.commit_keydir_write(&datafile_record.clone(), db.writer.lock().unwrap().id, 0)
+                .is_ok()
+        );
         {
             let keydir = db.keydir.read().unwrap();
             assert_eq!(keydir.len(), 1);
@@ -1630,7 +1648,10 @@ mod tests {
         let datafile_record = datafile_record_for_string_u32("byeworld", 2);
         let expected = keydir_entry_for(&datafile_record, db.writer.lock().unwrap().id, 35);
 
-        assert!(db.commit_keydir_write(&datafile_record.clone(), 35).is_ok());
+        assert!(
+            db.commit_keydir_write(&datafile_record.clone(), db.writer.lock().unwrap().id, 35)
+                .is_ok()
+        );
         {
             let keydir = db.keydir.read().unwrap();
             assert_eq!(keydir.len(), 2);
@@ -1640,7 +1661,10 @@ mod tests {
         let datafile_record = datafile_record_for_string_u32("byeworld", 3);
         let expected = keydir_entry_for(&datafile_record, db.writer.lock().unwrap().id, 70);
 
-        assert!(db.commit_keydir_write(&datafile_record.clone(), 70).is_ok());
+        assert!(
+            db.commit_keydir_write(&datafile_record.clone(), db.writer.lock().unwrap().id, 70)
+                .is_ok()
+        );
         {
             let keydir = db.keydir.read().unwrap();
             assert_ne!(keydir.len(), 3);
@@ -1661,7 +1685,9 @@ mod tests {
         }
 
         assert_eq!(db.readers.lock().unwrap().len(), 0);
-        assert!(db.switch_writer_datafile().is_ok());
+        {
+            assert!(db.switch_writer_datafile(db.writer.lock().unwrap()).is_ok());
+        }
 
         // Make sure old writer is demoted and added to LRU cache of readers
         {
@@ -1791,7 +1817,10 @@ mod tests {
         hf.flush().unwrap();
         assert_eq!(hf.file_size().unwrap(), HINT_ENTRY_SIZE as u64);
 
-        db.switch_writer_datafile().unwrap();
+        {
+            db.switch_writer_datafile(db.writer.lock().unwrap())
+                .unwrap();
+        }
         assert_eq!(hf.id, 1);
         let record = DatafileRecord::new(b"2", b"2").unwrap();
         assert!(db.write_hintfile_record(&mut hf, &record, 0).is_ok());
