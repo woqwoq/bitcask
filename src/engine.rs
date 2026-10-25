@@ -109,6 +109,7 @@ pub struct BitcaskInstance {
 #[hotpath::measure_all]
 impl BitcaskInstance {
     pub(crate) fn open(dir: &Path, options: BitcaskOptions) -> Result<Self, BitcaskError> {
+        options.validate().map_err(OpenError::InvalidDBOptions)?;
         let mut storage_tracker = StorageTracker::new();
         let mut keydir = KeyDir::with_capacity(options.expected_keydir_max_size);
         let mut readers: LruCache<u32, Arc<Datafile>> =
@@ -231,15 +232,13 @@ impl BitcaskInstance {
             .should_switch_writer_before_write_commit(rsz as u64, &self.options.datafile_max_size)
             .map_err(PutError::Datafile)?
         {
-            self.switch_writer_datafile(writer)?;
+            self.switch_writer_datafile(writer)?; // Consumes the guard
             writer = self.writer.lock().unwrap();
         }
 
         let offset = writer.append_record(record).map_err(PutError::Datafile)?; // Write record first, so that it can be
         // replayed in case of a crash.
-        {
-            self.storage_tracker.lock().unwrap().increment_write();
-        }
+        self.storage_tracker.lock().unwrap().increment_write();
 
         self.sync_writer(&mut writer).map_err(PutError::Datafile)?; // Sync IO according to user's options
 

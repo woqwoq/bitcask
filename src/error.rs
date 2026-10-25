@@ -77,6 +77,7 @@ pub enum OpenError {
     FatalDatafileReplay(DatafileError),
     FatalHintfileReplay(HintfileError),
     WriterInit(DatafileError),
+    InvalidDBOptions(InvalidOptionError),
 }
 
 impl fmt::Display for OpenError {
@@ -110,6 +111,9 @@ impl fmt::Display for OpenError {
             }
             OpenError::WriterInit(e) => {
                 write!(f, "failed to initialize active writer datafile: {e}")
+            }
+            OpenError::InvalidDBOptions(e) => {
+                write!(f, "invalid DB options detected: {e}")
             }
         }
     }
@@ -480,6 +484,25 @@ impl std::error::Error for HintfileError {
 impl From<TryFromSliceError> for HintfileError {
     fn from(value: TryFromSliceError) -> Self {
         Self::SliceConversion(value)
+    }
+}
+
+#[derive(Debug)]
+pub enum InvalidOptionError {
+    NonZeroField(String),
+    NonEmptyField(String),
+}
+
+impl fmt::Display for InvalidOptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InvalidOptionError::NonZeroField(field) => {
+                write!(f, "field {field} can't be set to zero.")
+            }
+            InvalidOptionError::NonEmptyField(field) => {
+                write!(f, "field {field} can't be empty.")
+            }
+        }
     }
 }
 

@@ -1,3 +1,5 @@
+use crate::error::InvalidOptionError;
+
 pub const KB: usize = 1024;
 pub const MB: usize = KB * KB;
 pub const GB: usize = KB * MB;
@@ -74,6 +76,51 @@ pub struct BitcaskOptions {
 }
 
 impl BitcaskOptions {
+    pub fn validate(&self) -> Result<(), InvalidOptionError> {
+        if matches!(self.sync_frequency, SyncFrequency::EveryNthWrite(0)) {
+            return Err(InvalidOptionError::NonZeroField(String::from(
+                "sync_frequency",
+            )));
+        }
+
+        if self.datafile_max_size.get_size() == 0 {
+            return Err(InvalidOptionError::NonZeroField(String::from(
+                "datafile_max_size",
+            )));
+        }
+
+        if self.merge_dead_space_threshold_percent == 0 {
+            return Err(InvalidOptionError::NonZeroField(String::from(
+                "merge_dead_space_threshold_percent",
+            )));
+        }
+
+        if self.merge_dead_space_threshold_bytes == 0 {
+            return Err(InvalidOptionError::NonZeroField(String::from(
+                "merge_dead_space_threshold_bytes",
+            )));
+        }
+
+        if self.reader_lru_cache_size == 0 {
+            return Err(InvalidOptionError::NonZeroField(String::from(
+                "reader_lru_cache_size",
+            )));
+        }
+
+        if self.datafile_extension.is_empty() {
+            return Err(InvalidOptionError::NonEmptyField(String::from(
+                "datafile_extension",
+            )));
+        }
+
+        if self.hintfile_extension.is_empty() {
+            return Err(InvalidOptionError::NonEmptyField(String::from(
+                "hintfile_extension",
+            )));
+        }
+
+        Ok(())
+    }
     pub fn sync_mode(mut self, new: SyncMode) -> Self {
         self.sync_mode = new;
         self
