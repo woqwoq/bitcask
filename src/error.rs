@@ -324,8 +324,8 @@ pub enum DatafileError {
     // Domain/validation variants
     NegativeTimestamp(SystemTimeError),
     SliceConversion(TryFromSliceError),
-    OversizedDatafileRecord,
-    ValueLargerThanDatafile,
+    DatafileKeyValueSizeOverflow,
+    PayloadSizeGreaterThanDatafile { file_size: u64, declared: usize },
     UndersizedDatafileHeader(usize),
     UndersizedDatafileKey { actual: usize, expected: usize },
     UndersizedDatafileValue { actual: usize, expected: usize },
@@ -356,13 +356,16 @@ impl fmt::Display for DatafileError {
                 f,
                 "failed to convert a byte slice into a fixed-size array while decoding: {e}"
             ),
-            DatafileError::OversizedDatafileRecord => write!(
+            DatafileError::DatafileKeyValueSizeOverflow => write!(
                 f,
                 "record is too large to be represented in the datafile header"
             ),
-            DatafileError::ValueLargerThanDatafile => write!(
+            DatafileError::PayloadSizeGreaterThanDatafile {
+                file_size: df_size,
+                declared,
+            } => write!(
                 f,
-                "value size declared in the header is large than the size of the current datafile. this is likely caused by a corrupted datafile header"
+                "key/value size {declared} is greater than the size of the current datafile {df_size}. this is likely caused by a corrupted record header"
             ),
             DatafileError::UndersizedDatafileHeader(actual) => write!(
                 f,
@@ -438,6 +441,7 @@ pub enum HintfileError {
     // Validation variants
     SliceConversion(TryFromSliceError),
     OversizedHintfileRecord,
+    PayloadSizeGreaterThanHintfile { file_size: u64, declared: usize },
     UndersizedHintfileHeader(usize),
     UndersizedHintfileKey { actual: usize, expected: usize },
     CrcMismatch,
@@ -457,6 +461,15 @@ impl fmt::Display for HintfileError {
             ),
             HintfileError::OversizedHintfileRecord => {
                 write!(f, "hintfile record is too large")
+            }
+            HintfileError::PayloadSizeGreaterThanHintfile {
+                file_size,
+                declared,
+            } => {
+                write!(
+                    f,
+                    "key/value size {declared} is greater than the size of the current hintfile {file_size}. this is likely caused by a corrupted record header"
+                )
             }
             HintfileError::UndersizedHintfileHeader(actual) => {
                 write!(f, "incomplete hintfile header: got {actual} bytes")

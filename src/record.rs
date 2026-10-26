@@ -42,9 +42,9 @@ impl DatafileRecordHeader {
         timestamp: u64,
     ) -> Result<Self, DatafileError> {
         let key_size =
-            u32::try_from(key.len()).map_err(|_| DatafileError::OversizedDatafileRecord)?;
+            u32::try_from(key.len()).map_err(|_| DatafileError::DatafileKeyValueSizeOverflow)?;
         let value_size =
-            u32::try_from(value.len()).map_err(|_| DatafileError::OversizedDatafileRecord)?;
+            u32::try_from(value.len()).map_err(|_| DatafileError::DatafileKeyValueSizeOverflow)?;
 
         Ok(DatafileRecordHeader {
             crc: Self::get_crc_for(record_type, timestamp, key_size, value_size, key, value),
@@ -124,9 +124,9 @@ impl DatafileRecordHeader {
         let size = u64::from(self.key_size)
             .checked_add(u64::from(self.value_size))
             .and_then(|kv| kv.checked_add(DATAFILE_HEADER_SIZE_BYTES as u64))
-            .ok_or(DatafileError::OversizedDatafileRecord)?;
+            .ok_or(DatafileError::DatafileKeyValueSizeOverflow)?;
 
-        usize::try_from(size).map_err(|_| DatafileError::OversizedDatafileRecord)
+        usize::try_from(size).map_err(|_| DatafileError::DatafileKeyValueSizeOverflow)
     }
 }
 
@@ -146,7 +146,11 @@ impl DatafileRecord {
         })
     }
 
-    pub(crate) fn with_timestamp(key: &[u8], value: &[u8], timestamp: u64) -> Result<Self, DatafileError> {
+    pub(crate) fn with_timestamp(
+        key: &[u8],
+        value: &[u8],
+        timestamp: u64,
+    ) -> Result<Self, DatafileError> {
         Ok(Self {
             header: DatafileRecordHeader::with_timestamp(
                 key,

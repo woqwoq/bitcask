@@ -11,7 +11,7 @@ use crate::{
     datafile::Datafile,
     error::HintfileError,
     keydir::KeyDir,
-    options::{KB, READER_BUFFER_SIZE, WRITER_BUFFER_SIZE},
+    options::{READER_BUFFER_SIZE, WRITER_BUFFER_SIZE},
     record::DatafileRecord,
 };
 
@@ -202,6 +202,13 @@ impl Hintfile {
                 &mut reader,
                 HINTFILE_RECORD_HEADER_SIZE_BYTES,
             )?)?;
+
+            if header.key_size as u64 >= fsz {
+                return Err(HintfileError::PayloadSizeGreaterThanHintfile {
+                    file_size: fsz,
+                    declared: header.key_size as usize,
+                });
+            }
 
             let mut hasher = header.crc();
 

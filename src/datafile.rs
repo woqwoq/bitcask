@@ -131,15 +131,17 @@ impl Datafile {
             })?;
 
         while start_offset < file_size {
-            // TODO: Handle unexpected eof
             let header = DatafileRecordHeader::decode(&Self::read_exact_bytes(
                 &mut reader,
                 DATAFILE_HEADER_SIZE_BYTES,
                 start_offset,
             )?)?;
 
-            if header.value_size as u64 >= file_size {
-                return Err(DatafileError::OversizedDatafileRecord);
+            if header.key_size as u64 >= file_size || header.value_size as u64 >= file_size {
+                return Err(DatafileError::PayloadSizeGreaterThanDatafile {
+                    file_size,
+                    declared: header.key_size.max(header.value_size) as usize,
+                });
             }
 
             let mut hasher = header.crc();
@@ -319,11 +321,16 @@ impl Datafile {
     ) -> Result<Box<[u8]>, DatafileError> {
         let mut buf = vec![0u8; count];
 
-        reader
-            .read_exact(&mut buf)
-            .map_err(|source| DatafileError::Read { offset, source })?;
-
-        Ok(Box::from(buf))
+        match reader.read_exact(&mut buf) {
+            Ok(_) => Ok(Box::from(buf)),
+            Err(e) => {
+                if e.kind() == ErrorKind::UnexpectedEof {
+                    Err(DatafileError::TornRecord)
+                } else {
+                    Err(DatafileError::Read { offset, source: e })
+                }
+            }
+        }
     }
 
     pub(crate) fn demote_to_reader(&mut self) {
@@ -697,6 +704,30 @@ mod tests {
             let mut keydir = KeyDir::default();
 
             assert!(df.replay(&mut keydir).is_ok());
+        }
+
+        #[test]
+        fn handles_values_larger_than_datafile() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut df = Datafile::new_writer(
+                temp_dir.path(),
+                1,
+                &BitcaskOptions::default().datafile_extension,
+            )
+            .unwrap();
+
+            let mut record = DatafileRecord::new(b"1", b"1").unwrap();
+            record.header.value_size = 100;
+            // Pre-fill datafile with a value larger than chunk size
+            assert!(df.append_record(&record).is_ok());
+            let _ = df.file.rewind();
+
+            let mut keydir = KeyDir::default();
+
+            assert!(matches!(
+                df.replay(&mut keydir),
+                Err(DatafileError::PayloadSizeGreaterThanDatafile { .. })
+            ));
         }
     }
 

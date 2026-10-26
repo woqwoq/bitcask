@@ -1,6 +1,5 @@
 use std::{
     fs::{self, read_dir},
-    io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -587,21 +586,11 @@ impl BitcaskRecoveryHandler {
                     .map_err(OpenError::FatalDatafileReplay)?;
                 match error {
                     DatafileError::TornRecord
+                    | DatafileError::PayloadSizeGreaterThanDatafile { .. }
                     | DatafileError::UndersizedDatafileHeader(_)
                     | DatafileError::CrcMismatch => {
                         df.truncate(df.offset)
                             .map_err(OpenError::FatalDatafileReplay)?;
-                    }
-                    DatafileError::Read { source, .. } => {
-                        if source.kind() == ErrorKind::UnexpectedEof {
-                            df.truncate(df.offset)
-                                .map_err(OpenError::FatalDatafileReplay)?;
-                        } else {
-                            return Err(OpenError::FatalDatafileReplay(DatafileError::Read {
-                                offset: df.offset,
-                                source,
-                            }));
-                        }
                     }
                     e => return Err(OpenError::FatalDatafileReplay(e)),
                 }
