@@ -8,7 +8,11 @@ use std::{
 use crc32fast::Hasher;
 
 use crate::{
-    datafile::Datafile, error::HintfileError, keydir::KeyDir, options::KB, record::DatafileRecord,
+    datafile::Datafile,
+    error::HintfileError,
+    keydir::KeyDir,
+    options::{KB, READER_BUFFER_SIZE, WRITER_BUFFER_SIZE},
+    record::DatafileRecord,
 };
 
 pub(crate) const HINTFILE_RECORD_HEADER_SIZE_BYTES: usize = 28;
@@ -178,7 +182,7 @@ impl Hintfile {
             .map_err(HintfileError::Open)?;
 
         Ok(Self {
-            file: BufWriter::with_capacity(8 * KB, file),
+            file: BufWriter::with_capacity(WRITER_BUFFER_SIZE, file),
             id,
         })
     }
@@ -188,7 +192,7 @@ impl Hintfile {
         let mut start_offset = 0;
         let mut count: usize = 0;
 
-        let mut reader = BufReader::with_capacity(8 * KB, self.file.get_ref());
+        let mut reader = BufReader::with_capacity(READER_BUFFER_SIZE, self.file.get_ref());
         reader
             .seek(SeekFrom::Start(0))
             .map_err(HintfileError::Read)?;
@@ -243,7 +247,7 @@ impl Hintfile {
             .map_err(HintfileError::Open)?;
 
         Ok(Some(Self {
-            file: BufWriter::with_capacity(8 * KB, file),
+            file: BufWriter::with_capacity(WRITER_BUFFER_SIZE, file),
             id,
         }))
     }

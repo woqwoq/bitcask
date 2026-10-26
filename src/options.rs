@@ -4,6 +4,9 @@ pub const KB: usize = 1024;
 pub const MB: usize = KB * KB;
 pub const GB: usize = KB * MB;
 
+pub const READER_BUFFER_SIZE: usize = 8 * KB;
+pub const WRITER_BUFFER_SIZE: usize = 8 * KB;
+
 pub const DATAFILE_HEADER_SIZE_BYTES: usize = 21;
 
 pub const DEFAULT_DATAFILE_EXTENSION: &str = "db";

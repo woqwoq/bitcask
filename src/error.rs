@@ -325,6 +325,7 @@ pub enum DatafileError {
     NegativeTimestamp(SystemTimeError),
     SliceConversion(TryFromSliceError),
     OversizedDatafileRecord,
+    ValueLargerThanDatafile,
     UndersizedDatafileHeader(usize),
     UndersizedDatafileKey { actual: usize, expected: usize },
     UndersizedDatafileValue { actual: usize, expected: usize },
@@ -358,6 +359,10 @@ impl fmt::Display for DatafileError {
             DatafileError::OversizedDatafileRecord => write!(
                 f,
                 "record is too large to be represented in the datafile header"
+            ),
+            DatafileError::ValueLargerThanDatafile => write!(
+                f,
+                "value size declared in the header is large than the size of the current datafile. this is likely caused by a corrupted datafile header"
             ),
             DatafileError::UndersizedDatafileHeader(actual) => write!(
                 f,

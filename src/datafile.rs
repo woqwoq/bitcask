@@ -9,7 +9,10 @@ use std::{
 use crate::{
     error::DatafileError,
     keydir::KeyDir,
-    options::{DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, KB, SyncMode},
+    options::{
+        DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, KB, READER_BUFFER_SIZE, SyncMode,
+        WRITER_BUFFER_SIZE,
+    },
     record::{
         DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE, DatafileRecord,
         DatafileRecordHeader,
@@ -48,7 +51,7 @@ impl Datafile {
             })?;
 
         Ok(Datafile {
-            file: BufWriter::with_capacity(8 * KB, file),
+            file: BufWriter::with_capacity(WRITER_BUFFER_SIZE, file),
             id,
             offset: 0,
             is_writer: true,
@@ -119,7 +122,7 @@ impl Datafile {
         let file_size = self.file_size()?;
         let mut start_offset = 0;
 
-        let mut reader = BufReader::with_capacity(8 * KB, self.file.get_ref());
+        let mut reader = BufReader::with_capacity(READER_BUFFER_SIZE, self.file.get_ref());
         reader
             .seek(SeekFrom::Start(0))
             .map_err(|e| DatafileError::Read {
@@ -135,7 +138,9 @@ impl Datafile {
                 start_offset,
             )?)?;
 
-            // TODO: Make sure VSZ is not overflowing the file???
+            if header.value_size as u64 >= file_size {
+                return Err(DatafileError::OversizedDatafileRecord);
+            }
 
             let mut hasher = header.crc();
 
