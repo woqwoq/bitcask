@@ -2031,5 +2031,29 @@ mod tests {
                 assert_eq!(db.get(&op.key).unwrap().unwrap(), op.value);
             }
         }
+
+        #[test]
+        fn reads_are_served() {
+            let thread_count: usize = 8;
+            let op_count: usize = 10000;
+            let thread_ops = op_count / thread_count;
+            let (ksz, vsz) = (4, 64);
+
+            let (_dir, _, db) = init_test();
+            let db = Arc::new(db);
+
+            let ops = provision_db_data(op_count, ksz, vsz, OperationType::Write);
+            fill_db(&db, &ops);
+
+            thread::scope(|s| {
+                for chunk in ops.chunks(thread_ops) {
+                    s.spawn(|| {
+                        for op in chunk.iter().cloned() {
+                            assert_eq!(db.get(&op.key).unwrap().unwrap(), op.value);
+                        }
+                    });
+                }
+            });
+        }
     }
 }
