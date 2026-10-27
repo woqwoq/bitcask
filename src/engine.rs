@@ -1999,4 +1999,31 @@ mod tests {
             }
         }
     }
+
+    mod concurrency {
+        use std::thread;
+
+        use crate::test_utils::*;
+
+        use super::*;
+
+        #[test]
+        fn reads_are_served() {
+            let thread_count: usize = 4;
+            let op_count: usize = 100;
+            let thread_ops = op_count / thread_count;
+            let (ksz, vsz) = (4, 16);
+
+            let (dir, _, db) = init_test();
+
+            let threads = (0..thread_count).map(|_| {
+                let ops = provision_db_data(thread_ops, ksz, vsz, OperationType::Write);
+                thread::spawn(|| {
+                    fill_db(&db, &ops);
+                })
+            });
+
+            threads.map(|t| t.join().unwrap());
+        }
+    }
 }
