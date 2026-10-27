@@ -1,3 +1,7 @@
+#![cfg(any(test, feature = "test_utils"))]
+
+use std::collections::HashMap;
+
 use rand::{
     distr::{Alphanumeric, SampleString},
     seq::SliceRandom,
@@ -5,7 +9,7 @@ use rand::{
 use tempfile::{TempDir, tempdir};
 
 use crate::{BitcaskInstance, options::BitcaskOptions};
-#[cfg(any(test, feature = "test_utils"))]
+
 #[derive(Clone)]
 pub enum OperationType {
     Read,
@@ -15,8 +19,8 @@ pub enum OperationType {
 #[derive(Clone)]
 pub struct Operation {
     op_type: OperationType,
-    key: Box<[u8]>,
-    value: Box<[u8]>,
+    pub key: Box<[u8]>,
+    pub value: Box<[u8]>,
 }
 
 impl Operation {
@@ -40,30 +44,41 @@ pub fn provision_db_in_temp(options: BitcaskOptions) -> (TempDir, BitcaskInstanc
     (temp_dir, BitcaskInstance::open(&path, options).unwrap())
 }
 
-pub fn fill_db(db: &BitcaskInstance, ops: &DatabaseOperations) {
+pub fn fill_db(db: &BitcaskInstance, ops: &[Operation]) {
     for op in ops {
         db.put(&op.key, &op.value).unwrap();
     }
 }
 
 pub type DatabaseOperations = Vec<Operation>;
+
+// Does not guarantee exact keysize due to possible collisions when ksz is small
 pub fn provision_db_data(
     n: usize,
     ksz: usize,
     vsz: usize,
     op_type: OperationType,
 ) -> DatabaseOperations {
-    let mut store = Vec::new();
+    let mut map = HashMap::new();
 
-    for _ in 0..n {
-        store.push(Operation::new(
-            generate_sized_string(ksz).as_bytes(),
-            generate_sized_string(vsz).as_bytes(),
-            op_type.clone(),
-        ));
+    while n > map.len() {
+        let key = generate_sized_string(ksz);
+
+        if map.contains_key(&key) {
+            continue;
+        }
+
+        map.insert(
+            key.clone(),
+            Operation::new(
+                key.as_bytes(),
+                generate_sized_string(vsz).as_bytes(),
+                op_type.clone(),
+            ),
+        );
     }
 
-    store
+    map.into_values().collect()
 }
 
 pub fn merge_and_shuffle(

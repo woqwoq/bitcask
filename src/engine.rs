@@ -2001,29 +2001,35 @@ mod tests {
     }
 
     mod concurrency {
-        use std::thread;
+        use std::thread::{self};
 
         use crate::test_utils::*;
 
         use super::*;
 
         #[test]
-        fn reads_are_served() {
-            let thread_count: usize = 4;
-            let op_count: usize = 100;
+        fn writes_are_served() {
+            let thread_count: usize = 8;
+            let op_count: usize = 10000;
             let thread_ops = op_count / thread_count;
-            let (ksz, vsz) = (4, 16);
+            let (ksz, vsz) = (4, 64);
 
-            let (dir, _, db) = init_test();
+            let (_dir, _, db) = init_test();
+            let db = Arc::new(db);
 
-            let threads = (0..thread_count).map(|_| {
-                let ops = provision_db_data(thread_ops, ksz, vsz, OperationType::Write);
-                thread::spawn(|| {
-                    fill_db(&db, &ops);
-                })
+            let all_ops = provision_db_data(op_count, ksz, vsz, OperationType::Write);
+
+            thread::scope(|s| {
+                for chunk in all_ops.chunks(thread_ops) {
+                    s.spawn(|| {
+                        fill_db(&db, chunk);
+                    });
+                }
             });
 
-            threads.map(|t| t.join().unwrap());
+            for op in &all_ops {
+                assert_eq!(db.get(&op.key).unwrap().unwrap(), op.value);
+            }
         }
     }
 }

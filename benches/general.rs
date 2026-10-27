@@ -1,11 +1,13 @@
 use bitcask::{
-    BitcaskInstance, DatabaseOperations, OperationType,
+    BitcaskInstance,
     db::KeyValueDatabase,
-    fill_db, merge_and_shuffle,
     options::{
         BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, GB, KB, MB, SyncFrequency,
     },
-    perform_operations, provision_db_data, provision_db_in_temp,
+    test_utils::{
+        DatabaseOperations, OperationType, fill_db, merge_and_shuffle, perform_operations,
+        provision_db_data, provision_db_in_temp,
+    },
 };
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -116,10 +118,10 @@ fn read_bench(c: &mut Criterion) {
 
     let throughput = |size| Throughput::Bytes((size * vsz) as u64);
     let prep = |s| {
-        let (dir, mut db) = provision_db_in_temp(options.clone());
+        let (dir, db) = provision_db_in_temp(options.clone());
         let ops = provision_db_data(s * DATA_TO_READS_RATIO, ksz, vsz, OperationType::Read);
 
-        fill_db(&mut db, &ops);
+        fill_db(&db, &ops);
 
         (dir, db, ops)
     };
@@ -165,11 +167,11 @@ fn read_write_bench(c: &mut Criterion) {
         let read_count = (size * RANDOM_READ_PERCENTAGE) / 100;
         let write_count = size - read_count;
 
-        let (dir, mut db) = provision_db_in_temp(options.clone());
+        let (dir, db) = provision_db_in_temp(options.clone());
         let read_kv = provision_db_data(read_count, ksz, vsz, OperationType::Read);
         let write_kv = provision_db_data(write_count, ksz, vsz, OperationType::Write);
 
-        fill_db(&mut db, &read_kv);
+        fill_db(&db, &read_kv);
 
         let ops = merge_and_shuffle(read_kv, write_kv);
 
@@ -198,10 +200,10 @@ fn merge_bench(c: &mut Criterion) {
     let throughput = |size| Throughput::Bytes((size * rsz) as u64);
 
     let prep = |size| {
-        let (dir, mut db) = provision_db_in_temp(options.clone());
+        let (dir, db) = provision_db_in_temp(options.clone());
         let ops = provision_db_data(size, ksz, vsz, OperationType::Write);
 
-        fill_db(&mut db, &ops);
+        fill_db(&db, &ops);
 
         (dir, db, ops)
     };

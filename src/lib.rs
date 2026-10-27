@@ -11,4 +11,3 @@ mod record;
 
 pub use db::KeyValueDatabase;
 pub use engine::BitcaskInstance;
-pub use test_utils::*;
