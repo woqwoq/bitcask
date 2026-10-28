@@ -96,7 +96,7 @@ pub fn merge_and_shuffle(
     data
 }
 
-pub fn perform_operations(db: &mut BitcaskInstance, ops: &DatabaseOperations, n: usize) {
+pub fn perform_operations(db: &BitcaskInstance, ops: &[Operation], n: usize) {
     for op in ops.iter().take(n) {
         match op.op_type {
             OperationType::Read => {

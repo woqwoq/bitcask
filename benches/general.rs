@@ -96,8 +96,8 @@ fn write_bench(c: &mut Criterion) {
         let ops = provision_db_data(s, ksz, vsz, OperationType::Write);
         (dir, db, ops)
     };
-    let run = |s, dir, mut db, ops| {
-        perform_operations(&mut db, &ops, s);
+    let run = |s, dir, db, ops: DatabaseOperations| {
+        perform_operations(&db, &ops, s);
         (dir, db, ops)
     };
 
@@ -133,8 +133,8 @@ fn read_bench(c: &mut Criterion) {
         (dir, db, ops)
     };
 
-    let run = |s, dir, mut db, ops| {
-        perform_operations(&mut db, &ops, s);
+    let run = |s, dir, db, ops: DatabaseOperations| {
+        perform_operations(&db, &ops, s);
         (dir, db, ops)
     };
 
@@ -178,8 +178,8 @@ fn read_write_bench(c: &mut Criterion) {
         (dir, db, ops)
     };
 
-    let run = |s, dir, mut db, ops| {
-        perform_operations(&mut db, &ops, s);
+    let run = |s, dir, db, ops: DatabaseOperations| {
+        perform_operations(&db, &ops, s);
         (dir, db, ops)
     };
 

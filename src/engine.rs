@@ -2001,9 +2001,12 @@ mod tests {
     }
 
     mod concurrency {
-        use std::thread::{self};
+        use std::{
+            collections::HashSet,
+            thread::{self},
+        };
 
-        use crate::test_utils::*;
+        use crate::{options::KB, test_utils::*};
 
         use super::*;
 
@@ -2051,6 +2054,47 @@ mod tests {
                         for op in chunk.iter().cloned() {
                             assert_eq!(db.get(&op.key).unwrap().unwrap(), op.value);
                         }
+                    });
+                }
+            });
+        }
+
+        // TODO: Race between get() and merge() in between get's non-atomic read
+        #[test]
+        fn chaos() {
+            const READ_PERCENTAGE: usize = 40;
+
+            let thread_count: usize = 8;
+            let op_count: usize = 10000;
+            let thread_ops = op_count / thread_count;
+            let (ksz, vsz) = (4, 64);
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let options = BitcaskOptions::default()
+                .datafile_max_size(DatafileMaxSize::SoftCappedBytes(KB))
+                .merge_dead_space_threshold_percent(50)
+                .merge_dead_space_min_bytes(1);
+
+            let db = Arc::new(BitcaskInstance::open(temp_dir.path(), options).unwrap());
+
+            let read_count = (op_count * READ_PERCENTAGE) / 100;
+            let write_count = op_count - read_count;
+
+            let read_kv = provision_db_data(read_count, ksz, vsz, OperationType::Read);
+            let write_kv = provision_db_data(write_count, ksz, vsz, OperationType::Write);
+
+            fill_db(&db, &read_kv);
+
+            let active_ops = merge_and_shuffle(read_kv, write_kv);
+
+            thread::scope(|s| {
+                for (i, ops) in active_ops.chunks(thread_ops).enumerate() {
+                    if i == thread_count / 2 {
+                        db.merge().unwrap();
+                    }
+
+                    s.spawn(|| {
+                        perform_operations(&db, ops, thread_ops);
                     });
                 }
             });
