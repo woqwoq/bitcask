@@ -169,7 +169,8 @@ impl BitcaskInstance {
         // If the current writer contains the entry
         {
             if keydir_entry.file_id == self.writer_id.load(std::sync::atomic::Ordering::Acquire) {
-                drop(keydir);
+                drop(keydir); // No need to hold a keydir lock, we are sure that the active writer
+                // houses the file
                 let mut writer = self.writer.lock().unwrap();
 
                 writer.flush().map_err(GetError::Datafile)?;
@@ -183,6 +184,8 @@ impl BitcaskInstance {
         }
 
         let reader = self.get_or_open_reader(keydir_entry.file_id)?;
+        drop(keydir); // Now that we know we have the right reader open we can drop the keydir to
+        // allow concurrent writes
 
         Ok(Some(
             reader
