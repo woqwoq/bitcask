@@ -1,8 +1,9 @@
 use std::{
+    fmt::write,
     fs::{self, read_dir},
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicU32},
 };
 
 use lru::LruCache;
@@ -95,6 +96,7 @@ pub struct BitcaskInstance {
     dir: PathBuf,                                 // For opening files through LRU
     keydir: RwLock<KeyDir>,                       // In-memory keydir map
     writer: Mutex<Datafile>,                      // Writer file handle
+    writer_id: AtomicU32, // Writer file id to avoid locking during concurrent reads
     readers: Mutex<LruCache<u32, Arc<Datafile>>>, // Use LRU cache to track recently used files
     storage_tracker: Mutex<StorageTracker>, // For tracking dead space, writes for sync triggers and trigger compaction
     options: BitcaskOptions,                // User-customisable options
@@ -120,16 +122,17 @@ impl BitcaskInstance {
         storage_tracker.write_bytes(total_df_size);
         storage_tracker.remove_bytes(total_df_size.saturating_sub(keydir.get_live_log_size()));
 
-        let writer = Mutex::new(BitcaskStartupHandler::create_writer_with_options(
+        let writer = BitcaskStartupHandler::create_writer_with_options(
             dir,
             &options,
             latest_datafile,
             &mut readers,
-        )?);
+        )?;
 
         Ok(BitcaskInstance {
             keydir: RwLock::new(keydir),
-            writer,
+            writer_id: AtomicU32::new(writer.id),
+            writer: Mutex::new(writer),
             dir: dir.to_path_buf(),
             readers: Mutex::new(readers),
             storage_tracker: Mutex::new(storage_tracker),
@@ -157,15 +160,18 @@ impl BitcaskInstance {
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Box<[u8]>>, BitcaskError> {
-        let Some(keydir_entry) = self.keydir.read().unwrap().get(key).copied() else {
+        let keydir = self.keydir.read().unwrap();
+
+        let Some(keydir_entry) = keydir.get(key).copied() else {
             return Ok(None);
         };
 
         // If the current writer contains the entry
         {
-            let mut writer = self.writer.lock().unwrap();
+            if keydir_entry.file_id == self.writer_id.load(std::sync::atomic::Ordering::Acquire) {
+                drop(keydir);
+                let mut writer = self.writer.lock().unwrap();
 
-            if keydir_entry.file_id == writer.id {
                 writer.flush().map_err(GetError::Datafile)?;
 
                 return Ok(Some(
@@ -362,18 +368,17 @@ impl BitcaskInstance {
     }
 
     // Actual implementation of writer switchover
-    fn rotate_writer(&self, old_writer: &mut Datafile) -> Result<(), DatafileError> {
-        old_writer.flush()?;
-        old_writer.demote_to_reader();
-        old_writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
+    fn rotate_writer(&self, writer: &mut Datafile) -> Result<(), DatafileError> {
+        writer.flush()?;
+        writer.demote_to_reader();
+        writer.sync(&SyncMode::SyncAll)?; // Force sync to persist
 
-        let new_writer = Datafile::new_writer(
-            &self.dir,
-            old_writer.id + 1,
-            &self.options.datafile_extension,
-        )?;
+        let new_writer =
+            Datafile::new_writer(&self.dir, writer.id + 1, &self.options.datafile_extension)?;
 
-        let old_writer = std::mem::replace(&mut *old_writer, new_writer);
+        let old_writer = std::mem::replace(&mut *writer, new_writer);
+        self.writer_id
+            .store(writer.id, std::sync::atomic::Ordering::Release);
 
         self.readers
             .lock()
@@ -525,6 +530,9 @@ impl BitcaskInstance {
     }
 
     fn remove_old_readers_post_merge(&self, ids: &[u32]) -> Result<(), MergeError> {
+        // Block any reads during removal of old datafiles
+        let _keydir = self.keydir.write().unwrap();
+
         for &id in ids {
             self.readers.lock().unwrap().pop(&id); // Evict the file from LRU
 
