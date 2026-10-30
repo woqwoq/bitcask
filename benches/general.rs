@@ -1,3 +1,5 @@
+use std::thread;
+
 use bitcask::{
     BitcaskInstance,
     db::KeyValueDatabase,
@@ -216,11 +218,61 @@ fn merge_bench(c: &mut Criterion) {
     bench.run("synthetic", throughput, prep, run);
 }
 
+fn concurrent_read_bench(c: &mut Criterion) {
+    let thread_count = 8usize;
+    let operation_counts = vec![10_000usize, 50_000, 100_000, 500_000];
+    let ksz = 4usize;
+    let vsz = KB;
+
+    // We use small datafile sizes so that threads don't need to wait for a writer lock during reads
+    let options = BitcaskOptions::default()
+        .datafile_max_size(DatafileMaxSize::SoftCappedBytes(5 * MB))
+        .reader_lru_cache_size(128)
+        .merge_dead_space_min_bytes(GB as u64)
+        .sync_frequency(SyncFrequency::Never);
+
+    let mut bench =
+        DatabaseBenchmarkRunner::new("concurrent_read", ksz, vsz, 10, &operation_counts, c);
+
+    let throughput = |size| Throughput::Bytes((size * vsz) as u64);
+    let prep = |s| {
+        let (dir, db) = provision_db_in_temp(options.clone());
+        let ops = provision_db_data(s * DATA_TO_READS_RATIO, ksz, vsz, OperationType::Read);
+
+        fill_db(&db, &ops);
+
+        (dir, db, ops)
+    };
+
+    let prep_random = |size| {
+        let (dir, db, mut ops) = prep(size);
+        let mut rng = rand::rng();
+        ops.shuffle(&mut rng);
+        (dir, db, ops)
+    };
+
+    let run = |size, dir, db: BitcaskInstance, ops: DatabaseOperations| {
+        thread::scope(|scope| {
+            for chunk in ops.chunks(size / thread_count) {
+                scope.spawn(|| {
+                    perform_operations(&db, chunk, size);
+                });
+            }
+        });
+
+        (dir, db, ops)
+    };
+
+    bench.run("sequential", throughput, prep, run);
+    bench.run("random", throughput, prep_random, run);
+}
+
 criterion_group!(
     benches,
     write_bench,
     read_bench,
     read_write_bench,
-    merge_bench
+    merge_bench,
+    concurrent_read_bench,
 );
 criterion_main!(benches);
