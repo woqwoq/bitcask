@@ -1,5 +1,4 @@
 use std::{
-    collections::hash_map::Keys,
     fs::{self, read_dir},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -15,7 +14,7 @@ use crate::{
         RemoveError,
     },
     hint::Hintfile,
-    keydir::{KeyDir, KeyDirEntry},
+    keydir::KeyDir,
     options::{
         BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, RecoveryMode, SyncFrequency,
         SyncMode,
@@ -100,6 +99,15 @@ pub struct BitcaskInstance {
     readers: Mutex<LruCache<u32, Arc<Datafile>>>, // Use LRU cache to track recently used files
     storage_tracker: Mutex<StorageTracker>, // For tracking dead space, writes for sync triggers and trigger compaction
     options: BitcaskOptions,                // User-customisable options
+}
+
+impl Drop for BitcaskInstance {
+    fn drop(&mut self) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.flush();
+            let _ = writer.sync(&SyncMode::SyncAll);
+        }
+    }
 }
 
 #[hotpath::measure_all]
@@ -2156,6 +2164,23 @@ mod tests {
 
             for key in db.keys() {
                 assert!(db.contains(&key));
+            }
+        }
+
+        #[test]
+        fn drop_flushes_writer_buff_and_fsyncs() {
+            let (dir, options, db) = init_test();
+            let (n, ksz, vsz) = (4, 4, 1);
+            let ops = test_utils::provision_db_data(n, ksz, vsz, test_utils::OperationType::Write);
+
+            perform_operations(&db, &ops, n);
+
+            drop(db);
+
+            let db = BitcaskInstance::open(dir.path(), options).unwrap();
+            assert_eq!(db.len(), n);
+            for op in ops {
+                assert_eq!(db.get(&op.key).unwrap().unwrap(), op.value);
             }
         }
     }
