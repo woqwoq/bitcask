@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, read_dir},
+    fs::{self, File, OpenOptions, TryLockError, read_dir},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, atomic::AtomicU32},
@@ -16,8 +16,8 @@ use crate::{
     hint::Hintfile,
     keydir::KeyDir,
     options::{
-        BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, RecoveryMode, SyncFrequency,
-        SyncMode,
+        BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, LOCKFILE_NAME, RecoveryMode,
+        SyncFrequency, SyncMode,
     },
     record::{DATAFILE_RECORD_TYPE_NORMAL, DATAFILE_RECORD_TYPE_TOMBSTONE, DatafileRecord},
 };
@@ -99,6 +99,7 @@ pub struct BitcaskInstance {
     readers: Mutex<LruCache<u32, Arc<Datafile>>>, // Use LRU cache to track recently used files
     storage_tracker: Mutex<StorageTracker>, // For tracking dead space, writes for sync triggers and trigger compaction
     options: BitcaskOptions,                // User-customisable options
+    lockfile: File, // File lock so that other databases can't use the same folder
 }
 
 impl Drop for BitcaskInstance {
@@ -107,13 +108,23 @@ impl Drop for BitcaskInstance {
             let _ = writer.flush();
             let _ = writer.sync(&SyncMode::SyncAll);
         }
+
+        let _ = self.lockfile.unlock();
+        let _ = fs::remove_file(self.dir.join(LOCKFILE_NAME));
+        // self.lockfile is still live in RAM, but its destructor will run here
     }
 }
 
 #[hotpath::measure_all]
 impl BitcaskInstance {
     pub(crate) fn open(dir: &Path, options: BitcaskOptions) -> Result<Self, BitcaskError> {
+        // Verify the parameters are valid before proceeding
         options.validate().map_err(OpenError::InvalidDBOptions)?;
+
+        // Try to get a lockfile before doign heap allocations
+        BitcaskStartupHandler::verify_and_create_dir_path(dir)?;
+        let lockfile = BitcaskStartupHandler::lockfile_on_startup(dir)?;
+
         let mut storage_tracker = StorageTracker::new();
         let mut keydir = KeyDir::with_capacity(options.expected_keydir_max_size);
         let mut readers: LruCache<u32, Arc<Datafile>> =
@@ -145,6 +156,7 @@ impl BitcaskInstance {
             readers: Mutex::new(readers),
             storage_tracker: Mutex::new(storage_tracker),
             options,
+            lockfile,
         })
     }
 
@@ -649,6 +661,37 @@ pub(crate) struct BitcaskStartupHandler;
 
 #[hotpath::measure_all]
 impl BitcaskStartupHandler {
+    pub(crate) fn verify_and_create_dir_path(dir: &Path) -> Result<(), OpenError> {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir).map_err(OpenError::InvalidDBPath)?;
+        }
+
+        if !dir.is_dir() {
+            return Err(OpenError::PathIsFile);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn lockfile_on_startup(dir: &Path) -> Result<File, OpenError> {
+        let lockfile = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LOCKFILE_NAME))
+            .map_err(OpenError::LockfileError)?;
+
+        match lockfile.try_lock() {
+            Ok(_) => Ok(lockfile),
+            Err(TryLockError::WouldBlock) => {
+                return Err(OpenError::LockfileAlreadyTaken);
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(OpenError::LockfileError(err));
+            }
+        }
+    }
+
     pub(crate) fn reopen_datafile_as_writer(
         dir: &Path,
         options: &BitcaskOptions,
@@ -664,14 +707,6 @@ impl BitcaskStartupHandler {
         dir: &Path,
         datafile_extension: &str,
     ) -> Result<Vec<u32>, OpenError> {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir).map_err(OpenError::InvalidDBPath)?;
-        }
-
-        if !dir.is_dir() {
-            return Err(OpenError::PathIsFile);
-        }
-
         let mut ids: Vec<u32> = Vec::new();
         for file in read_dir(dir).map_err(OpenError::InvalidDBPath)? {
             let file = file.map_err(OpenError::InvalidDBPath)?;
@@ -2128,6 +2163,41 @@ mod tests {
                     });
                 }
             });
+        }
+    }
+
+    mod lockfile {
+        use crate::options::LOCKFILE_NAME;
+
+        use super::*;
+
+        #[test]
+        fn lockfile_spawns_on_startup_and_drops_on_shutdown() {
+            let (_dir, _, db) = init_test();
+
+            let lockfile_path = db.dir.join(LOCKFILE_NAME);
+            assert!(std::fs::exists(&lockfile_path).unwrap());
+
+            drop(db);
+            assert!(!std::fs::exists(&lockfile_path).unwrap());
+        }
+
+        #[test]
+        fn lockfile_is_exclusive() {
+            let (dir, options, db1) = init_test();
+
+            let lockfile_path = db1.dir.join(LOCKFILE_NAME);
+            assert!(std::fs::exists(&lockfile_path).unwrap());
+
+            assert!(matches!(
+                BitcaskInstance::open(dir.path(), options.clone()),
+                Err(BitcaskError::FatalOpenFailure(
+                    OpenError::LockfileAlreadyTaken
+                ))
+            ));
+
+            drop(db1);
+            assert!(BitcaskInstance::open(dir.path(), options).is_ok());
         }
     }
 

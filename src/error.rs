@@ -70,6 +70,9 @@ impl From<MergeError> for BitcaskError {
 
 #[derive(Debug)]
 pub enum OpenError {
+    LockfileAlreadyTaken,
+    LockfileError(io::Error),
+
     InvalidDBPath(io::Error),
     PathIsFile,
     DatafileNameError(ParseIntError),
@@ -83,6 +86,12 @@ pub enum OpenError {
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            OpenError::LockfileError(e) => {
+                write!(f, "failed to create or acquire an exclusive database: {e}")
+            }
+            OpenError::LockfileAlreadyTaken => {
+                write!(f, "failed to acquire an exclusive database file lock")
+            }
             OpenError::InvalidDBPath(e) => {
                 write!(f, "failed to access or create the database directory: {e}")
             }
