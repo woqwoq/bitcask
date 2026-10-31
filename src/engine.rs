@@ -1,5 +1,5 @@
 use std::{
-    fmt::write,
+    collections::hash_map::Keys,
     fs::{self, read_dir},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use crate::{
         RemoveError,
     },
     hint::Hintfile,
-    keydir::KeyDir,
+    keydir::{KeyDir, KeyDirEntry},
     options::{
         BitcaskOptions, DATAFILE_HEADER_SIZE_BYTES, DatafileMaxSize, RecoveryMode, SyncFrequency,
         SyncMode,
@@ -149,6 +149,20 @@ impl BitcaskInstance {
         self.write_datafile_record(&record, &mut writer)?;
 
         Ok(())
+    }
+
+    pub(crate) fn keys(&self) -> Vec<Box<[u8]>> {
+        // We either do a heap allocation or a hold a read lock for as long as the iterator is alive
+        self.keydir
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    pub(crate) fn contains(&self, key: &[u8]) -> bool {
+        self.keydir.read().unwrap().contains(key)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -2012,10 +2026,7 @@ mod tests {
     }
 
     mod concurrency {
-        use std::{
-            collections::HashSet,
-            thread::{self},
-        };
+        use std::thread::{self};
 
         use crate::{options::KB, test_utils::*};
 
@@ -2109,6 +2120,43 @@ mod tests {
                     });
                 }
             });
+        }
+    }
+
+    mod misc {
+        use crate::test_utils::{self, perform_operations};
+
+        use super::*;
+
+        #[test]
+        fn contains() {
+            let (_dir, _, db) = init_test();
+            let (n, ksz, vsz) = (100, 4, 1);
+            let ops = test_utils::provision_db_data(n, ksz, vsz, test_utils::OperationType::Write);
+
+            perform_operations(&db, &ops, n);
+
+            for op in ops {
+                assert!(db.contains(&op.key));
+            }
+        }
+
+        #[test]
+        fn keys() {
+            let (_dir, _, db) = init_test();
+            let (n, ksz, vsz) = (100, 4, 1);
+            let ops = test_utils::provision_db_data(n, ksz, vsz, test_utils::OperationType::Write);
+
+            perform_operations(&db, &ops, n);
+
+            let keys = db.keys();
+
+            assert_eq!(keys.len(), ops.len());
+            assert_eq!(keys.len(), db.keydir.read().unwrap().len());
+
+            for key in db.keys() {
+                assert!(db.contains(&key));
+            }
         }
     }
 }

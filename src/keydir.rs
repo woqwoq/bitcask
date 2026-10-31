@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{collections::hash_map::Keys, fmt::Display};
 
 use ahash::AHashMap;
 
@@ -64,6 +64,10 @@ impl KeyDir {
             key,
             KeyDirEntry::new(file_id, value_size, value_offset, timestamp),
         )
+    }
+
+    pub(crate) fn keys(&self) -> Keys<'_, Box<[u8]>, KeyDirEntry> {
+        self.dir.keys()
     }
 
     pub(crate) fn get_live_log_size(&self) -> u64 {

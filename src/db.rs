@@ -17,6 +17,9 @@ pub trait KeyValueDatabase {
     fn merge(&self) -> Result<(), Self::Error>;
     fn sync(&self) -> Result<(), Self::Error>;
 
+    fn contains(&self, key: &[u8]) -> bool;
+    fn keys(&self) -> Vec<Box<[u8]>>;
+
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
 }
@@ -43,6 +46,14 @@ impl KeyValueDatabase for BitcaskInstance {
 
     fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
         self.remove(key)
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        self.contains(key)
+    }
+
+    fn keys(&self) -> Vec<Box<[u8]>> {
+        self.keys()
     }
 
     fn merge(&self) -> Result<(), Self::Error> {
