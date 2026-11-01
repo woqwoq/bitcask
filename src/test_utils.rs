@@ -1,6 +1,6 @@
 #![cfg(any(test, feature = "test_utils"))]
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use rand::{
     distr::{Alphanumeric, SampleString},
@@ -52,33 +52,32 @@ pub fn fill_db(db: &BitcaskInstance, ops: &[Operation]) {
 
 pub type DatabaseOperations = Vec<Operation>;
 
-// Does not guarantee exact keysize due to possible collisions when ksz is small
 pub fn provision_db_data(
     n: usize,
     ksz: usize,
     vsz: usize,
     op_type: OperationType,
 ) -> DatabaseOperations {
-    let mut map = HashMap::new();
+    let mut set = HashSet::new();
+    let mut ops = DatabaseOperations::new();
 
-    while n > map.len() {
+    while n > set.len() {
         let key = generate_sized_string(ksz);
 
-        if map.contains_key(&key) {
+        if set.contains(&key) {
             continue;
         }
 
-        map.insert(
-            key.clone(),
-            Operation::new(
-                key.as_bytes(),
-                generate_sized_string(vsz).as_bytes(),
-                op_type.clone(),
-            ),
-        );
+        set.insert(key.clone());
+
+        ops.push(Operation::new(
+            key.as_bytes(),
+            generate_sized_string(vsz).as_bytes(),
+            op_type.clone(),
+        ));
     }
 
-    map.into_values().collect()
+    ops
 }
 
 pub fn merge_and_shuffle(
