@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::{engine::BitcaskInstance, error::BitcaskError, options::BitcaskOptions};
 
 pub trait KeyValueDatabase {
-    type Options: Clone;
+    type Options: Clone + Default;
     type Error: std::error::Error;
 
     fn open(dir: &Path, options: Self::Options) -> Result<Self, Self::Error>
