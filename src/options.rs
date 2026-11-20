@@ -133,41 +133,21 @@ impl BitcaskOptions {
     }
 
     pub fn sync_frequency(mut self, new: SyncFrequency) -> Self {
-        if let SyncFrequency::EveryNthWrite(n) = new
-            && n == 0
-        {
-            panic!("SyncFrequency::EveryNthWrite cannot be set to 0");
-        }
-
         self.sync_frequency = new;
         self
     }
 
     pub fn datafile_max_size(mut self, new: DatafileMaxSize) -> Self {
-        if new.get_size() <= DATAFILE_HEADER_SIZE_BYTES {
-            panic!(
-                "DatafileMaxSize has to be set to a value greater than {DATAFILE_HEADER_SIZE_BYTES}"
-            )
-        }
-
         self.datafile_max_size = new;
         self
     }
 
     pub fn merge_dead_space_threshold_percent(mut self, new: u8) -> Self {
-        if new == 0 {
-            panic!("merge_dead_space_threshold_percent cannot be set to 0")
-        }
-
         self.merge_dead_space_threshold_percent = new;
         self
     }
 
     pub fn merge_dead_space_min_bytes(mut self, new: u64) -> Self {
-        if new == 0 {
-            panic!("merge_dead_space_min_bytes cannot be set to 0")
-        }
-
         self.merge_dead_space_threshold_bytes = new;
         self
     }
@@ -178,28 +158,16 @@ impl BitcaskOptions {
     }
 
     pub fn datafile_extension(mut self, new: &str) -> Self {
-        if new.is_empty() {
-            panic!("datafile_extension cannot be empty")
-        }
-
         self.datafile_extension = new.to_string();
         self
     }
 
     pub fn hintfile_extension(mut self, new: &str) -> Self {
-        if new.is_empty() {
-            panic!("hintfile_extension cannot be empty")
-        }
-
         self.hintfile_extension = new.to_string();
         self
     }
 
     pub fn reader_lru_cache_size(mut self, new: usize) -> Self {
-        if new == 0 {
-            panic!("reader_lru_cache_size cannot be set to 0")
-        }
-
         self.reader_lru_cache_size = new;
         self
     }
